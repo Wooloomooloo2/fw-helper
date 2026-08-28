@@ -13,6 +13,12 @@
 #     --interval N   sample window (default 10)
 #     --fan DUTY     take the fan to a fixed duty; 0 or 30-255 (default: leave it to the EC)
 #     --method M     stress-ng --cpu-method (default matrixprod, as M0 and Q6 used)
+#     --stressor S   which stress-ng stressor to drive (default `cpu`, which is what
+#                    --method applies to). Use `vecfp`, `vecwide` or `vecmath` for an
+#                    explicitly SIMD load: those go through GCC vector extensions and
+#                    exercise the AVX2 units that a scalar/SSE workload leaves idle.
+#                    Changing this changes what the score means, so only compare scores
+#                    from runs using the same stressor.
 #     --label NAME   tag for the CSV filename
 #     --out PATH     CSV path (default ./perf-<label>-<timestamp>.csv)
 #     --monitor      generate NO load and change NOTHING — just log power, temperature,
@@ -27,6 +33,7 @@
 set -uo pipefail
 
 PL1_W=""; SECS=300; INTERVAL=10; FAN_DUTY=""; METHOD=matrixprod; LABEL=""; OUT=""
+STRESSOR=cpu
 MONITOR=no
 while (( $# )); do
     case "$1" in
@@ -35,6 +42,7 @@ while (( $# )); do
         --interval) INTERVAL=$2; shift 2 ;;
         --fan)      FAN_DUTY=$2; shift 2 ;;
         --method)   METHOD=$2; shift 2 ;;
+        --stressor) STRESSOR=$2; shift 2 ;;
         --label)    LABEL=$2; shift 2 ;;
         --out)      OUT=$2; shift 2 ;;
         --monitor)  MONITOR=yes; shift ;;
@@ -230,6 +238,9 @@ yaml_num() { awk -v k="$2:" '$1==k {print $2; exit}' "$1"; }
 
 # --- run ---------------------------------------------------------------------
 NCPU=$(nproc)
+# --cpu-method is meaningful only for the `cpu` stressor; the vector stressors reject it.
+METHOD_ARG=()
+[[ "$STRESSOR" == cpu ]] && METHOD_ARG=(--cpu-method "$METHOD")
 STAMP=$(date +%Y%m%d-%H%M%S)
 [[ -z "$LABEL" ]] && LABEL="pl1-${PL1_W}w"
 [[ -z "$OUT" ]] && OUT="$PWD/perf-${LABEL}-${STAMP}.csv"
@@ -237,7 +248,7 @@ INTERVALS=$(( SECS / INTERVAL ))
 
 printf '\n\033[1m== sustained performance: %s s at PL1 %s W, %s x %s s ==\033[0m\n' \
     "$SECS" "$PL1_READBACK" "$INTERVALS" "$INTERVAL"
-printf '   load: stress-ng --cpu %s --cpu-method %s\n' "$NCPU" "$METHOD"
+printf '   load: stress-ng --%s %s %s\n' "$STRESSOR" "$NCPU" "${METHOD_ARG[*]}"
 printf '   score: bogo-ops/s over each window, from a fresh %s s stressor run\n' "$INTERVAL"
 printf '   PL1 averages over ~32 s, so the first %s intervals are turbo, not steady state\n\n' \
     "$(( 32 / INTERVAL + 1 ))"
@@ -271,7 +282,7 @@ for (( i = 1; i <= INTERVALS; i++ )); do
     if [[ "$MONITOR" == yes ]]; then
         sleep "$INTERVAL"
     else
-        stress-ng --cpu "$NCPU" --cpu-method "$METHOD" -t "$INTERVAL" \
+        stress-ng "--$STRESSOR" "$NCPU" "${METHOD_ARG[@]}" -t "$INTERVAL" \
             --metrics-brief --yaml "$WORK/m.yaml" >/dev/null 2>&1 &
         LOAD_PID=$!
         wait "$LOAD_PID" 2>/dev/null; LOAD_PID=""

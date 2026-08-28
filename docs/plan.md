@@ -442,16 +442,26 @@ Suspend/resume leaves the fan in a correct state. Curve holds a target temperatu
   PL2 is deliberately untouched: it governs burst responsiveness, not sustained thermals,
   and its `max_power_uw` reads 0 (unset), which would clamp any naive UI to zero
 - Write PL1/PL2 via `intel-rapl-mmio:0` — confirmed as the authoritative zone (Q2)
-- Envelope is **25 W PL1 / 60 W PL2** (Q5), and PL1 regulates to ±2% of setpoint (Q6)
-- Profile values, grounded in the Q6 measurements (10 W ≈ 12 °C):
+- Envelope is **8-35 W PL1 / 60 W PL2**, and PL1 regulates to ±2% of setpoint (Q6).
+  Q5 said 25 W from `max_power_uw`; Q7 measured the enforced ceiling at **35 W**
+- Profile values. The first three come from Q6 (10 W ≈ 12 °C); `turbo` and `max` from Q7,
+  where the temperatures are measured under a pinned duty-200 fan:
 
-  | Profile | PL1 | Expected sustained CPU temp |
-  |---|---|---|
-  | Quiet | 15 W | ~65 °C |
-  | Balanced | 20 W | ~71 °C |
-  | Performance | 25 W (stock) | ~77 °C |
+  | Profile | PPD | PL1 | Sustained CPU temp | vs 25 W |
+  |---|---|---|---|---|
+  | Quiet | power-saver | 15 W | ~65 °C | — |
+  | Balanced | balanced | 20 W | ~71 °C | — |
+  | Performance | performance | 25 W (stock) | ~77 °C | baseline |
+  | Turbo | performance | 30 W | 76 °C core | +8.9% |
+  | Max | performance | 35 W | 84 °C core | +15.9% |
 
-- Never expose the MSR zone's bogus 200 W as a slider maximum — clamp the UI to `max_power_uw`
+  `turbo` and `max` share the `performance` PPD position. The GNOME slider still lands on
+  `performance` — `Profile::canonical_name_for` is what keeps that unambiguous, and the
+  extra two are reached by name.
+- Never expose the MSR zone's bogus 200 W as a slider maximum. **And do not clamp the UI to
+  `max_power_uw` either**: it declares 25 W on a board that honours 35 W, and trusting it
+  cost ~16% of the machine's throughput (Q7). `PowerLimit::max_watts` treats the declared
+  value as a floor on the answer, never a ceiling
 - **Any power measurement must average over more than the ~32 s PL1 window.** Sampling sooner
   reads turbo as steady state — the Q6 run showed 29 W at t+25 s under a 25 W limit
 - Validate writes stick — read back after a delay, and downgrade the capability to

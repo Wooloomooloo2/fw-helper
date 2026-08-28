@@ -168,13 +168,15 @@ fw-helperctl status | watch [secs] | charge-limit N
 fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the firmware floor
 fw-helperctl fan curve | fan curve 55:0,70:65,85:120   # follow a temp->duty curve
 fw-helperctl power-limit 15               # sustained CPU watts; ~32s to take effect
-fw-helperctl profile | profile quiet      # quiet | balanced | performance; moves the GNOME slider
+fw-helperctl profile | profile quiet      # quiet|balanced|performance|turbo|max; moves the GNOME slider
 /etc/fw-helper/profiles.d/*.conf          # user profiles; see data/example-profile.conf
 ./target/debug/fw-helper                  # the GUI
 
 ./scripts/fw-probe.sh                     # read-only hardware survey
 sudo ./scripts/fw-probe.sh --write-test   # writes and restores; read it first
 sudo ./scripts/q6-pl1-load-test.sh        # PL1 efficacy; also M4's regression test
+sudo ./scripts/sustained-perf-test.sh --pl1 35 --fan 200   # 5 min under load, power+score per 10 s
+sudo ./scripts/sustained-perf-test.sh --monitor            # log only; for benchmarking a game
 ```
 
 `FW_HELPERD_SESSION_BUS=1` runs daemon and clients on the session bus — development only,
@@ -259,6 +261,7 @@ All of these cost real time once. Do not rediscover them.
 | Applying a profile **re-takes the fan** | A profile carries a fan curve, so `profile performance` puts the daemon back in control of `pwm1` and undoes a `fan auto` issued before it. Anything needing the EC to own the fan — learning the firmware floor, above all — must order `fan auto` **last**, and must not straddle an AC/battery transition, which re-applies the profile and takes the fan back the same way |
 | The daemon **fights** `q6-pl1-load-test.sh` | The script predates the daemon owning PL1. It writes 15 W for its `LIMITED` arm; the daemon re-asserts its own setpoint within seconds (`power limit was 15 W, expected 25 W; re-applied`), so the arm measures the daemon's budget and the script concludes `NO EFFECT ... Cut M4`. It is an artifact — power settling from 30.47 W to 24.95 W *is* PL1 governing. Stop the daemon, or use plain `stress-ng` when all you need is heat |
 | A **verified** charge limit that does nothing | `charge_control_end_threshold` accepts 80, reads back 80, persists and re-applies across suspend and reboot — and the EC charges straight through it: 88% → 93%, +282 mAh, `status=Charging` throughout. Every layer M2 tested passed; none of them tested whether charging *stops*. **Read-back is not efficacy.** Fixed in ADR 0012 by driving Framework's custom EC command instead; `scripts/q2-charge-limit-efficacy.sh` is now the check that counts |
+| `max_power_uw` is a **declaration, not a bound** | It reads 25 W and this board honours 35 W: setpoints of 30 and 35 W held to within 0.2% for 26 straight intervals, worth +8.9% and +15.9% throughput. Clamping the UI to it cost ~16% of the machine. The real ceiling is 35 W and firmware enforces it invisibly — a 40 W setpoint stays in the register and still draws 35.07 W, cold, with zero throttle events. Same shape as the charge limit: the knob Linux offers is not the one holding the value (Q7) |
 | **Two charge limits exist, and sysfs is the wrong one** | This board runs Framework's custom EC charge command *and* the standard CrOS one. They hold independent values: measured with `charge_control_end_threshold` at 80, the custom command reported `max=100` — and 100 is what happened. Forcing `cros_charge-control` to bind with `probe_with_fwk_charge_control=1` produces a working-looking sysfs attribute wired to the losing mechanism. The kernel's refusal to bind was a correct verdict about the hardware, not an inconvenience to route around (ADR 0012) |
 | An **opcode from memory** is a coin flip | Looking up `EC_CMD_CHARGE_LIMIT_CONTROL` returned `0x3E07` from one summary and `0x3E03` from another. The real answer is **`0x3E03`**, settled only by reading the enum with its neighbours. A wrong opcode is not a compile error and often not a runtime error either — the EC simply answers a different question. Pin it in a test |
 | A **disconnected** GUI still looks operable | Sensitivity is decided by `sync_controls` from a snapshot, which cannot run with no daemon — so controls keep whatever state they were built with. Cold-started against no daemon, every control accepted input and discarded it, which reads as "the app does nothing" rather than "nothing is installed". Build controls insensitive; gate the groups on connection, and let per-row capability sensitivity sit underneath |
@@ -291,6 +294,10 @@ Measured on the target machine, not estimated:
 - PL1 15 W → **15.02 W, +0.1%**, 62.2 °C — driven through the daemon (M4)
 - **10 W of power limit buys ~12 °C.** Why ADR 0007 can drop undervolting. Rests on the
   M0 runs; M4's 25 W figure was heat-soaked and does not re-confirm it
+- **The real PL1 ceiling is 35 W, not the 25 W `max_power_uw` declares** (Q7, 2026-08-28).
+  30 W → 30.06 W sustained, +8.9% throughput; 35 W → 35.08 W, +15.9%. A 40 W setpoint holds
+  in the register and still settles at 35.07 W, cold, with zero throttle events — a firmware
+  power budget, not a thermal limit. Efficiency falls ~9% per 5 W step
 - Tjmax **100 °C** (`coretemp` crit). Peak in ordinary use **92.8 °C**, not 76.8 °C
 - Duty → RPM is **concave**: 30→1107, 50→1879, 77→2693, 90→3052, 120→3840, 180→5201 rpm.
   Stiction between duty 20 and 30

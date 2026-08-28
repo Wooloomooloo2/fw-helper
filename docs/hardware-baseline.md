@@ -222,11 +222,17 @@ Also `hwmon1` (`acpi_fan`) exposes `fan1_input` / `fan1_target` / `power1_input`
 **Read this table carefully — the raw numbers mislead.**
 
 `max_power_uw` is the ceiling *the platform declares* for the constraint, and it is **25 W on
-both zones**. That is the authoritative sustained figure. The MSR zone's 200 W `long_term`
-is a limit set *above* the declared maximum, which is the signature of a constraint that is
-not constraining anything — firmware parks an unconstrained value there because real
-governance happens through MMIO and the EC. **The machine's sustained power budget is 25 W,
-not 200 W.**
+both zones**. The MSR zone's 200 W `long_term` is a limit set *above* the declared maximum,
+which is the signature of a constraint that is not constraining anything — firmware parks an
+unconstrained value there because real governance happens through MMIO and the EC.
+
+> **Corrected 2026-08-28.** This section used to conclude "the machine's sustained power
+> budget is 25 W, not 200 W". The first half of that is wrong. `max_power_uw` is a
+> *declaration*, and this board does not enforce it: 30 W and 35 W setpoints are both
+> honoured and held to within 0.2%. The real ceiling is **35 W**, and it is enforced
+> somewhere below the OS. See **Q7**. The reasoning above is sound about the MSR zone and
+> unsound about the number — it inferred an enforced limit from an advertised one, which is
+> the same mistake as reading back a charge limit and calling it efficacy.
 
 Three separate misreadings to avoid:
 
@@ -324,7 +330,7 @@ Implementation note: `fan1_target` stayed `0` while under manual control. Read `
 for actual RPM; do not trust `fan1_target` as a feedback signal.
 Scale reference: 63% duty ≈ 4681 RPM, useful for curve design.
 
-**Q5 — What is the true sustained limit?** *(answered)*
+**Q5 — What is the true sustained limit?** *(answered — and the answer was wrong; see Q7)*
 **25 W PL1 / 60 W PL2**, confirmed by `max_power_uw` = 25 W on both zones. The MSR zone's
 200 W is not a real limit and the 175 W `peak_power` is a microsecond-scale current ceiling,
 not a thermal budget. Remaining work is only to pick sensible per-profile values below 25 W
@@ -343,6 +349,51 @@ steady state = mean of the second 30 s of each 60 s sampling run):
 
 **PL1 is a real control, regulated to within ~2% of setpoint.** Intel Dynamic Tuning is not
 arbitrating it away. M4 ships as genuine functionality.
+
+**Q7 — Does `max_power_uw` bind, and where is the real ceiling?** *(answered — it does not
+bind, and the ceiling is 35 W)*
+Measured 2026-08-28 with `scripts/sustained-perf-test.sh`: 5 minutes of
+`stress-ng --cpu 16 --cpu-method matrixprod` per setpoint, sampled in 30 × 10 s windows,
+package power from `energy_uj` deltas and a throughput score from each window's own
+`bogo-ops`. Fan pinned at duty 200 (~5850 rpm) throughout so cooling is not a variable.
+Steady state = mean of intervals 5–30, past PL1's ~32 s averaging window.
+
+| PL1 setpoint | Sustained draw | Score (bogo-ops/s) | vs 25 W | Efficiency | Freq | peci | core | board | Throttle |
+|---|---|---|---|---|---|---|---|---|---|
+| 25 W | 25.06 W | 27 909 | — | 1110 ops/J | 2267 MHz | 85.8 °C | 72 °C | 48.9 °C | 0 |
+| 30 W | 30.06 W | 30 405 | **+8.9%** | 1008 ops/J | 2479 MHz | 85.8 °C | 76 °C | 51.9 °C | 0 |
+| 35 W | 35.08 W | 32 338 | **+15.9%** | 919 ops/J | 2632 MHz | 94.8 °C | 84 °C | 55.9 °C | 0 |
+| 40 W | **35.07 W** | 32 320 | +15.8% | 918 ops/J | 2630 MHz | 94.8 °C | 84 °C | 56.9 °C | 0 |
+
+**`constraint_0_max_power_uw` = 25 W does not bind.** Setpoints of 30 and 35 W were accepted
+and held to within 0.2% for 26 consecutive intervals. Clamping fw-helper to the declared
+value was costing **15.9%** of this machine's throughput.
+
+**The real ceiling is 35 W, and it is a power budget rather than a thermal limit.** A 40 W
+setpoint stayed in the register for all 30 intervals — no drift, no refusal — and still
+settled at 35.07 W, matching the 35 W run to 0.06%. Three things rule out heat:
+
+1. It clamped at **interval 4**, 40 s in, with the board at 45.9 °C and cores at 78 °C. The
+   chassis was still cold; heat soak did not arrive until interval 27.
+2. `package_throttle_count` stayed **0** across every interval of every run. Cores peaked at
+   84 °C against a Tjmax of 100 °C.
+3. Twenty-six intervals spanning 35.06–35.10 W is a governed setpoint. Thermal droop wanders.
+
+Nothing in `/sys` exposes what enforces it. The candidates were checked and eliminated: the
+USB-C adapter negotiates **20 V × 5 A = 100 W** (65 W spare, not starving); the `psys` zone's
+constraints both read `0` (unset); there is no `INT3400` device, so Intel DPTF's platform
+driver is not present; and Tjmax never engaged. It is firmware or the EC — the same shape as
+the charge limit in [ADR 0012](adr/0012-charge-limit-via-custom-ec-command.md), where the
+knob Linux offers is not the one holding the value.
+
+**Returns diminish smoothly and efficiency falls about 9% per 5 W step.** 40% more power
+across the range buys 15.9% more work. Whether that trade is worth making is a user choice,
+which is why 30 W and 35 W ship as profiles (`turbo`, `max`) rather than as a new default.
+
+*Not yet established:* that 35 W is sustainable beyond five minutes. Board temperature was
+still climbing at interval 30 (52.9 °C at interval 14, 56.9 °C at interval 30, no plateau),
+so these runs show survivability, not steady state. A 15-minute soak is the outstanding test.
+All four runs also used duty 200; what 35 W costs under a *realistic* curve is unmeasured.
 
 Two secondary findings worth carrying into design:
 

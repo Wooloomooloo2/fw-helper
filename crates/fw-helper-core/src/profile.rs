@@ -72,7 +72,7 @@ impl std::fmt::Display for ProfileError {
                 f,
                 "{w} W is outside the range a power limit can sensibly take ({}-{} W)",
                 crate::power::MIN_WATTS,
-                crate::power::FALLBACK_MAX_WATTS
+                crate::power::MAX_WATTS
             ),
             Self::ChargeOutOfRange(v) => write!(f, "{v}% is not a usable charge limit"),
         }
@@ -170,9 +170,67 @@ impl Profile {
         }
     }
 
-    /// The three shipped defaults.
+    /// 30 W. The first profile that spends the headroom `max_power_uw` was hiding:
+    /// measured, 30 W is worth +8.9% throughput over 25 W for 20% more power, with the
+    /// cores at 76 °C and no throttling at all.
+    ///
+    /// The curve has to start earlier and climb harder than performance's, because the
+    /// power budget is no longer doing most of the thermal work — above 25 W the curve
+    /// is what keeps the machine in range.
+    pub fn turbo() -> Self {
+        Self {
+            name: "turbo".into(),
+            ppd: Ppd::Performance,
+            pl1_watts: 30,
+            curve: curve(&[
+                (40.0, 0),
+                (50.0, 60),
+                (60.0, 100),
+                (70.0, 140),
+                (80.0, 190),
+                (90.0, 255),
+            ]),
+            charge_limit: None,
+        }
+    }
+
+    /// 35 W, everything this board will give. Above it firmware simply stops listening:
+    /// a 40 W setpoint held the register and still settled at 35.07 W (see
+    /// [`crate::power::MAX_WATTS`]), so there is no profile beyond this one to write.
+    ///
+    /// Worth +15.9% over 25 W, and it costs noise: measured at 35 W the cores reach
+    /// 84 °C and peci 91.8 °C even with the fan at ~5850 rpm. The curve is accordingly
+    /// the loudest thing here, and is meant to be chosen deliberately.
+    pub fn max() -> Self {
+        Self {
+            name: "max".into(),
+            ppd: Ppd::Performance,
+            pl1_watts: 35,
+            curve: curve(&[
+                (40.0, 0),
+                (48.0, 70),
+                (58.0, 115),
+                (68.0, 160),
+                (78.0, 210),
+                (88.0, 255),
+            ]),
+            charge_limit: None,
+        }
+    }
+
+    /// The shipped defaults, ordered by power budget.
+    ///
+    /// `turbo` and `max` share the `performance` PPD position with `performance` itself.
+    /// That is fine and is why [`Self::canonical_name_for`] exists: the GNOME slider
+    /// still lands on `performance`, and the extra two are reached by name.
     pub fn built_ins() -> Vec<Self> {
-        vec![Self::quiet(), Self::balanced(), Self::performance()]
+        vec![
+            Self::quiet(),
+            Self::balanced(),
+            Self::performance(),
+            Self::turbo(),
+            Self::max(),
+        ]
     }
 
     /// Validate a profile assembled from somewhere less trustworthy than this file.
@@ -192,9 +250,7 @@ impl Profile {
         {
             return Err(ProfileError::NameNotSimple(self.name.clone()));
         }
-        if self.pl1_watts < crate::power::MIN_WATTS
-            || self.pl1_watts > crate::power::FALLBACK_MAX_WATTS
-        {
+        if self.pl1_watts < crate::power::MIN_WATTS || self.pl1_watts > crate::power::MAX_WATTS {
             return Err(ProfileError::PowerOutOfRange(self.pl1_watts));
         }
         if let Some(limit) = self.charge_limit {
@@ -279,23 +335,49 @@ mod tests {
 
     #[test]
     fn profiles_are_ordered_by_power_and_by_noise() {
-        let (q, b, p) = (
-            Profile::quiet(),
-            Profile::balanced(),
-            Profile::performance(),
-        );
-        assert!(q.pl1_watts < b.pl1_watts && b.pl1_watts < p.pl1_watts);
-        // At any given temperature a hotter-running profile must not ask for less air.
-        for t in [50.0, 60.0, 70.0, 80.0, 90.0] {
+        // built_ins() is declared in ascending power order, and each step up must ask
+        // for at least as much air as the one below it at every temperature. Written
+        // over the whole list so adding a profile cannot quietly break the ordering.
+        let all = Profile::built_ins();
+        for pair in all.windows(2) {
+            let (lo, hi) = (&pair[0], &pair[1]);
             assert!(
-                q.curve.duty_at(t) <= b.curve.duty_at(t),
-                "quiet louder than balanced at {t} C"
+                lo.pl1_watts < hi.pl1_watts,
+                "{} does not draw less than {}",
+                lo.name,
+                hi.name
             );
-            assert!(
-                b.curve.duty_at(t) <= p.curve.duty_at(t),
-                "balanced louder than performance at {t} C"
-            );
+            for t in [50.0, 60.0, 70.0, 80.0, 90.0] {
+                assert!(
+                    lo.curve.duty_at(t) <= hi.curve.duty_at(t),
+                    "{} is louder than {} at {t} C",
+                    lo.name,
+                    hi.name
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_top_profile_matches_what_the_board_will_actually_give() {
+        // 35 W is not a taste decision: above it a setpoint is accepted and ignored, so
+        // a profile asking for more would advertise throughput the machine cannot make.
+        assert_eq!(Profile::max().pl1_watts, crate::power::MAX_WATTS);
+    }
+
+    #[test]
+    fn sharing_a_ppd_position_does_not_disturb_the_slider() {
+        // turbo and max both claim `performance`. The GNOME slider must still land on
+        // the profile named `performance` — a coin toss between three is the ADR 0005
+        // failure in miniature.
+        let claimants: Vec<_> = Profile::built_ins()
+            .into_iter()
+            .filter(|p| p.ppd == Ppd::Performance)
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(claimants.len(), 3, "expected performance, turbo and max");
+        assert_eq!(Profile::canonical_name_for(Ppd::Performance), "performance");
+        assert_eq!(Profile::for_ppd(Ppd::Performance).name, "performance");
     }
 
     #[test]

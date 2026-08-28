@@ -28,11 +28,19 @@ use std::fmt;
 /// the desktop stops feeling responsive. Refused rather than accepted.
 pub const MIN_WATTS: u32 = 8;
 
-/// Used when the zone's own `max_power_uw` is missing or implausible.
+/// The highest PL1 this board honours, **measured** — not what the zone declares.
 ///
-/// The measured envelope is 25 W PL1 on this board. A fallback is needed because
-/// `max_power_uw` is exactly the kind of field that reports 0 — `constraint_1`'s does.
-pub const FALLBACK_MAX_WATTS: u32 = 25;
+/// `constraint_0_max_power_uw` reads 25 W and does not bind: measured 2026-08-28 with
+/// `scripts/sustained-perf-test.sh`, setpoints of 30 W and 35 W were both honoured and
+/// held to within 0.2% for 26 consecutive intervals, worth +8.9% and +15.9% throughput
+/// over 25 W. Above 35 W the board stops listening — a 40 W setpoint stayed in the
+/// register for the whole run and still settled at 35.07 W, with the chassis cold
+/// (board 45.9 °C) and `package_throttle_count` at zero. That is a firmware power
+/// budget, not a thermal limit, and 35 W is where it sits.
+///
+/// Doubles as the fallback when `max_power_uw` is missing or implausible, which it is
+/// exactly the kind of field to be — `constraint_1`'s reads 0.
+pub const MAX_WATTS: u32 = 35;
 
 const PL1_LIMIT: &str = "constraint_0_power_limit_uw";
 const PL1_MAX: &str = "constraint_0_max_power_uw";
@@ -109,18 +117,25 @@ impl<'a> PowerLimit<'a> {
         self.fs.exists(&self.attr(PL1_LIMIT))
     }
 
-    /// The highest limit this zone admits to, in watts.
+    /// The highest limit we will set, in watts.
+    ///
+    /// **The zone's declared maximum is a floor on this answer, not a ceiling.** On this
+    /// board `max_power_uw` understates what firmware honours by 10 W (see
+    /// [`MAX_WATTS`]), and clamping to it cost ~16% of available throughput. Hardware
+    /// that declares *more* than we measured is believed, because that is a claim about
+    /// a machine we have not characterised and refusing it would be the same mistake in
+    /// the other direction.
     ///
     /// Validated: `max_power_uw` is a field that reports 0 when unset, and a ceiling of
     /// 0 W would make every value out of range and the control permanently useless.
     pub fn max_watts(&self) -> u32 {
-        let raw = self
+        let declared = self
             .fs
             .read_u64(&self.attr(PL1_MAX))
             .ok()
             .map(|uw| (uw / 1_000_000) as u32)
             .filter(|w| PLAUSIBLE_MAX_WATTS.contains(w));
-        raw.unwrap_or(FALLBACK_MAX_WATTS)
+        declared.unwrap_or(0).max(MAX_WATTS)
     }
 
     /// The averaging window, in seconds. Any measurement of the *effect* of a limit
@@ -205,7 +220,43 @@ mod tests {
         // max_watts must never return 0: every value would be out of range and the
         // control would be permanently dead with no explanation.
         let fs = Sysfs::new("/nonexistent");
-        assert_eq!(PowerLimit::new(&fs).max_watts(), FALLBACK_MAX_WATTS);
+        assert_eq!(PowerLimit::new(&fs).max_watts(), MAX_WATTS);
+    }
+
+    /// A zone rooted in a throwaway directory, declaring `max_power_uw` of `declared` W.
+    fn zone_declaring(tag: &str, declared: u32) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fw-helper-power-{}-{tag}", std::process::id()));
+        let dir = root.join(crate::paths::RAPL_MMIO);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("constraint_0_power_limit_uw"), "25000000\n").unwrap();
+        std::fs::write(
+            dir.join("constraint_0_max_power_uw"),
+            format!("{}\n", u64::from(declared) * 1_000_000),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn a_declared_maximum_below_the_measured_one_does_not_bind() {
+        // The regression this exists to catch: this board declares 25 W and honours 35 W,
+        // so trusting the declaration cost ~16% of the machine's throughput.
+        let root = zone_declaring("understated", 25);
+        let fs = Sysfs::new(&root);
+        assert_eq!(PowerLimit::new(&fs).max_watts(), MAX_WATTS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_declared_maximum_above_the_measured_one_is_believed() {
+        // Hardware we have not characterised gets the benefit of its own claim; refusing
+        // it would be the same mistake as trusting an understated one.
+        let root = zone_declaring("generous", 64);
+        let fs = Sysfs::new(&root);
+        assert_eq!(PowerLimit::new(&fs).max_watts(), 64);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

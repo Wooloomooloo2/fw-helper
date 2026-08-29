@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.2.0 — 2026-08-29
+
+Raises this machine's sustained power ceiling from 25 W to the 35 W it actually
+honours, adds two profiles that use it, and fixes an enforcement bug that let a
+profile's power limit silently not apply.
+
+### The finding most worth passing upstream
+
+**`constraint_0_max_power_uw` is a declaration, not a bound — at least on this board.**
+
+The MMIO RAPL zone declares a 25 W maximum. It does not enforce it. Measured with
+`scripts/sustained-perf-test.sh` (five minutes per setpoint, 30 × 10 s windows, package
+power from `energy_uj` deltas, throughput from each window's own `bogo-ops`, fan pinned
+at duty 200 so cooling is not a variable):
+
+| PL1 setpoint | Sustained draw | Throughput | vs 25 W | Efficiency | Cores |
+|---|---|---|---|---|---|
+| 25 W | 25.06 W | 27 909 bogo-ops/s | — | 1110 ops/J | 72 °C |
+| 30 W | 30.06 W | 30 405 bogo-ops/s | +8.9% | 1008 ops/J | 76 °C |
+| 35 W | 35.08 W | 32 338 bogo-ops/s | +15.9% | 919 ops/J | 84 °C |
+| 40 W | **35.07 W** | 32 320 bogo-ops/s | +15.8% | 918 ops/J | 84 °C |
+
+Every setpoint held to within 0.2%. Clamping to the declared maximum was costing 15.9%
+of the machine.
+
+**35 W is the real ceiling, and it is a power budget rather than a thermal limit.** The
+40 W setpoint stayed in the register for all 30 intervals — no drift, no refusal — and
+still settled at 35.07 W. It clamped at interval 4, forty seconds in, with the board at
+45.9 °C and cores at 78 °C; `package_throttle_count` stayed at 0 across every interval of
+every run. Nothing in `/sys` enforces it: the USB-C adapter negotiates 100 W, the `psys`
+zone's constraints read 0, and there is no `INT3400` device, so Intel DPTF is not
+present. It is firmware or the EC — the same shape as the charge limit in 0.1.0, where
+the knob Linux offers is not the one holding the value.
+
+### Added
+
+- **`turbo` (30 W) and `max` (35 W) profiles.** Both sit on the `performance` PPD
+  position alongside `performance` itself; the GNOME slider still lands on
+  `performance`, and the other two are reached by name. Their curves start earlier and
+  climb harder, because above 25 W the curve rather than the budget does the thermal
+  work.
+- **`scripts/sustained-perf-test.sh`** — sustained load with package power *and* a
+  throughput score per interval, so the shape of a run is visible rather than just its
+  mean. `--monitor` generates no load and changes nothing, for recording what an
+  external benchmark costs. `--stressor` selects a different stress-ng stressor, so the
+  instruction mix can be varied.
+
+### Fixed
+
+- **A profile's power limit could silently not apply.** The daemon bounds how often it
+  re-asserts PL1 against firmware and says "giving up until it is set again"; it never
+  kept that promise. The reset lived only on the poll loop's `apply_profile` paths, and
+  the D-Bus paths do not go through them — `set_profile`'s PPD echo is deliberately
+  skipped so a profile is not applied twice, and the reset went with it. Observed here:
+  the budget was spent one evening, `profile balanced` the next afternoon wrote 20 W and
+  verified it, firmware re-derived 25 W moments later, and the machine ran for six hours
+  at a budget no profile had asked for with nothing in the log saying so. The budget now
+  resets whenever the setpoint changes, on every path.
+
+### Changed
+
+- `PowerLimit::max_watts` treats the zone's declared maximum as a *floor* on the answer
+  rather than a ceiling. Hardware declaring more than we measured is still believed.
+- `docs/hardware-baseline.md` gains **Q7**, and its earlier claim that "the machine's
+  sustained power budget is 25 W" is corrected in place rather than quietly edited away.
+
+### Still not established
+
+That 35 W is sustainable beyond five minutes. Board temperature was still climbing when
+the runs ended — 52.9 °C at interval 14, 56.9 °C at interval 30, no plateau — so these
+runs show survivability, not steady state. All four also ran with the fan pinned at duty
+200; what 35 W costs under a realistic curve is unmeasured.
+
 ## 0.1.0 — 2026-08-26
 
 First public preview. Fan curves, sustained power limits, a battery charge limit and

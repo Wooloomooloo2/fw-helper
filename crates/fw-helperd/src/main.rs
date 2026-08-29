@@ -228,6 +228,54 @@ const FLOOR_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 /// is few enough that a real conflict surfaces as a log line rather than as silence.
 const MAX_POWER_CORRECTIONS: u32 = 5;
 
+/// How many times we will re-assert the power limit before concluding firmware has won.
+///
+/// Bounded because a daemon that fights firmware forever is worse than one that stops
+/// and says so. **Reset whenever the setpoint changes**, because a new setpoint is a new
+/// intention rather than a continuation of a losing fight — which is exactly what the
+/// "giving up until it is set again" message has always promised.
+///
+/// That promise was not kept. The reset lived only on the PPD-follow path, and that path
+/// is deliberately skipped for our own writes (`applied_ppd` marks them so a profile is
+/// not applied twice). So `fw-helperctl profile balanced` inherited an exhausted budget:
+/// measured 2026-08-29, the budget ran out at 18:11 the previous evening, `balanced` was
+/// applied at 13:42 and wrote 20 W, firmware re-derived 25 W moments later, and nothing
+/// ever corrected it. The write verified, the profile reported success, and the machine
+/// ran at a budget no profile had asked for.
+#[derive(Debug)]
+struct PowerCorrections {
+    used: u32,
+    desired: Option<u32>,
+}
+
+impl PowerCorrections {
+    fn new(desired: Option<u32>) -> Self {
+        Self { used: 0, desired }
+    }
+
+    /// Note the setpoint as it stands this tick, resetting the budget if it moved.
+    fn observe(&mut self, desired: Option<u32>) {
+        if desired != self.desired {
+            self.desired = desired;
+            self.used = 0;
+        }
+    }
+
+    fn may_correct(&self) -> bool {
+        self.used < MAX_POWER_CORRECTIONS
+    }
+
+    /// Record a correction; returns how many have now been used.
+    fn record(&mut self) -> u32 {
+        self.used += 1;
+        self.used
+    }
+
+    fn just_exhausted(&self) -> bool {
+        self.used == MAX_POWER_CORRECTIONS
+    }
+}
+
 /// PPD profiles as a number, so the watcher can hand one to the poll loop through an
 /// atomic. 0 means "nothing pending".
 pub fn ppd_code(p: Ppd) -> u8 {
@@ -352,6 +400,66 @@ async fn apply_profile(
         profile.pl1_watts
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod power_correction_tests {
+    use super::*;
+
+    #[test]
+    fn a_bounded_budget_stops_fighting_firmware() {
+        let mut b = PowerCorrections::new(Some(25));
+        for _ in 0..MAX_POWER_CORRECTIONS {
+            assert!(b.may_correct());
+            b.record();
+        }
+        assert!(!b.may_correct(), "budget must be bounded");
+        assert!(b.just_exhausted(), "the give-up message fires exactly once");
+    }
+
+    #[test]
+    fn a_new_setpoint_gets_a_fresh_budget() {
+        // The defect this exists to prevent, measured 2026-08-29: the budget was spent
+        // on a 25 W setpoint the previous evening, and `profile balanced` then wrote
+        // 20 W that firmware immediately re-derived to 25 W with nothing left to correct
+        // it. A new setpoint is a new intention.
+        let mut b = PowerCorrections::new(Some(25));
+        for _ in 0..MAX_POWER_CORRECTIONS {
+            b.record();
+        }
+        assert!(!b.may_correct());
+
+        b.observe(Some(20));
+        assert!(
+            b.may_correct(),
+            "a changed setpoint must restore the budget"
+        );
+    }
+
+    #[test]
+    fn the_same_setpoint_keeps_spending_the_same_budget() {
+        // Otherwise the bound means nothing: observing an unchanged value every tick
+        // would reset it every tick and we would fight firmware forever.
+        let mut b = PowerCorrections::new(Some(25));
+        for _ in 0..MAX_POWER_CORRECTIONS {
+            b.observe(Some(25));
+            b.record();
+        }
+        b.observe(Some(25));
+        assert!(
+            !b.may_correct(),
+            "an unchanged setpoint must not refill the budget"
+        );
+    }
+
+    #[test]
+    fn losing_the_setpoint_entirely_is_also_a_change() {
+        let mut b = PowerCorrections::new(Some(25));
+        b.record();
+        b.observe(None);
+        assert!(b.may_correct());
+        assert_eq!(b.used, 0);
+    }
 }
 
 /// What `govern_fan` has to remember between ticks.
@@ -609,7 +717,7 @@ async fn poll_loop(ctx: Poll) {
     // profile's own value to tell "this profile's budget" from "a limit the user set
     // afterwards", which are the same field but not the same intent.
     let power_override = persisted_power_limit;
-    let mut power_corrections = 0u32;
+    let mut power_corrections = PowerCorrections::new(None);
     // `None` until the first sample: the first reading is a baseline, not a transition.
     let mut last_on_ac: Option<bool> = None;
     let mut last_floor_save = std::time::Instant::now();
@@ -655,7 +763,6 @@ async fn poll_loop(ctx: Poll) {
             match lookup_profile(&known_profiles, &name) {
                 Some(p) => {
                     eprintln!("re-applying persisted profile {name}");
-                    power_corrections = 0;
                     applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
                     let thermal = fan::Thermal::from_telemetry(&sample);
                     if let Err(e) =
@@ -711,7 +818,6 @@ async fn poll_loop(ctx: Poll) {
                     match lookup_profile(&known_profiles, &name) {
                         Some(p) => {
                             eprintln!("switched to {source}; applying profile {name}");
-                            power_corrections = 0;
                             applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
                             let thermal = fan::Thermal::from_telemetry(&sample);
                             if let Err(e) =
@@ -749,7 +855,10 @@ async fn poll_loop(ctx: Poll) {
                     target.as_str(),
                     p.name
                 );
-                power_corrections = 0;
+                // No explicit budget reset here any more. `record_profile` below
+                // updates the desired setpoint, and the enforcement block notices the
+                // change and resets — which also covers the D-Bus paths this branch
+                // never sees.
                 let thermal = fan::Thermal::from_telemetry(&sample);
                 if let Err(e) =
                     apply_profile(&p, false, &axis, &lease, &fs, &*cros_ec, thermal).await
@@ -765,19 +874,23 @@ async fn poll_loop(ctx: Poll) {
 
         // Re-assert the power limit. A verified write is not a durable one here: see
         // Daemon::enforce_power_limit. Bounded, so we never fight firmware forever.
-        if power_corrections < MAX_POWER_CORRECTIONS {
-            if let Ok(guard) = conn
-                .object_server()
-                .interface::<_, iface::Daemon>(OBJECT_PATH)
-                .await
-            {
-                if let Some((desired, observed)) = guard.get().await.enforce_power_limit() {
-                    power_corrections += 1;
+        if let Ok(guard) = conn
+            .object_server()
+            .interface::<_, iface::Daemon>(OBJECT_PATH)
+            .await
+        {
+            let daemon = guard.get().await;
+            // Before the budget check, so a freshly set limit is always enforced even
+            // if the previous setpoint had used the budget up.
+            power_corrections.observe(daemon.desired_power_limit());
+            if power_corrections.may_correct() {
+                if let Some((desired, observed)) = daemon.enforce_power_limit() {
+                    let used = power_corrections.record();
                     eprintln!(
                         "power limit was {observed} W, expected {desired} W; re-applied \
-                         (correction {power_corrections} of {MAX_POWER_CORRECTIONS})"
+                         (correction {used} of {MAX_POWER_CORRECTIONS})"
                     );
-                    if power_corrections == MAX_POWER_CORRECTIONS {
+                    if power_corrections.just_exhausted() {
                         eprintln!(
                             "power limit: firmware keeps overriding us; giving up until it is \
                              set again. This machine may re-derive PL1 from platform_profile"

@@ -194,6 +194,16 @@ impl Daemon {
         }
     }
 
+    /// The power limit we are currently trying to hold, if any.
+    ///
+    /// Read by the poll loop to notice when the setpoint *changes*, which is what
+    /// resets the correction budget. Every path that changes it — `set_profile`,
+    /// `set_power_limit`, `record_profile` — writes this same field, so watching it
+    /// catches all of them without each having to remember to signal.
+    pub fn desired_power_limit(&self) -> Option<u32> {
+        self.state.lock().ok().and_then(|s| s.power_limit)
+    }
+
     /// Re-apply the persisted power limit.
     ///
     /// Same shape as [`Self::reapply_charge_limit`], and for the same reason: read

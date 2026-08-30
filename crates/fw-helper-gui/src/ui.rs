@@ -83,9 +83,6 @@ struct Widgets {
     /// Pending debounced sends, so a control that is still being adjusted issues one
     /// command rather than one per step.
     pending: HashMap<&'static str, glib::SourceId>,
-    /// Whether fan speed is shown as RPM or as a duty count. Shared with the curve
-    /// editor, which owns the control that changes it.
-    units: crate::units::Units,
     /// Controls whose new value has not been seen coming back yet, with what we are
     /// waiting for and since when.
     ///
@@ -103,7 +100,6 @@ pub fn build(app: &adw::Application) {
 
     let banner = adw::Banner::builder().revealed(false).build();
     let banner_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-    let units: crate::units::Units = Rc::new(Cell::new(crate::units::FanUnits::default()));
 
     // The four numbers worth seeing without scrolling: what the CPU is drawing, how
     // hot it is, how hard the fan is working, and what the whole machine costs.
@@ -218,7 +214,7 @@ pub fn build(app: &adw::Application) {
 
     let curve_editor = {
         let tx = commands.clone();
-        crate::curve::CurveEditor::new(Rc::clone(&units), move |points| {
+        crate::curve::CurveEditor::new(move |points| {
             let _ = tx.send(worker::Command::FanCurve(points));
         })
     };
@@ -320,7 +316,6 @@ pub fn build(app: &adw::Application) {
         title,
         banner,
         banner_generation,
-        units,
         power,
         fan,
         cpu_temp: cpu_temp.clone(),
@@ -749,11 +744,11 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
 
 /// One line saying who is driving the fan and, when it is us, why it may not be doing
 /// what was asked.
-fn describe_fan(s: &Snapshot, units: crate::units::FanUnits) -> String {
+fn describe_fan(s: &Snapshot) -> String {
     match s.fan_mode.as_deref() {
         Some("curve") => {
             let duty = s.fan_duty.unwrap_or(0);
-            format!("following a curve · {}", units.describe(duty))
+            format!("following a curve · {}", crate::units::describe_duty(duty))
         }
         Some("manual") => {
             let duty = s.fan_duty.unwrap_or(0);
@@ -763,10 +758,10 @@ fn describe_fan(s: &Snapshot, units: crate::units::FanUnits) -> String {
                 Some(f) if f > 0 && u32::from(duty) <= u32::from(f) + 3 => {
                     format!(
                         "manual · {}, held at the firmware floor",
-                        units.describe(duty)
+                        crate::units::describe_duty(duty)
                     )
                 }
-                _ => format!("manual · {}", units.describe(duty)),
+                _ => format!("manual · {}", crate::units::describe_duty(duty)),
             }
         }
         Some("unavailable") | None => "unavailable".to_string(),
@@ -931,7 +926,7 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
 
     w.profile
         .set_label(s.platform_profile.as_deref().unwrap_or("—"));
-    w.fan_row.set_subtitle(&describe_fan(s, w.units.get()));
+    w.fan_row.set_subtitle(&describe_fan(s));
 
     // Percentage, state, and what is actually left in the pack. Assembled from
     // whatever is known rather than formatted as one string, so a machine reporting

@@ -15,10 +15,12 @@ Window changes, all four asked for directly.
   second. Scaled by *nominal* voltage rather than `voltage_now`, which rises with state
   of charge and sags under load and would make a resting figure drift while nothing was
   happening.
-- **Fan speed shown in RPM, by default.** Linked RPM/Duty toggles in the fan curve
-  group's header change the plot's axis, the per-point speed hints and the fan row
-  together. Duty remains available and is still what the spinners edit, because duty is
-  what a curve stores and what the firmware floor is drawn in.
+- **Fan speed shown in RPM, alongside the duty rather than instead of it.** Every duty
+  the window writes down now carries its speed: each curve point shows `~3840 rpm` beside
+  its spinner, and the fan row reads `duty 120/255 (~3840 rpm)`. There is no unit toggle
+  — the two answer different questions and neither replaces the other, so both are always
+  visible. The spinners and the plot axis stay in duty, which is what a curve stores,
+  what the spinners set and what the firmware floor is drawn in.
   `fw_helper_core::fan::rpm_for_duty` does the conversion by interpolating the measured
   table — never by fitting a line, which would put duty 77 near 2925 rpm where it
   actually turns about 2693.
@@ -45,10 +47,9 @@ duty 30 reads as stopped.
 **The table is flat above duty 200.** Nothing above 200 has been measured; the last
 segment climbs at roughly 30 rpm per duty count, and extrapolating that to 255 would
 claim about 7450 rpm from a fan whose highest observed reading is 5886. Holding the last
-measured value understates the top of the range instead of inventing it. The RPM
-gridlines are placed at the measured duties for the same reason: evenly spaced duties
-produce unevenly spaced speeds, and two evenly spaced speeds would land on the same
-label.
+measured value understates the top of the range instead of inventing it, and it is why
+the plot axis is labelled in duty: the axis has room for one number, and an RPM axis
+would put two gridlines on the same label.
 
 The duty 200 figure — **5803 rpm** — is new, from the four Q7 sustained runs of
 2026-08-28 which held the fan pinned there for five minutes apiece. It is the mean of

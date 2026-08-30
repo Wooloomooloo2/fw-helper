@@ -151,6 +151,14 @@ spins the fan *up*. Read it before running it.
 - [fw-fanctrl](https://github.com/TamtamHero/fw-fanctrl) — established fan curve daemon
 - [LACT](https://github.com/ilya-zlobintsev/LACT) — GPU control, for Framework 16
 - [inputmodule-rs](https://github.com/FrameworkComputer/inputmodule-rs) — FW16 LED matrix
+- [CrOS_EC_Python](https://github.com/Steve-Tech/CrOS_EC_Python) — third-party EC library, and the
+  clearest catalogue of Framework EC command numbers we have found. It independently confirms the
+  `0x3E03` charge-limit opcode of [ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md),
+  which two summary lookups had disagreed about
+- [YAFI](https://github.com/Steve-Tech/YAFI) — GTK4 EC GUI in Python, Linux and Windows. Overlaps on
+  fan, temperatures and charge limit; adds LED control; has no power limits and no daemon. The
+  daemon is the main architectural difference: it is what makes resume re-apply, the fan watchdog
+  and `kill -9` recovery possible at all
 
 ## Licence
 

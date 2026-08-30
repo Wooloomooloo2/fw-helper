@@ -85,6 +85,10 @@ mod tests {
     fn command_id_is_the_one_verified_against_framework_source() {
         // Pinned deliberately. A wrong opcode here is not a compile error and not a
         // runtime error either - the EC would simply answer a different question.
+        //
+        // Two summary lookups disagreed (0x3E07 vs 0x3E03) and this was settled by
+        // reading the enum with its neighbours. Corroborated 2026-08-30 by
+        // CrOS_EC_Python, an unrelated third-party library, which lists the same value.
         assert_eq!(CHARGE_LIMIT_CONTROL, 0x3E03);
     }
 

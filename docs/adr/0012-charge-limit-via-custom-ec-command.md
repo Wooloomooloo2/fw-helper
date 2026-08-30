@@ -152,8 +152,37 @@ fine for weeks.
   packaged for Ubuntu. Its source is the reference for the protocol, which is a different
   thing from being a runtime dependency.
 
+## Corroboration — 2026-08-30
+
+*Appended, not revised: the decision below stands unchanged and this only strengthens
+its weakest step.*
+
+The opcode was the shakiest part of this ADR. It was settled by reading the enum with
+its neighbours, precisely because two separate lookups had returned `0x3E07` and
+`0x3E03` and there was no way to tell which was right from the summaries alone — a
+wrong opcode is neither a compile error nor, usually, a runtime error, because the EC
+just answers a different question.
+
+[`CrOS_EC_Python`](https://github.com/Steve-Tech/CrOS_EC_Python), an unrelated
+third-party library used by the [YAFI](https://github.com/Steve-Tech/YAFI) GUI,
+independently lists `EC_CMD_CHARGE_LIMIT_CONTROL` as **`0x3E03`** under its
+Framework-specific commands. That is an implementation arrived at separately from ours
+and from the same hardware's behaviour, so the value is now corroborated rather than
+merely carefully derived.
+
+It also documents EC commands this project reaches by other means, which is worth
+knowing for [ADR 0006](0006-fail-safe-fan-control.md): `EC_CMD_PWM_SET_FAN_DUTY`
+(`0x0024`) and `EC_CMD_THERMAL_AUTO_FAN_CTRL` (`0x0052`). Our fan control and our
+crash-path restore both go through the `cros_ec` hwmon driver's `pwm1` and
+`pwm1_enable`, so they depend on that driver being present and healthy. `0x0052` over
+`/dev/cros_ec` is a second, driver-independent way to hand the fan back. Not adopted —
+the sysfs path is verified on this hardware and changing a safety path needs its own
+evidence — but recorded, because ADR 0006's whole argument is that handing the fan back
+must not have a single point of failure.
+
 ## Sources
 
 - [FrameworkComputer/framework-system — `chromium_ec/command.rs`](https://github.com/FrameworkComputer/framework-system/blob/main/framework_lib/src/chromium_ec/command.rs)
 - [FrameworkComputer/framework-system — `chromium_ec/commands.rs`](https://github.com/FrameworkComputer/framework-system/blob/main/framework_lib/src/chromium_ec/commands.rs)
 - [coreboot/chrome-ec — `util/cros_ec_dev.h`](https://github.com/coreboot/chrome-ec/blob/main/util/cros_ec_dev.h)
+- [Steve-Tech/CrOS_EC_Python](https://github.com/Steve-Tech/CrOS_EC_Python) — third-party EC library; independent confirmation of `0x3E03`, and a catalogue of command numbers

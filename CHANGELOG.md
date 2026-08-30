@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.3.0 — 2026-08-30
+
+Window changes, all four asked for directly.
+
+### Added
+
+- **Watt-hours in the battery row.** A percentage says how full the pack is; watt-hours
+  say how much work is left in it, which is the figure that compares against a draw in
+  watts. Shown as `58.0 of 72.5 Wh` beside the percentage and state. Read from
+  `energy_now`/`energy_full` where a board offers them and from
+  `charge_now`/`charge_full` scaled by `voltage_min_design` where it does not — the same
+  two-family split the discharge rate already handles, and this machine reports only the
+  second. Scaled by *nominal* voltage rather than `voltage_now`, which rises with state
+  of charge and sags under load and would make a resting figure drift while nothing was
+  happening.
+- **Fan speed shown in RPM, by default.** Linked RPM/Duty toggles in the fan curve
+  group's header change the plot's axis, the per-point speed hints and the fan row
+  together. Duty remains available and is still what the spinners edit, because duty is
+  what a curve stores and what the firmware floor is drawn in.
+  `fw_helper_core::fan::rpm_for_duty` does the conversion by interpolating the measured
+  table — never by fitting a line, which would put duty 77 near 2925 rpm where it
+  actually turns about 2693.
+
+### Changed
+
+- **A profile now says it is a power limit and a fan curve, in the three places you
+  would look:** the profile selector's subtitle, the power limit row, and the "Your
+  profiles" group, which spells out what saving captures and why the charge limit is
+  deliberately left out of it.
+- **Transient banners hide themselves after ten seconds.** Only transient ones: a
+  disconnected daemon is a standing condition and its banner stays until the condition
+  does. A newer message is never cut short by an older message's timer.
+
+### Notes on the RPM conversion
+
+Two details are deliberate and both are tested.
+
+**Stiction is a discontinuity, not a ramp.** Duty 20 measures 0 rpm and duty 30 measures
+1107. Interpolating between them would report duty 25 as a fan turning at 554 rpm, and
+there is no such state — the fan is either stopped or it has broken free. Anything below
+duty 30 reads as stopped.
+
+**The table is flat above duty 200.** Nothing above 200 has been measured; the last
+segment climbs at roughly 30 rpm per duty count, and extrapolating that to 255 would
+claim about 7450 rpm from a fan whose highest observed reading is 5886. Holding the last
+measured value understates the top of the range instead of inventing it. The RPM
+gridlines are placed at the measured duties for the same reason: evenly spaced duties
+produce unevenly spaced speeds, and two evenly spaced speeds would land on the same
+label.
+
+The duty 200 figure — **5803 rpm** — is new, from the four Q7 sustained runs of
+2026-08-28 which held the fan pinned there for five minutes apiece. It is the mean of
+104 settled samples.
+
 ## 0.2.0 — 2026-08-29
 
 Raises this machine's sustained power ceiling from 25 W to the 35 W it actually

@@ -4,7 +4,7 @@ use crate::worker::{self, Command, Update};
 use adw::prelude::*;
 use fw_helper_client::Snapshot;
 use gtk::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -28,9 +28,23 @@ pub fn load_css() {
 }
 
 /// Widgets that get updated on every tick, held so we mutate rather than rebuild.
+/// How long a transient banner stays up before hiding itself.
+///
+/// Long enough to read a sentence you were not looking at, short enough that it is gone
+/// before it becomes furniture. Only *transient* banners expire: a disconnected daemon
+/// is a standing condition, and its banner stays until the condition does.
+const BANNER_SECONDS: u32 = 10;
+
 struct Widgets {
     title: adw::WindowTitle,
     banner: adw::Banner,
+    /// Bumped every time the banner is written to.
+    ///
+    /// A timeout captures the value current when it was scheduled and hides the banner
+    /// only if it still matches, so a newer message is never cut short by an older
+    /// message's timer. Cheaper and safer than storing a `SourceId` and removing it:
+    /// removing a source that has already fired is a warning at best.
+    banner_generation: Rc<Cell<u64>>,
     power: gtk::Label,
     fan: gtk::Label,
     cpu_temp: gtk::Label,
@@ -69,6 +83,9 @@ struct Widgets {
     /// Pending debounced sends, so a control that is still being adjusted issues one
     /// command rather than one per step.
     pending: HashMap<&'static str, glib::SourceId>,
+    /// Whether fan speed is shown as RPM or as a duty count. Shared with the curve
+    /// editor, which owns the control that changes it.
+    units: crate::units::Units,
     /// Controls whose new value has not been seen coming back yet, with what we are
     /// waiting for and since when.
     ///
@@ -85,6 +102,8 @@ pub fn build(app: &adw::Application) {
     let header = adw::HeaderBar::builder().title_widget(&title).build();
 
     let banner = adw::Banner::builder().revealed(false).build();
+    let banner_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    let units: crate::units::Units = Rc::new(Cell::new(crate::units::FanUnits::default()));
 
     // The four numbers worth seeing without scrolling: what the CPU is drawing, how
     // hot it is, how hard the fan is working, and what the whole machine costs.
@@ -109,7 +128,7 @@ pub fn build(app: &adw::Application) {
     let profile = gtk::Label::builder().xalign(0.0).label("—").build();
     let profile_row = adw::ComboRow::builder()
         .title("Profile")
-        .subtitle("power limit and fan curve, via power-profiles-daemon")
+        .subtitle("sets the power limit and the fan curve together")
         .build();
 
     let battery = adw::ActionRow::builder().title("Battery").build();
@@ -122,7 +141,7 @@ pub fn build(app: &adw::Application) {
 
     let power_row = adw::SpinRow::builder()
         .title("Power limit")
-        .subtitle("sustained CPU watts; takes ~32 s to settle")
+        .subtitle("sustained CPU watts, saved with the profile; ~32 s to settle")
         .adjustment(&gtk::Adjustment::new(25.0, 8.0, 25.0, 1.0, 1.0, 0.0))
         .build();
 
@@ -160,6 +179,12 @@ pub fn build(app: &adw::Application) {
 
     let save_group = adw::PreferencesGroup::builder()
         .title("Your profiles")
+        .description(
+            "A profile is a power limit and a fan curve under one name, plus the \
+             power-profiles-daemon mode they run in. Saving captures all three as they \
+             are set right now. The charge limit is left out on purpose: it is a \
+             standing preference, not a performance choice.",
+        )
         .build();
     save_group.add(&save_entry);
     save_group.add(&delete_row);
@@ -193,7 +218,7 @@ pub fn build(app: &adw::Application) {
 
     let curve_editor = {
         let tx = commands.clone();
-        crate::curve::CurveEditor::new(move |points| {
+        crate::curve::CurveEditor::new(Rc::clone(&units), move |points| {
             let _ = tx.send(worker::Command::FanCurve(points));
         })
     };
@@ -294,6 +319,8 @@ pub fn build(app: &adw::Application) {
     let widgets = Rc::new(RefCell::new(Widgets {
         title,
         banner,
+        banner_generation,
+        units,
         power,
         fan,
         cpu_temp: cpu_temp.clone(),
@@ -347,8 +374,7 @@ pub fn build(app: &adw::Application) {
                 if let Ok(mut w) = w2.try_borrow_mut() {
                     w.in_flight
                         .insert("profile", (name.clone(), std::time::Instant::now()));
-                    w.banner.set_title(&format!("applying {name}…"));
-                    w.banner.set_revealed(true);
+                    flash(&w, &format!("applying {name}…"));
                 }
                 let _ = tx.send(Command::Profile(name));
             }
@@ -411,8 +437,7 @@ pub fn build(app: &adw::Application) {
             };
             let name = w.save_entry.text().trim().to_lowercase();
             if name.is_empty() {
-                w.banner.set_title("give the profile a name first");
-                w.banner.set_revealed(true);
+                flash(&w, "give the profile a name first");
                 return;
             }
             // The daemon validates the name properly and its message says what is
@@ -462,8 +487,7 @@ pub fn build(app: &adw::Application) {
                             msg
                         }
                     };
-                    w.banner.set_title(&msg);
-                    w.banner.set_revealed(true);
+                    flash(&w, &msg);
                 }
             }
         }
@@ -725,11 +749,11 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
 
 /// One line saying who is driving the fan and, when it is us, why it may not be doing
 /// what was asked.
-fn describe_fan(s: &Snapshot) -> String {
+fn describe_fan(s: &Snapshot, units: crate::units::FanUnits) -> String {
     match s.fan_mode.as_deref() {
         Some("curve") => {
             let duty = s.fan_duty.unwrap_or(0);
-            format!("following a curve · duty {duty}/255")
+            format!("following a curve · {}", units.describe(duty))
         }
         Some("manual") => {
             let duty = s.fan_duty.unwrap_or(0);
@@ -737,9 +761,12 @@ fn describe_fan(s: &Snapshot) -> String {
                 // The floor is why a quiet setting may not be honoured, and saying so
                 // is the difference between a bug and a decision (ADR 0006).
                 Some(f) if f > 0 && u32::from(duty) <= u32::from(f) + 3 => {
-                    format!("manual · duty {duty}/255, held at the firmware floor")
+                    format!(
+                        "manual · {}, held at the firmware floor",
+                        units.describe(duty)
+                    )
                 }
-                _ => format!("manual · duty {duty}/255"),
+                _ => format!("manual · {}", units.describe(duty)),
             }
         }
         Some("unavailable") | None => "unavailable".to_string(),
@@ -786,8 +813,34 @@ fn stat_card(value: &gtk::Label, caption: &str) -> gtk::Widget {
     stat_card_with_caption(value, caption).0
 }
 
+/// Show a message that hides itself after [`BANNER_SECONDS`].
+///
+/// Takes `&Widgets`, not `&mut`: the generation counter is a `Cell`, so this works from
+/// a shared borrow. That matters because half the callers are signal handlers holding
+/// the widgets immutably, and requiring a mutable borrow would mean either a second
+/// borrow or restructuring handlers that have their own reasons for the borrow they hold.
+fn flash(w: &Widgets, message: &str) {
+    w.banner.set_title(message);
+    w.banner.set_revealed(true);
+
+    let generation = w.banner_generation.get().wrapping_add(1);
+    w.banner_generation.set(generation);
+    let banner = w.banner.clone();
+    let current = Rc::clone(&w.banner_generation);
+    glib::timeout_add_seconds_local_once(BANNER_SECONDS, move || {
+        // Superseded timers still fire; they just find a newer generation and do
+        // nothing, which is what keeps a later message on screen for its full run.
+        if current.get() == generation {
+            banner.set_revealed(false);
+        }
+    });
+}
+
 fn disconnected(w: &mut Widgets, why: &str) {
     w.title.set_subtitle("daemon not running");
+    // Outlive any pending flash: this condition does not expire on a timer.
+    w.banner_generation
+        .set(w.banner_generation.get().wrapping_add(1));
     w.banner
         .set_title(&format!("fw-helperd is not available — {why}"));
     w.banner.set_revealed(true);
@@ -878,15 +931,30 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
 
     w.profile
         .set_label(s.platform_profile.as_deref().unwrap_or("—"));
-    w.fan_row.set_subtitle(&describe_fan(s));
+    w.fan_row.set_subtitle(&describe_fan(s, w.units.get()));
 
-    match (s.battery_percent, s.battery_status.as_deref()) {
-        (Some(p), Some(st)) => {
-            w.battery.set_subtitle(&format!("{p}% · {st}"));
-        }
-        (Some(p), None) => w.battery.set_subtitle(&format!("{p}%")),
-        _ => w.battery.set_subtitle("—"),
+    // Percentage, state, and what is actually left in the pack. Assembled from
+    // whatever is known rather than formatted as one string, so a machine reporting
+    // less drops a clause instead of printing a placeholder — the same rule the system
+    // caption follows. Watt-hours are the figure that compares against a draw in watts;
+    // a percentage on its own cannot answer "how long will this last".
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = s.battery_percent {
+        parts.push(format!("{p}%"));
     }
+    if let Some(st) = s.battery_status.as_deref() {
+        parts.push(st.to_string());
+    }
+    match (s.battery_wh, s.battery_wh_full) {
+        (Some(wh), Some(full)) => parts.push(format!("{wh:.1} of {full:.1} Wh")),
+        (Some(wh), None) => parts.push(format!("{wh:.1} Wh")),
+        _ => {}
+    }
+    w.battery.set_subtitle(&if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" · ")
+    });
 
     for sensor in &s.temps {
         let entry = w.sensor_rows.get(&sensor.label).cloned();

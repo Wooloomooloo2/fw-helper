@@ -53,6 +53,63 @@ pub const PWM_AUTO: u64 = 2;
 /// guarantee at all under load.
 pub const MIN_TAKEOVER_DUTY: u8 = crate::floor::STICTION_DUTY;
 
+/// Measured duty → RPM on this fan, for showing a curve in units people recognise.
+///
+/// **Interpolated, never fitted.** The relationship is concave: a line through the high
+/// points (120/160/181) predicts 1343 rpm at a stopped duty of 0 and puts duty 77 at
+/// 2925 rpm where it actually turns about 2693. Fitting one would misdescribe the whole
+/// low end, which is exactly where a quiet curve lives.
+///
+/// Sources: duties 30–180 from the M0 fan sweep; duty 200 from the four Q7 sustained
+/// runs of 2026-08-28, which held the fan pinned there for five minutes apiece — 5803
+/// rpm, the mean of 104 settled samples. Duty 20 is measured at 0: stiction sits between
+/// 20 and 30, so a duty in that band is a stopped fan rather than a slow one.
+/// Starts at [`MIN_TAKEOVER_DUTY`] because stiction is a **discontinuity, not a ramp**.
+/// Duty 20 measures 0 rpm and duty 30 measures 1107; interpolating between them would
+/// report duty 25 as a fan turning at 554 rpm, and there is no such state — the fan is
+/// either stopped or it has broken free. `rpm_for_duty` returns 0 below the table.
+const DUTY_RPM: &[(u8, u16)] = &[
+    (30, 1107),
+    (50, 1879),
+    (77, 2693),
+    (90, 3052),
+    (120, 3840),
+    (180, 5201),
+    (200, 5803),
+];
+
+/// Approximate RPM for a duty, by interpolating [`DUTY_RPM`].
+///
+/// For display only — the fan is commanded in duty, and the actual RPM at a duty varies
+/// with temperature and airflow. Measured under load, duty 84 produced 2808 rpm where
+/// the table predicts about 2886, so treat this as a label rather than a promise.
+///
+/// **Flat above duty 200, deliberately.** Nothing above 200 has been measured, and the
+/// last segment climbs at roughly 30 rpm per duty count — extrapolating that to 255
+/// would claim about 7450 rpm from a fan whose highest observed reading is 5886. Holding
+/// the last measured value understates the top of the range instead of inventing it.
+pub fn rpm_for_duty(duty: u8) -> u16 {
+    // Below stiction the fan is stopped, whatever the duty says. Interpolating down to
+    // zero would draw a gentle ramp across a band the fan cannot occupy.
+    if duty < MIN_TAKEOVER_DUTY {
+        return 0;
+    }
+    let pairs = DUTY_RPM;
+    let last = pairs[pairs.len() - 1];
+    if duty >= last.0 {
+        return last.1;
+    }
+    for pair in pairs.windows(2) {
+        let ((d0, r0), (d1, r1)) = (pair[0], pair[1]);
+        if duty <= d1 {
+            let span = f64::from(d1 - d0);
+            let along = f64::from(duty - d0) / span;
+            return (f64::from(r0) + along * (f64::from(r1) - f64::from(r0))).round() as u16;
+        }
+    }
+    last.1
+}
+
 /// How far the EC's reported duty may sit from what we asked for before it counts
 /// as a rejected write.
 ///
@@ -471,5 +528,52 @@ mod tests {
         }
         .to_string();
         assert!(duty.contains("released"), "got: {duty}");
+    }
+
+    #[test]
+    fn duty_to_rpm_reproduces_every_measured_point() {
+        // The table is measurement; interpolation between it must not disturb it.
+        for &(duty, rpm) in DUTY_RPM {
+            assert_eq!(rpm_for_duty(duty), rpm, "duty {duty}");
+        }
+    }
+
+    #[test]
+    fn duty_to_rpm_never_goes_backwards() {
+        let mut last = 0;
+        for duty in 0..=255u8 {
+            let rpm = rpm_for_duty(duty);
+            assert!(
+                rpm >= last,
+                "duty {duty} turns slower than the duty below it"
+            );
+            last = rpm;
+        }
+    }
+
+    #[test]
+    fn the_stiction_band_reads_as_a_stopped_fan() {
+        // Duty 1-29 is a stopped fan, not a slow one, and the display must not imply
+        // otherwise by drawing a gentle ramp up from zero.
+        for duty in 0..MIN_TAKEOVER_DUTY {
+            assert_eq!(rpm_for_duty(duty), 0, "duty {duty} should read as stopped");
+        }
+        assert!(rpm_for_duty(MIN_TAKEOVER_DUTY) > 1000);
+    }
+
+    #[test]
+    fn duty_to_rpm_is_flat_above_what_was_measured() {
+        // Deliberate: extrapolating the last segment to 255 would claim ~7450 rpm from
+        // a fan never seen above 5886. Understating beats inventing.
+        let top = rpm_for_duty(200);
+        assert_eq!(rpm_for_duty(255), top);
+        assert_eq!(rpm_for_duty(220), top);
+    }
+
+    #[test]
+    fn duty_to_rpm_stays_concave_where_a_line_would_not() {
+        // A straight line through the high points puts duty 77 near 2925 rpm. The
+        // measured answer is 2693, and the table must keep saying so.
+        assert!(rpm_for_duty(77) < 2800, "got {}", rpm_for_duty(77));
     }
 }

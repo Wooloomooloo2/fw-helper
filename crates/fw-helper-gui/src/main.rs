@@ -8,6 +8,7 @@
 
 mod curve;
 mod ui;
+mod units;
 mod worker;
 
 use adw::prelude::*;

@@ -44,6 +44,10 @@ struct PlotData {
     floor: Vec<(f64, u8)>,
     /// Where the machine is right now: control temperature, and duty if we drive it.
     now: Option<(f64, Option<u8>)>,
+    /// Which units the vertical axis is labelled in. The geometry is always duty —
+    /// that is what a curve stores and what the floor is expressed in — so only the
+    /// labels and the gridline positions change.
+    units: crate::units::FanUnits,
 }
 
 fn x_of(t: f64, w: f64) -> f64 {
@@ -86,7 +90,7 @@ fn draw(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32, d: &P
         cr.move_to(x - 7.0, h - 6.0);
         let _ = cr.show_text(&format!("{t:.0}"));
     }
-    for duty in [0u32, 64, 128, 192, 255] {
+    for (duty, label) in d.units.gridlines() {
         let y = y_of(f64::from(duty), h);
         cr.set_source_rgba(r, g, b, 0.10);
         cr.move_to(PAD_L, y);
@@ -94,7 +98,7 @@ fn draw(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32, d: &P
         let _ = cr.stroke();
         cr.set_source_rgba(r, g, b, 0.45);
         cr.move_to(2.0, y + 3.0);
-        let _ = cr.show_text(&format!("{duty}"));
+        let _ = cr.show_text(&label);
     }
 
     // The firmware floor, filled down to zero: everything inside this region is a duty
@@ -181,6 +185,8 @@ pub struct CurveEditor {
     apply: gtk::Button,
     points: Rc<RefCell<Vec<Point>>>,
     data: Rc<RefCell<PlotData>>,
+    /// Shared with the window, which labels the fan row from the same setting.
+    units: crate::units::Units,
     /// Set the moment the user changes anything, cleared when a curve is applied.
     ///
     /// While it is set, telemetry stops loading the running curve into the editor.
@@ -192,14 +198,42 @@ pub struct CurveEditor {
 }
 
 impl CurveEditor {
-    pub fn new(on_apply: impl Fn(Vec<(f64, u8)>) + 'static) -> Rc<Self> {
+    pub fn new(
+        units: crate::units::Units,
+        on_apply: impl Fn(Vec<(f64, u8)>) + 'static,
+    ) -> Rc<Self> {
         let group = adw::PreferencesGroup::builder()
             .title("Fan curve")
             .description(
-                "Temperature to fan duty. The shaded band is what the firmware would \
-                 do on its own — a point drawn inside it is raised to meet it.",
+                "Temperature to fan speed, saved with the profile. The shaded band is \
+                 what the firmware would do on its own — a point drawn inside it is \
+                 raised to meet it.",
             )
             .build();
+
+        // The unit choice lives in the header of the group whose axis it changes, so
+        // the control and its effect are visible at once. Linked toggles rather than a
+        // combo row: two mutually exclusive options are cheaper to read as buttons, and
+        // this costs no row in a column that is already the tallest thing in the window.
+        let rpm_toggle = gtk::ToggleButton::builder()
+            .label("RPM")
+            .active(units.get() == crate::units::FanUnits::Rpm)
+            .tooltip_text("Show fan speed in RPM, interpolated from measured duties")
+            .build();
+        let duty_toggle = gtk::ToggleButton::builder()
+            .label("Duty")
+            .group(&rpm_toggle)
+            .active(units.get() == crate::units::FanUnits::Duty)
+            .tooltip_text("Show the raw 0-255 duty the hardware is given")
+            .build();
+        let unit_switch = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["linked"])
+            .valign(gtk::Align::Center)
+            .build();
+        unit_switch.append(&rpm_toggle);
+        unit_switch.append(&duty_toggle);
+        group.set_header_suffix(Some(&unit_switch));
 
         let data = Rc::new(RefCell::new(PlotData::default()));
         let plot = gtk::DrawingArea::builder()
@@ -259,8 +293,26 @@ impl CurveEditor {
             apply: apply.clone(),
             points: Rc::new(RefCell::new(Curve::default_quiet().points().to_vec())),
             data,
+            units: Rc::clone(&units),
             dirty: Rc::new(Cell::new(false)),
         });
+
+        // Redraw immediately on toggle rather than waiting for the next telemetry tick:
+        // this is a display preference, and a control that appears to do nothing for a
+        // second reads as broken.
+        {
+            let e = Rc::clone(&editor);
+            rpm_toggle.connect_toggled(move |b| {
+                e.units.set(if b.is_active() {
+                    crate::units::FanUnits::Rpm
+                } else {
+                    crate::units::FanUnits::Duty
+                });
+                // rebuild for the per-row speed hints, refresh for the plot axis.
+                e.rebuild();
+                e.refresh();
+            });
+        }
 
         {
             let e = Rc::clone(&editor);
@@ -354,6 +406,20 @@ impl CurveEditor {
             row.append(&arrow);
             row.append(&gtk::Label::new(Some("duty")));
             row.append(&duty_spin);
+            // The spinner stays in duty whatever the display units say, because duty is
+            // what a curve stores and what the firmware floor is expressed in — and
+            // because duty→RPM is flat above 200, so an RPM spinner would have values
+            // that cannot be reached and two that mean the same thing. The speed is
+            // shown beside it instead, which is the part people actually recognise.
+            let rpm_hint = gtk::Label::builder()
+                .css_classes(["dim-label", "caption"])
+                .width_chars(9)
+                .xalign(1.0)
+                .build();
+            if self.units.get() == crate::units::FanUnits::Rpm {
+                rpm_hint.set_label(&crate::units::FanUnits::Rpm.describe(duty));
+            }
+            row.append(&rpm_hint);
             row.append(&remove);
 
             {
@@ -368,7 +434,13 @@ impl CurveEditor {
             }
             {
                 let e = Rc::clone(self);
+                let rpm_hint = rpm_hint.clone();
                 duty_spin.connect_value_changed(move |s| {
+                    if e.units.get() == crate::units::FanUnits::Rpm {
+                        rpm_hint.set_label(
+                            &crate::units::FanUnits::Rpm.describe(s.value().round() as u8),
+                        );
+                    }
                     if let Ok(mut p) = e.points.try_borrow_mut() {
                         p[i].duty = s.value().round().clamp(0.0, 255.0) as u8;
                     }
@@ -415,6 +487,7 @@ impl CurveEditor {
     /// Validate, report, and redraw. The single place the Apply button's sensitivity
     /// and the status line are decided.
     fn refresh(&self) {
+        self.data.borrow_mut().units = self.units.get();
         let pts = self.points.borrow().clone();
         match Curve::new(pts.clone()) {
             Ok(_) => {

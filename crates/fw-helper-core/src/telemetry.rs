@@ -29,6 +29,17 @@ pub struct Telemetry {
     pub system_watts: Option<f64>,
     /// Minutes until the battery is empty at the current rate, when discharging.
     pub battery_minutes: Option<u64>,
+    /// Energy left in the pack and what a full charge holds, both in watt-hours.
+    ///
+    /// A percentage says how full the battery is; watt-hours say how much work is left
+    /// in it, which is the figure that can be compared against a draw in watts. Both
+    /// are published because the remaining figure means little without the capacity it
+    /// is a fraction of.
+    ///
+    /// Available whatever the battery's state, unlike [`Self::system_watts`] — this is
+    /// a level rather than a rate, so charging does not make it meaningless.
+    pub battery_wh: Option<f64>,
+    pub battery_wh_full: Option<f64>,
     /// True on mains, false on battery, `None` when no mains supply can be found.
     ///
     /// Resolved by the supply's `type` being `Mains`, never by its name: this board
@@ -116,6 +127,9 @@ impl Monitor {
         let (watts, minutes) = self.read_battery_rate();
         t.system_watts = watts;
         t.battery_minutes = minutes;
+        let (wh, wh_full) = self.read_battery_energy();
+        t.battery_wh = wh;
+        t.battery_wh_full = wh_full;
 
         if let Some(hwmon) = self.caps.ec_hwmon.clone() {
             // fan1_target stayed 0 under manual control during hardware validation
@@ -188,6 +202,34 @@ impl Monitor {
             .ok()
             .map(|uah| (uah as f64 * 60.0 / ua as f64) as u64);
         (Some(watts), minutes)
+    }
+
+    /// How much energy is in the pack, and how much it holds full, in watt-hours.
+    ///
+    /// The same two-family problem as [`Self::read_battery_rate`], and the same answer:
+    /// try **energy** (`energy_now`/`energy_full`, already µWh) and fall back to
+    /// **charge** (`charge_now`/`charge_full` in µAh, scaled by voltage). The reference
+    /// machine reports only the charge family.
+    ///
+    /// Scaled by `voltage_min_design`, the pack's *nominal* voltage, not `voltage_now`.
+    /// Nominal is the convention every other tool uses, and it is also the only stable
+    /// choice: `voltage_now` rises with state of charge and sags under load, so using it
+    /// would make a resting figure drift by several percent while nothing was happening.
+    fn read_battery_energy(&self) -> (Option<f64>, Option<f64>) {
+        let bat = paths::BATTERY;
+        let uwh = |name: &str| self.fs.read_u64(&format!("{bat}/{name}")).ok();
+
+        if let Some(now) = uwh("energy_now") {
+            let full = uwh("energy_full").map(|v| v as f64 / 1_000_000.0);
+            return (Some(now as f64 / 1_000_000.0), full);
+        }
+
+        let Some(uv) = uwh("voltage_min_design") else {
+            return (None, None);
+        };
+        // µAh x µV is 1e-12 Wh, so one divisor covers both conversions.
+        let wh = |uah: u64| (uah as f64) * (uv as f64) / 1e12;
+        (uwh("charge_now").map(wh), uwh("charge_full").map(wh))
     }
 
     /// Find the mains supply by type and read whether it is online.

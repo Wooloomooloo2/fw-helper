@@ -196,6 +196,12 @@ pub struct Snapshot {
     pub system_watts: Option<f64>,
     /// Minutes until empty at the current rate.
     pub battery_minutes: Option<u64>,
+    /// Energy in the pack, and what it holds full, in watt-hours. A percentage says how
+    /// full it is; these say how much work is left, which is what compares against a
+    /// draw in watts. Unlike `system_watts` these are levels, so charging does not make
+    /// them meaningless.
+    pub battery_wh: Option<f64>,
+    pub battery_wh_full: Option<f64>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -246,6 +252,8 @@ impl Snapshot {
             auto_profiles: d.auto_profiles().unwrap_or_default(),
             on_ac: t.get("on_ac").and_then(as_bool),
             system_watts: t.get("system_watts").and_then(as_f64),
+            battery_wh: t.get("battery_wh").and_then(as_f64),
+            battery_wh_full: t.get("battery_wh_full").and_then(as_f64),
             battery_minutes: t.get("battery_minutes").and_then(as_u64),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),

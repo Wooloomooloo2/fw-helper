@@ -41,6 +41,12 @@ pub fn telemetry_dict(t: &Telemetry) -> HashMap<String, OwnedValue> {
     if let Some(w) = t.system_watts {
         put("system_watts", Value::F64(w));
     }
+    if let Some(wh) = t.battery_wh {
+        put("battery_wh", Value::F64(wh));
+    }
+    if let Some(wh) = t.battery_wh_full {
+        put("battery_wh_full", Value::F64(wh));
+    }
     if let Some(m) = t.battery_minutes {
         put("battery_minutes", Value::U64(m));
     }

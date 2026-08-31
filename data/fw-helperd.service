@@ -3,6 +3,16 @@ Description=fw-helper firmware control daemon
 Documentation=https://github.com/Wooloomooloo2/fw-helper
 After=dbus.service
 Requires=dbus.service
+# Ordering only, deliberately no Wants=: if PPD is part of this boot we would rather
+# start after it than race it, but we must not be the reason it starts. A machine
+# without PPD is a supported configuration (ADR 0005's fallback), and pulling it in
+# would change that machine's behaviour just by installing us.
+#
+# This is ordering, not a guarantee: systemd considers PPD "started" as soon as its
+# unit is active, which for a D-Bus-activated service is before it owns its name. The
+# daemon adopts PPD on NameOwnerChanged for exactly that reason; this only narrows the
+# window.
+After=power-profiles-daemon.service
 
 [Service]
 Type=dbus

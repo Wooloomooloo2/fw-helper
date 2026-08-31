@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0 — 2026-08-31
+
+### Fixed
+
+- **The daemon no longer loses a boot race with power-profiles-daemon.** PPD is
+  D-Bus-activatable, so *our own probe* is what starts it — and a single probe at startup
+  turned that timing accident into a permanent verdict. On a busy boot the probe inherited
+  D-Bus's ~25 s timeout, we concluded PPD was absent, and wrote `platform_profile`
+  directly — ADR 0005's forbidden path — for the whole session. PPD appeared 23 ms after
+  we gave up. Measured: 26.8 s to a wrong verdict at boot, 4 ms to the right one on
+  restart, and startup blocked for those 27 s.
+
+  The probe is now bounded at 2 s and a miss is no longer final. The daemon watches
+  `NameOwnerChanged` on both of PPD's bus names and adopts it whenever it appears,
+  releasing it only when *both* names are gone. The unit gains
+  `After=power-profiles-daemon.service`, which narrows the window without closing it —
+  systemd considers a D-Bus-activated unit started before it owns its name, which is
+  precisely why adoption rather than ordering is the fix.
+
+  Two details that would otherwise bite later: the `ActiveProfile` subscription is
+  re-armed on adoption with the previous one aborted, so a restarted PPD cannot leave two
+  streams applying the same slider move twice; and the proxy, now mutable state, sits
+  behind a mutex that is never held across an await.
+
+  No `Wants=` on the unit, deliberately. A machine without PPD is a supported
+  configuration, and pulling PPD in would change that machine's behaviour just by
+  installing us.
+
 ## 0.3.0 — 2026-08-30
 
 Window changes, all four asked for directly.

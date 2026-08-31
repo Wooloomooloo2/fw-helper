@@ -147,6 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     }
 
+    // PPD is D-Bus-activatable, so a cold boot can have us probing before it exists and
+    // a single probe would make that timing accident permanent. Adopt it whenever it
+    // appears instead — installed even when the startup probe succeeded, because PPD can
+    // also restart underneath us.
+    axis.watch_for_ppd().await;
+
     let resumed = Arc::new(AtomicBool::new(false));
     logind::watch_sleep(&conn, Arc::clone(&resumed), Arc::clone(&lease)).await;
 

@@ -58,15 +58,18 @@ floor table has largely relearned. `/var/lib/fw-helper/state` reads all zeros th
 should be silent where firmware would not be (ADR 0011). Decide whether `54:51` is a real
 observation or the same one-off anomaly problem in miniature.
 
-**2 - Fix the PPD boot race.** Carried over untouched and still the worst live defect.
-`ProfileAxis::connect` probes once at startup; PPD is D-Bus-activatable, so *our own probe*
-triggers its activation. On a busy boot systemd took 26.9 s, our call hit the ~25 s D-Bus
-timeout, and we fell back to writing `platform_profile` directly - ADR 0005's forbidden
-path - for the whole session. PPD appeared 23 ms after we gave up. Measured: 26.8 s to a
-wrong verdict at boot, 4 ms to the right one on restart. It also blocked startup for 27 s.
-Fix: watch `NameOwnerChanged` on both bus names and adopt PPD when it appears, bound the
-initial probe to ~2 s, add `After=power-profiles-daemon.service`. The proxy becomes mutable
-state, so it goes behind a mutex per the `&self` rule.
+**2 - The PPD boot race is fixed in code, and needs a boot to confirm it.** The probe is
+now bounded at 2 s, a miss is no longer final, and the daemon adopts PPD on
+`NameOwnerChanged` on either bus name - releasing it only when *both* are gone, since PPD
+owns two. The proxy is mutable state behind a mutex, never held across an await. The
+`ActiveProfile` subscription is re-armed on adoption and the previous one aborted, so a
+restarted PPD cannot leave two streams applying the same slider move twice.
+`After=power-profiles-daemon.service` narrows the window but cannot close it: systemd
+calls a D-Bus-activated unit started before it owns its name, which is why adoption is the
+actual fix rather than ordering. **Unverified on hardware.** What to look for on a cold
+boot: startup no longer blocking, and either `delegating to PPD at ... (N ms)` or
+`PPD did not answer within 2s` followed by `PPD appeared at ...; adopting it`. Seeing
+neither adoption line nor a fast delegate is the failure.
 
 **3 - Retire the ADR 0008 leftovers.** `/etc/modprobe.d/fw-helper.conf` and
 `fw-helper-enable-charge-control` are now inert: they configure an interface nothing reads.
@@ -79,7 +82,16 @@ only ever been exercised against the *sysfs* mechanism. It is now a different co
 
 **Open defects, in severity order:**
 
-- **`fw-helperd` loses a boot race with PPD and never recovers.** See step 2.
+- **The battery guard was sized against CPU heat, and charging is a different source.**
+  Its ramp starts at crit - 8 C = 41.9 C, a margin chosen because the pack peaked at
+  **33.9 C** under five minutes of 16-core load (2026-08-21, not charging). Observed
+  2026-08-30 while merely warm from a game and *not* charging: **37.9 C** - already above
+  that "peak under full load" and 4 C from the ramp. Charging heat has never been
+  measured, and the charge rate has not either: the limit holds at 80% so nothing has been
+  sampled crossing it. The curve also follows `peci-temp` alone, so charger heat cannot
+  move the fan except through this guard, which has never fired. Measure before changing
+  any constant - `battery.rs` says outright that a guard firing often means either the
+  thresholds are wrong or the situation is new, and this would be the second.
 - **A one-off floor anomaly is permanent.** Floors only ever rise within a bucket, so a
   single bad sample sticks forever - the cleared table had held `62:184` against neighbours
   of 79, roughly 5200 rpm. Needs outlier rejection or corroboration before a large jump is

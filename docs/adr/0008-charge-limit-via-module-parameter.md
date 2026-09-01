@@ -204,3 +204,32 @@ part of the replacement's install story, not of this correction.
 - [PATCH v5 5/5 — power: supply: cros_charge-control: don't load if Framework control is present](https://lkml.iu.edu/2406.3/08725.html)
 - [PATCH v4 5/5 — same series, v4](https://lkml.iu.edu/hypermail/linux/kernel/2406.2/00329.html)
 - [PATCH v4 0/5 — ChromeOS Embedded Controller charge control driver](https://lkml.rescloud.iu.edu/2406.2/00328.html)
+
+## Retired — 2026-09-01
+
+*Appended, not revised.* [ADR 0012](0012-charge-limit-via-custom-ec-command.md) superseded
+the decision; this records that its **artefacts** are now gone too, which is a separate
+step and was deliberately not folded into that change.
+
+Removed: `data/fw-helper-enable-charge-control`, `data/fw-helper.modprobe.conf`, and
+`install-dev.sh --enable-charge-control`, which now exits with an explanation rather than
+silently doing nothing.
+
+`/etc/modprobe.d/fw-helper.conf` is now **deleted** on install rather than merely reported.
+Earlier versions printed "safe to remove" and left it, which is advice rather than a fix.
+The distinction matters because the drop-in is not inert in the harmless sense: it forces
+`cros_charge-control` to bind, and a bound driver produces a `charge_control_end_threshold`
+that accepts a value, reads it back, persists across suspend and reboot, and does not stop
+charging. That appearance is the whole reason this ADR survived as long as it did. Leaving
+the file in place leaves the trap armed for the next person to read that attribute and
+believe it.
+
+The removal matches on file **content**, not just the path, so a drop-in that happens to
+share the name but is not ours is never touched. It was never a dpkg conffile — the package
+shipped it to `/usr/share`, and only the opt-in step copied it into `/etc` — so removing it
+is cleaning up after ourselves rather than deleting a user's configuration.
+
+One thing the removal cannot do: the module parameter **survives until reboot**. A machine
+that had the drop-in will still have `charge_control_end_threshold` for the rest of the
+session, inert. Both the postinst and `install-dev.sh` say so, because a capability
+outliving the config that enabled it is a trap this project has already been caught by once.

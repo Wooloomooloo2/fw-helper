@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.0 — 2026-09-01
+
+### Removed
+
+- **The ADR 0008 workaround is retired, artefacts and all.**
+  `fw-helper-enable-charge-control` and the modprobe drop-in are gone from the tree and
+  the package, and `install-dev.sh --enable-charge-control` now exits with an explanation
+  rather than silently doing nothing.
+
+  **`/etc/modprobe.d/fw-helper.conf` is now deleted on install**, not merely reported.
+  Earlier versions printed "safe to remove" and left it there, which is advice rather
+  than a fix — and the file is not inert in the harmless sense. It forces
+  `cros_charge-control` to bind, and a bound driver produces a
+  `charge_control_end_threshold` that accepts a value, reads it back, persists across
+  suspend and reboot, and **does not stop charging**. That appearance is the whole reason
+  the superseded mechanism survived as long as it did, so leaving the file in place left
+  the trap armed for the next person to read that attribute and believe it.
+
+  The removal matches on file content rather than only the path, so a drop-in that
+  happens to share the name but is not ours is never touched. It was never a dpkg
+  conffile — the package shipped it to `/usr/share`, and only the opt-in step copied it
+  into `/etc` — so this is cleaning up after ourselves rather than deleting a user's
+  configuration.
+
+  One thing it cannot do: the module parameter **survives until reboot**, so a machine
+  that had the drop-in keeps an inert `charge_control_end_threshold` for the rest of the
+  session. Both the postinst and `install-dev.sh` say so, because a capability outliving
+  the config that enabled it is a trap this project has already been caught by once.
+
 ## 0.4.0 — 2026-08-31
 
 ### Fixed

@@ -71,10 +71,15 @@ boot: startup no longer blocking, and either `delegating to PPD at ... (N ms)` o
 `PPD did not answer within 2s` followed by `PPD appeared at ...; adopting it`. Seeing
 neither adoption line nor a fast delegate is the failure.
 
-**3 - Retire the ADR 0008 leftovers.** `/etc/modprobe.d/fw-helper.conf` and
-`fw-helper-enable-charge-control` are now inert: they configure an interface nothing reads.
-The postinst says the drop-in is safe to remove but nothing deletes it. Needs an uninstall
-path of its own, which is why it was not folded into the ADR 0012 change.
+**3 - The ADR 0008 leftovers are retired.** `data/fw-helper-enable-charge-control` and
+`data/fw-helper.modprobe.conf` are gone from the tree and the package;
+`install-dev.sh --enable-charge-control` now exits with an explanation. The postinst and
+`install-dev.sh` **delete** `/etc/modprobe.d/fw-helper.conf` rather than advising it,
+matching on content so an unrelated drop-in sharing the name survives. The point is not
+tidiness: the drop-in forces `cros_charge-control` to bind, and a bound driver produces a
+`charge_control_end_threshold` that reads back correctly and does not stop charging - the
+appearance that kept ADR 0008 alive for weeks. **Unverified on hardware:** this machine
+still has the drop-in, so installing 0.5.0 is itself the test.
 
 **4 - Reboot and confirm the charge limit survives it.** The EC limit was set at run time
 and the daemon re-applies from `/var/lib/fw-helper/state` at startup, but that re-apply has
@@ -171,7 +176,6 @@ cargo fmt --all                           # CI gate
 cargo build --release --all               # ALWAYS build release too, see traps
 
 sudo ./scripts/install-dev.sh             # D-Bus + polkit policy, CLI shim on PATH
-sudo ./scripts/install-dev.sh --enable-charge-control   # opt-in, ADR 0008
 sudo ./scripts/install-dev.sh --uninstall
 
 sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'

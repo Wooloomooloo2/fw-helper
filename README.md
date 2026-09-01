@@ -104,9 +104,12 @@ enables the service, and creates `/etc/fw-helper/profiles.d/` for your own profi
 
 Nothing takes manual control of the fan until you ask it to.
 
-The charge limit needs no opt-in step any more. `fw-helper-enable-charge-control` and the
-modprobe drop-in belong to the superseded mechanism ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md))
-and no longer do anything useful; they are removed separately.
+The charge limit needs no opt-in step. If a previous version left
+`/etc/modprobe.d/fw-helper.conf` behind, installing removes it: it belonged to the
+superseded mechanism ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md)) and
+was not merely useless — it produced a charge limit that reads back correctly and does not
+stop charging, which is what made that mechanism look right for weeks
+([ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)).
 
 ## Or run it from source
 

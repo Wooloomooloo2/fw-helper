@@ -6,7 +6,6 @@
 #
 #   sudo ./scripts/install-dev.sh            # policy only, run the daemon by hand
 #   sudo ./scripts/install-dev.sh --systemd  # also install + start the unit
-#   sudo ./scripts/install-dev.sh --enable-charge-control
 #   sudo ./scripts/install-dev.sh --uninstall
 #
 # Installs the polkit actions that gate hardware writes, and with --systemd the
@@ -25,24 +24,30 @@ POLKIT=/usr/share/polkit-1/actions/org.fwhelper.policy
 MODPROBE=/etc/modprobe.d/fw-helper.conf
 PROFILES=/etc/fw-helper/profiles.d
 
-# Opt-in, never a side effect of installing: this changes which mechanism governs
-# battery charging on the machine (ADR 0008).
+# Retire the ADR 0008 workaround wherever it is still lying around.
+#
+# It is not merely obsolete. The drop-in forces cros_charge-control to bind, which
+# produces a charge_control_end_threshold that accepts a value, reads it back, persists
+# it - and does not govern charging on this board. That appearance is what made ADR 0008
+# look correct for weeks, so leaving the file in place leaves the trap armed.
+#
+# Matched on content rather than only on the path, so a drop-in that happens to share
+# the name but is not ours is never touched.
+retire_charge_control_dropin() {
+    [[ -e "$MODPROBE" ]] || return 0
+    grep -q probe_with_fwk_charge_control "$MODPROBE" 2>/dev/null || return 0
+    rm -f "$MODPROBE"
+    echo "removed $MODPROBE (superseded by ADR 0012)"
+    echo "  the limit now goes through the EC command that actually governs charging"
+    echo "  the module parameter survives until reboot, so charge_control_end_threshold"
+    echo "  may still exist this session - it is inert"
+}
+
 if [[ "${1:-}" == "--enable-charge-control" ]]; then
-    echo "This makes fw-helper the battery charge-limit authority."
-    echo "Leave the battery limit in UEFI setup at its default, or the two will fight."
-    echo
-    install -m 644 -v "$REPO/data/fw-helper.modprobe.conf" "$MODPROBE"
-    echo "Reloading cros_charge_control..."
-    modprobe -r cros_charge_control 2>/dev/null || true
-    modprobe cros_charge_control 2>/dev/null || true
-    sleep 1
-    if [[ -e /sys/class/power_supply/BAT1/charge_control_end_threshold ]]; then
-        echo "OK: charge_control_end_threshold now present"
-        echo "    current limit: $(cat /sys/class/power_supply/BAT1/charge_control_end_threshold)%"
-    else
-        echo "Not yet present. A reboot may be needed; check: dmesg | grep -i charge" >&2
-    fi
-    exit 0
+    echo "ERROR: --enable-charge-control is gone. It enabled the mechanism ADR 0012" >&2
+    echo "       replaced: the sysfs attribute it produced was wired to the charge" >&2
+    echo "       controller this board ignores. The charge limit needs no opt-in now." >&2
+    exit 2
 fi
 
 if [[ "${1:-}" == "--uninstall" ]]; then
@@ -65,6 +70,8 @@ if ! python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse(sys.argv[1])"
     cat /tmp/fw-policy-parse.err >&2
     exit 1
 fi
+
+retire_charge_control_dropin
 
 install -m 644 -v "$REPO/data/org.fwhelper.Daemon1.conf" "$POLICY"
 # The bus only reads system.d at startup or on reload.
@@ -154,6 +161,7 @@ else
     echo
     echo "Stop it with:  sudo pkill -x fw-helperd"
     echo
-    echo "Charge limiting needs one more opt-in step (see ADR 0008):"
-    echo "    sudo $0 --enable-charge-control"
+    echo "Charge limiting needs no opt-in step: it goes through the EC command over"
+    echo "/dev/cros_ec that actually governs charging (ADR 0012)."
+    echo "    fw-helperctl charge-limit 80"
 fi

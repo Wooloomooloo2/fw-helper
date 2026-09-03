@@ -539,13 +539,32 @@ fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry, state: 
         // the EC quantizes: a target of 88 settles at 89, so next tick's target of 89
         // is a genuine change of decision that moves nothing.
         Some(fan::Enforced::Corrected { from, to, .. }) if from == to => {}
+        // Name the guard that actually demanded the duty. The earlier message reported
+        // the CPU temperature whatever the cause, so the first time the battery guard
+        // fired - 2026-09-01, charging, the pack parked on its ramp start - it read as
+        // the fan oscillating at a steady 52.9 C for no reason at all.
         Some(fan::Enforced::Corrected {
             from,
             to,
             floor,
             celsius,
+            source: fan::FloorSource::Firmware,
         }) => eprintln!(
             "fan: {celsius:.1} C puts the firmware floor at {floor}/255; moved {from} -> {to}"
+        ),
+        Some(fan::Enforced::Corrected {
+            from,
+            to,
+            floor,
+            celsius,
+            source:
+                fan::FloorSource::Battery {
+                    celsius: battery_c,
+                    firmware,
+                },
+        }) => eprintln!(
+            "fan: battery at {battery_c:.1} C asks for {floor}/255, above the {firmware}/255 \
+             the CPU at {celsius:.1} C needs; moved {from} -> {to}"
         ),
         Some(fan::Enforced::ReleasedBatteryHot {
             celsius,

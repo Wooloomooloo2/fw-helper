@@ -107,6 +107,55 @@ const BUCKET_C: f64 = 2.0;
 const BUCKET_BASE_C: f64 = 30.0;
 const BUCKETS: usize = 40; // 30 °C to 110 °C
 
+/// How many hotter buckets must contradict an observation before it is treated as an
+/// outlier rather than a measurement.
+///
+/// Firmware's **ascending branch is monotone in temperature** — it cannot need less air
+/// at 46 °C than it needed at 40 °C — so a bucket whose duty exceeds every one of its
+/// hotter neighbours is not a curiosity, it is proof that one of the two disagrees with
+/// reality. Weight of evidence decides which: several mutually consistent buckets beat a
+/// lone contradicting one.
+///
+/// Three, so a contradiction spans 6 °C. One quiet hotter bucket is not enough and must
+/// not be, because of the asymmetry [`FirmwareFloor::record`] rests on: a quiet sample
+/// proves nothing on its own — firmware may simply not have spun up yet when a 4 °C/s
+/// ramp flew past — whereas a loud one is proof it will.
+///
+/// Repetition is deliberately **not** the test. Whatever produced the `40:51` seen on
+/// 2026-09-01 held for seconds at 1 Hz, so it would have corroborated itself many times
+/// over. Only the table's own internal inconsistency separates it from a measurement.
+const CONTRADICTING_BUCKETS: usize = 3;
+
+/// How far above its hotter neighbours an observation must sit before the contradiction
+/// counts as an outlier rather than noise.
+///
+/// The EC's own duty wanders a little, and the real table shows it: the plateau above
+/// 78 °C reads 153, 158, 166, 156 across neighbouring buckets, a spread of 13 counts
+/// that is plainly one behaviour rather than four. Suppressing on any inconsistency at
+/// all would trim those to the lowest of the group for no benefit and a real loss of
+/// airflow in the band where airflow matters most.
+///
+/// Both anomalies actually seen are an order away from that: `40:51` against zeros is 51
+/// counts, `62:184` against 79 is 105. Twenty-four sits above the measured dither and far
+/// below either — and, from the duty→RPM table, is worth roughly 800 rpm, which is not
+/// something a sensor mistakes.
+const CONTRADICTION_DUTY: u8 = 24;
+
+/// How far the temperature must fall below where a floor was last justified before that
+/// floor is allowed to drop.
+///
+/// The floor is a step function over [`BUCKET_C`]-wide buckets and `peci-temp` dithers
+/// by ~1 °C, so a temperature parked on a boundary alternates between two buckets'
+/// duties every tick. Measured 2026-09-01 at idle: `peci-temp` crossing 39.9 ↔ 40.9 °C
+/// produced `moved 0 -> 54` and `moved 54 -> 0` every couple of minutes, indefinitely —
+/// an audible pulse with no thermal event behind it.
+///
+/// Same reasoning and same width as [`DIRECTION_HYSTERESIS_C`]: a move of one whole
+/// bucket is more than the sensor's quantization can account for, so it means something.
+/// The asymmetry is the safe one — a floor **rises the instant** the temperature says
+/// so, and only its release is delayed.
+const FLOOR_RELEASE_C: f64 = 2.0;
+
 /// Sustained change, in degrees, before the direction is allowed to flip.
 ///
 /// `peci-temp` is quantized to ~1 °C and dithers across a boundary. Measured on
@@ -321,6 +370,50 @@ impl FirmwareFloor {
         self.seen[i].then(|| self.observed[i])
     }
 
+    /// The observation at `celsius`, with a lone contradicted outlier discounted.
+    ///
+    /// Floors only ever rise within a bucket, so one bad sample sticks forever — and
+    /// two have now been seen: `62:184` against neighbours of 79 (~5200 rpm), and
+    /// `40:51` sitting between `38:0` and six consecutive zeros running to `52:0`, which
+    /// pulsed the fan at idle for as long as it stood.
+    ///
+    /// The check is [`CONTRADICTING_BUCKETS`] hotter *seen* buckets, every one of them
+    /// at least [`CONTRADICTION_DUTY`] below this one. When they agree, the highest of
+    /// them stands in — firmware demonstrably runs no harder than that anywhere hotter,
+    /// so it cannot need more here. The margin keeps the EC's own few counts of dither
+    /// from reading as a contradiction.
+    ///
+    /// **Non-destructive on purpose.** The observation is kept, not overwritten, so a
+    /// hotter bucket relearning a higher duty restores the cooler one on the next read
+    /// rather than requiring the table to be cleared by hand.
+    pub fn trusted_duty(&self, celsius: f64) -> Option<u8> {
+        let i = Self::bucket(celsius)?;
+        if !self.seen[i] {
+            return None;
+        }
+        let duty = self.observed[i];
+        // Nothing below zero to fall back to, and no reason to look.
+        if duty == 0 {
+            return Some(0);
+        }
+        let hotter: Vec<u8> = (i + 1..BUCKETS)
+            .filter(|&j| self.seen[j])
+            .take(CONTRADICTING_BUCKETS)
+            .map(|j| self.observed[j])
+            .collect();
+        // Too few hotter observations to overrule anything: the table simply has not
+        // seen enough yet, and the loud answer is the right one meanwhile.
+        if hotter.len() < CONTRADICTING_BUCKETS {
+            return Some(duty);
+        }
+        match hotter.iter().copied().max() {
+            // `saturating_sub` on the observation, not `+` on the neighbour: the
+            // comparison must not wrap when a bucket is near full duty.
+            Some(highest) if highest < duty.saturating_sub(CONTRADICTION_DUTY) => Some(highest),
+            _ => Some(duty),
+        }
+    }
+
     /// The RPM the model predicts firmware would run at this temperature.
     ///
     /// Cold start only. [`Self::floor_duty`] prefers a direct observation whenever one
@@ -341,8 +434,9 @@ impl FirmwareFloor {
         }
         // A direct observation of firmware wins outright, including an observation of
         // duty 0. Firmware running the fan off at 60 °C while heating is not a gap in
-        // our knowledge — it is the answer.
-        if let Some(duty) = self.observed_duty(celsius) {
+        // our knowledge — it is the answer. `trusted_duty` rather than `observed_duty`,
+        // so a single sample the rest of the table contradicts cannot be that answer.
+        if let Some(duty) = self.trusted_duty(celsius) {
             if duty == 0 {
                 return 0;
             }
@@ -369,6 +463,69 @@ impl FirmwareFloor {
         } else {
             (duty, false)
         }
+    }
+}
+
+/// Hysteresis on the floor itself, so a sensor dithering across a bucket edge cannot
+/// chatter the fan.
+///
+/// [`FirmwareFloor::floor_duty`] is a step function — `54:0` next to `56:66` is a jump of
+/// 68 counts across one boundary — and `peci-temp` is quantized to ~1 °C and wanders
+/// either side of wherever it sits. Read literally every tick, that produces a fan
+/// switching between two duties at 1 Hz with nothing thermal happening at all. Measured
+/// at idle on 2026-09-01, before this existed: `moved 0 -> 54` then `moved 54 -> 0` three
+/// seconds later, repeating for as long as the machine was left alone.
+///
+/// **Raise immediately, lower lazily.** The unsafe direction is being slow to speed the
+/// fan up, so a rise is never delayed by even one tick; only the drop waits, until the
+/// temperature has fallen [`FLOOR_RELEASE_C`] below where the held floor was last
+/// justified. The cost of the lag is some quiet, which is the direction this whole module
+/// is allowed to err in.
+///
+/// Kept separate from [`FirmwareFloor`] because it is per-*controller* state rather than
+/// knowledge about the hardware: it belongs to whoever is driving the fan right now, and
+/// resets when the lease changes hands.
+#[derive(Debug, Clone, Default)]
+pub struct FloorHold {
+    /// The floor being held, and the temperature at which it was last justified.
+    held: Option<(u8, f64)>,
+}
+
+impl FloorHold {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed this tick's temperature and the floor the table gives for it; returns the
+    /// floor to actually enforce.
+    pub fn update(&mut self, celsius: f64, floor_now: u8) -> u8 {
+        // An unreadable sensor is not a boundary crossing, and it is emphatically not a
+        // reason to hold a stale floor: report what was asked and remember nothing.
+        if !celsius.is_finite() {
+            return floor_now;
+        }
+        match self.held {
+            // Falling, and not yet clear of where the current floor was justified.
+            Some((duty, at)) if floor_now < duty && celsius > at - FLOOR_RELEASE_C => duty,
+            // Rising, equal, or far enough below to let go. Both the duty and the
+            // temperature that justifies it are refreshed together, so a climb re-arms
+            // the hysteresis at the new height rather than leaving it anchored low.
+            _ => {
+                self.held = Some((floor_now, celsius));
+                floor_now
+            }
+        }
+    }
+
+    /// The floor currently being enforced, if any tick has run.
+    pub fn held(&self) -> Option<u8> {
+        self.held.map(|(duty, _)| duty)
+    }
+
+    /// Forget the held floor. For a change of fan ownership, where the previous
+    /// controller's hysteresis means nothing.
+    pub fn reset(&mut self) {
+        self.held = None;
     }
 }
 
@@ -795,5 +952,194 @@ mod tests {
             "a dropped sample is not a change of direction"
         );
         assert!(d.update(Some(f64::NAN)), "NaN is not a change of direction");
+    }
+    /// `/var/lib/fw-helper/state` as it stood on 2026-09-01, verbatim. `40:51` is the
+    /// anomaly that pulsed the fan at idle; everything else is a real observation and
+    /// must survive untouched.
+    const TABLE_2026_09_01: [(f64, u8); 35] = [
+        (30.0, 0),
+        (32.0, 0),
+        (34.0, 0),
+        (36.0, 0),
+        (38.0, 0),
+        (40.0, 51),
+        (42.0, 0),
+        (44.0, 0),
+        (46.0, 0),
+        (48.0, 0),
+        (50.0, 0),
+        (52.0, 0),
+        (54.0, 51),
+        (56.0, 66),
+        (58.0, 74),
+        (60.0, 79),
+        (62.0, 84),
+        (64.0, 89),
+        (66.0, 94),
+        (68.0, 153),
+        (70.0, 153),
+        (72.0, 153),
+        (74.0, 158),
+        (76.0, 158),
+        (78.0, 153),
+        (80.0, 153),
+        (82.0, 153),
+        (84.0, 158),
+        (86.0, 166),
+        (88.0, 156),
+        (90.0, 156),
+        (92.0, 156),
+        (94.0, 156),
+        (96.0, 153),
+        (98.0, 153),
+    ];
+
+    fn measured() -> FirmwareFloor {
+        let mut f = FirmwareFloor::new();
+        f.restore(TABLE_2026_09_01);
+        f
+    }
+
+    #[test]
+    fn the_idle_pulse_outlier_is_rejected() {
+        let f = measured();
+        // What the daemon logged, over and over: 40.9 C demanded 53 while 39.9 C
+        // demanded nothing, three seconds apart, with the machine doing nothing.
+        assert_eq!(f.observed_duty(40.9), Some(51), "the record is kept");
+        assert_eq!(
+            f.floor_duty(40.9),
+            0,
+            "42 through 46 C all saw firmware silent; 40 C cannot need more air than they do"
+        );
+        assert_eq!(f.floor_duty(39.9), 0);
+    }
+
+    #[test]
+    fn an_observation_its_hotter_neighbours_agree_with_stands() {
+        // 54:51 sat under the same suspicion as 40:51 and is a different case: 56, 58
+        // and 60 C all recorded MORE duty, which is exactly what a monotone curve does.
+        let f = measured();
+        assert_eq!(f.floor_duty(54.9), 51 + FLOOR_MARGIN_DUTY);
+    }
+
+    #[test]
+    fn the_ecs_own_dither_is_not_a_contradiction() {
+        // The plateau above 78 C reads 153, 158, 166, 156. Trimming 86 C to its
+        // neighbours would cost airflow in the band that needs it, for noise.
+        let f = measured();
+        assert_eq!(f.floor_duty(86.9), 166 + FLOOR_MARGIN_DUTY);
+        assert_eq!(f.floor_duty(74.9), 158 + FLOOR_MARGIN_DUTY);
+    }
+
+    #[test]
+    fn one_quiet_hotter_bucket_cannot_overrule_a_loud_one() {
+        // The asymmetry `record` rests on: a quiet sample may only mean firmware had
+        // not spun up yet when a 4 C/s ramp flew past. One of them proves nothing.
+        let mut f = FirmwareFloor::new();
+        f.restore([(66.0, 94), (68.0, 0), (70.0, 153), (72.0, 153)]);
+        assert_eq!(f.floor_duty(66.9), 94 + FLOOR_MARGIN_DUTY);
+    }
+
+    #[test]
+    fn too_few_hotter_observations_to_overrule_anything() {
+        // Two zeros are not evidence; the loud answer stands until the table has seen
+        // enough to say otherwise.
+        let mut f = FirmwareFloor::new();
+        f.restore([(40.0, 51), (42.0, 0), (44.0, 0)]);
+        assert_eq!(f.floor_duty(40.9), 51 + FLOOR_MARGIN_DUTY);
+        f.restore([(46.0, 0)]);
+        assert_eq!(
+            f.floor_duty(40.9),
+            0,
+            "three agreeing neighbours is the bar"
+        );
+    }
+
+    #[test]
+    fn suppression_lifts_when_a_hotter_bucket_relearns() {
+        // Non-destructive: the observation is discounted, not erased, so watching
+        // firmware actually run the fan at 46 C brings 40 C back without hand-editing
+        // the state file.
+        let mut f = measured();
+        assert_eq!(f.floor_duty(40.9), 0);
+        f.observe(46.9, 80, true);
+        assert_eq!(
+            f.floor_duty(40.9),
+            51 + FLOOR_MARGIN_DUTY,
+            "the record was kept, so it can be restored"
+        );
+    }
+
+    #[test]
+    fn a_floor_rises_the_instant_the_table_says_so() {
+        // The unsafe direction, and the one that is never delayed.
+        let mut h = FloorHold::new();
+        assert_eq!(h.update(50.0, 0), 0);
+        assert_eq!(h.update(56.9, 68), 68, "no lag on the way up");
+    }
+
+    #[test]
+    fn dithering_across_a_bucket_edge_does_not_pulse_the_fan() {
+        // The 2026-09-01 defect in miniature, at the 54/56 boundary rather than the
+        // 38/40 one: without the hold this alternates 53, 68, 53, 68 at 1 Hz.
+        let f = measured();
+        let mut h = FloorHold::new();
+        let mut seen = Vec::new();
+        for c in [56.9, 55.9, 56.9, 55.9, 56.9, 55.9] {
+            seen.push(h.update(c, f.floor_duty(c)));
+        }
+        assert_eq!(seen, vec![68, 68, 68, 68, 68, 68], "one duty, not two");
+    }
+
+    #[test]
+    fn the_floor_does_drop_once_the_temperature_is_clear() {
+        // Hysteresis, not a ratchet. A machine that has genuinely cooled gets its
+        // silence back.
+        let f = measured();
+        let mut h = FloorHold::new();
+        assert_eq!(h.update(56.9, f.floor_duty(56.9)), 68);
+        assert_eq!(h.update(55.9, f.floor_duty(55.9)), 68, "inside the band");
+        assert_eq!(
+            h.update(54.8, f.floor_duty(54.8)),
+            53,
+            "a full bucket below where 68 was justified"
+        );
+        assert_eq!(h.update(51.0, f.floor_duty(51.0)), 0);
+    }
+
+    #[test]
+    fn a_climb_re_arms_the_hysteresis_at_the_new_height() {
+        // Otherwise the band stays anchored to the temperature of the first crossing
+        // and a much hotter machine would be allowed to drop after 2 C of cooling from
+        // wherever it started.
+        let f = measured();
+        let mut h = FloorHold::new();
+        h.update(56.9, f.floor_duty(56.9));
+        assert_eq!(h.update(60.9, f.floor_duty(60.9)), 79 + FLOOR_MARGIN_DUTY);
+        assert_eq!(
+            h.update(59.9, f.floor_duty(59.9)),
+            79 + FLOOR_MARGIN_DUTY,
+            "1 C below 60.9 is inside the band"
+        );
+        assert_eq!(h.update(58.5, f.floor_duty(58.5)), 74 + FLOOR_MARGIN_DUTY);
+    }
+
+    #[test]
+    fn an_unreadable_temperature_neither_holds_nor_is_held() {
+        // A dropped sample is not a boundary crossing, and it is not licence to keep
+        // enforcing a floor justified by a temperature we can no longer see.
+        let mut h = FloorHold::new();
+        h.update(56.9, 68);
+        assert_eq!(h.update(f64::NAN, u8::MAX), u8::MAX);
+        assert_eq!(h.held(), Some(68), "and it remembered nothing about NaN");
+    }
+
+    #[test]
+    fn a_reset_forgets_the_held_floor() {
+        let mut h = FloorHold::new();
+        h.update(56.9, 68);
+        h.reset();
+        assert_eq!(h.held(), None);
+        assert_eq!(h.update(55.9, 53), 53, "no hysteresis to inherit");
     }
 }

@@ -25,7 +25,8 @@
 
 use fw_helper_core::fan::DUTY_TOLERANCE;
 use fw_helper_core::{
-    BatteryGuard, Ceiling, Curve, CurveEngine, FanControl, FanError, FanMode, FirmwareFloor, Sysfs,
+    BatteryGuard, Ceiling, Curve, CurveEngine, FanControl, FanError, FanMode, FirmwareFloor,
+    FloorHold, Sysfs,
 };
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -221,6 +222,17 @@ pub struct FanLease {
     /// and a lock there could be held by the panicking thread. Everything on the
     /// shutdown path stays lock-free; only the deliberate control paths take this.
     floor: Mutex<FirmwareFloor>,
+    /// Hysteresis on the enforced floor, so a sensor sitting on a bucket edge does not
+    /// pulse the fan. Per-lease rather than part of the table: it is a fact about what
+    /// we are currently driving, not about the hardware.
+    ///
+    /// **Under the same rule as `floor` and `curve`: no release path locks this.**
+    hold: Mutex<FloorHold>,
+    /// The same hysteresis for the battery guard's ramp, kept separate because it is
+    /// keyed on a **different sensor**. One hold cannot serve both: a floor the battery
+    /// justified at 42.9 °C has to be released by the battery cooling, not by the CPU
+    /// happening to drop 2 °C while the pack stays hot.
+    battery_hold: Mutex<FloorHold>,
 }
 
 impl FanLease {
@@ -234,6 +246,8 @@ impl FanLease {
             restore_duty: AtomicU8::new(0),
             curve: Mutex::new(None),
             floor: Mutex::new(FirmwareFloor::new()),
+            hold: Mutex::new(FloorHold::new()),
+            battery_hold: Mutex::new(FloorHold::new()),
         }
     }
 
@@ -282,6 +296,50 @@ impl FanLease {
             .unwrap_or(u8::MAX)
     }
 
+    /// The lowest duty to actually enforce right now: the firmware floor and the
+    /// battery guard, each with hysteresis, whichever demands more.
+    ///
+    /// Advances both holds, so this is the accessor for the control paths and
+    /// `floor_duty` stays the pure one for display and validation. A rise passes
+    /// through untouched; only a drop is made to wait. See [`FloorHold`].
+    ///
+    /// **Hysteresis has to be applied before the two are combined, not after.** Taking
+    /// `max` of two raw step functions and holding the result is not the same thing: the
+    /// composed value would be released by whichever sensor moved first, including one
+    /// that was not the reason the floor was raised. Measured 2026-09-01, with the hold
+    /// on the firmware floor alone: the pack sat exactly on the guard's ramp start
+    /// (41.9 °C, `crit - 8`) while charging, dithered by its own 1 °C quantization, and
+    /// the fan alternated between duty 0 and duty 43 every few seconds with the CPU
+    /// steady at 52.9 °C throughout.
+    fn enforced_floor(&self, thermal: &Thermal, celsius: f64) -> (u8, u8) {
+        let firmware = self
+            .hold
+            .lock()
+            .map(|mut h| h.update(celsius, self.floor_duty(celsius)))
+            // Poisoned: same answer as everywhere else on this path, the loud one.
+            .unwrap_or(u8::MAX);
+        // Keyed on the battery's temperature, and `NAN` when there is no battery
+        // sensor — which `FloorHold` passes straight through rather than holding.
+        let battery_celsius = thermal.battery_celsius.unwrap_or(f64::NAN);
+        let battery = self
+            .battery_hold
+            .lock()
+            .map(|mut h| h.update(battery_celsius, thermal.battery_floor()))
+            .unwrap_or(u8::MAX);
+        (firmware, battery)
+    }
+
+    /// Drop any held floor. Called where the fan changes hands, because the previous
+    /// controller's hysteresis says nothing about the next one's.
+    fn reset_hold(&self) {
+        if let Ok(mut h) = self.hold.lock() {
+            h.reset();
+        }
+        if let Ok(mut h) = self.battery_hold.lock() {
+            h.reset();
+        }
+    }
+
     fn control(&self) -> Result<FanControl<'_>, FanError> {
         FanControl::probe(&self.fs)
     }
@@ -327,6 +385,12 @@ impl FanLease {
         let Some(celsius) = thermal.celsius.filter(|c| c.is_finite()) else {
             return Err(LeaseError::NoTemperature);
         };
+        // Taking the fan starts a fresh hysteresis: a floor held last time we drove it
+        // was justified at a temperature from another era. Before the floor is computed
+        // below, not after the write — the write is what establishes the new hold.
+        if !self.held() {
+            self.reset_hold();
+        }
         // Checked before anything else touches hardware: above the ceiling the answer
         // is no, whatever the duty and whoever is asking.
         if thermal.ceiling.exceeded_by(celsius) {
@@ -343,7 +407,8 @@ impl FanLease {
         }
         // Whichever demands more air. They are independent: the CPU can be idle while
         // the battery is warm from charging or a hot room.
-        let floor = self.floor_duty(celsius).max(thermal.battery_floor());
+        let (firmware_floor, battery_floor) = self.enforced_floor(&thermal, celsius);
+        let floor = firmware_floor.max(battery_floor);
         let target = duty.max(floor);
 
         let settled = self.write(target)?;
@@ -413,7 +478,8 @@ impl FanLease {
             }
             None => self.requested.load(Ordering::SeqCst),
         };
-        let floor = self.floor_duty(celsius).max(thermal.battery_floor());
+        let (firmware_floor, battery_floor) = self.enforced_floor(&thermal, celsius);
+        let floor = firmware_floor.max(battery_floor);
         let target = requested.max(floor);
 
         let current = self.duty()?;
@@ -429,12 +495,23 @@ impl FanLease {
         if !decision_changed && !drifted {
             return None;
         }
+        // Ties go to the firmware floor: when both ask for the same duty, the EC's own
+        // curve is the plainer explanation and the one the reader expects.
+        let source = if battery_floor > firmware_floor {
+            FloorSource::Battery {
+                celsius: thermal.battery_celsius.unwrap_or(f64::NAN),
+                firmware: firmware_floor,
+            }
+        } else {
+            FloorSource::Firmware
+        };
         match self.write(target) {
             Ok(settled) => Some(Enforced::Corrected {
                 from: current,
                 to: settled,
                 floor,
                 celsius,
+                source,
             }),
             Err(e) => Some(Enforced::Failed(e)),
         }
@@ -511,6 +588,7 @@ impl FanLease {
     /// Hand the fan back and confirm the EC took it.
     pub fn release(&self) -> Result<(), LeaseError> {
         self.clear_curve();
+        self.reset_hold();
         self.requested.store(0, Ordering::SeqCst);
         self.applied.store(0, Ordering::SeqCst);
         // Asking for EC control means asking for it after the next resume too.
@@ -574,6 +652,23 @@ impl FanLease {
     }
 }
 
+/// What set the floor being enforced, for a log line that names the real cause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FloorSource {
+    /// Never quieter than the EC would be at this CPU temperature (ADR 0006 point 4).
+    Firmware,
+    /// The battery guard's ramp is asking for more air than the CPU does. The CPU can
+    /// be idle while the pack is hot from charging or a warm room, so this is not a
+    /// variation on the firmware floor — it is a different sensor with its own reason.
+    Battery {
+        /// What the pack is reading.
+        celsius: f64,
+        /// What the firmware floor alone would have allowed, so the message can show
+        /// how far the guard moved it.
+        firmware: u8,
+    },
+}
+
 /// Outcome of one floor enforcement pass.
 #[derive(Debug)]
 pub enum Enforced {
@@ -583,6 +678,13 @@ pub enum Enforced {
         to: u8,
         floor: u8,
         celsius: f64,
+        /// Which guard demanded `floor`.
+        ///
+        /// Worth carrying rather than inferring at the log line, because getting this
+        /// wrong cost real time on 2026-09-01: the message named the CPU temperature
+        /// beside a floor the *battery* had asked for, so a battery guard firing for
+        /// the first time in the project's life read as a fan bug at 52.9 °C.
+        source: FloorSource,
     },
     /// The temperature became unreadable, so the fan went back to firmware.
     ReleasedNoSensor {
@@ -1072,5 +1174,184 @@ mod tests {
             assert_eq!(enable(&root), "1");
         }
         assert_eq!(enable(&root), "2", "Drop must have handed the fan back");
+    }
+    /// The floor table as `/var/lib/fw-helper/state` held it on 2026-09-01, trimmed to
+    /// the band the idle pulse happened in plus the 54/56 edge used below.
+    const MEASURED_FLOOR: [(f64, u8); 11] = [
+        (38.0, 0),
+        (40.0, 51),
+        (42.0, 0),
+        (44.0, 0),
+        (46.0, 0),
+        (48.0, 0),
+        (50.0, 0),
+        (52.0, 0),
+        (54.0, 51),
+        (56.0, 66),
+        (58.0, 74),
+    ];
+
+    #[test]
+    fn the_idle_pulse_is_gone_end_to_end() {
+        // The 2026-09-01 defect exactly as the journal recorded it: a machine sitting
+        // still, `peci-temp` wandering 39.9 <-> 40.9 C, and the daemon logging
+        // `moved 0 -> 54` / `moved 54 -> 0` every couple of minutes for ever.
+        let root = fixture("idle-pulse");
+        let l = lease(&root);
+        l.restore_floor(MEASURED_FLOOR.to_vec());
+        l.set_duty(0, th(39.9)).unwrap();
+
+        for c in [40.9, 39.9, 40.9, 39.9, 40.9, 39.9] {
+            assert!(
+                l.enforce_floor(th(c)).is_none(),
+                "{c} C moved the fan; nothing thermal happened"
+            );
+        }
+        assert_eq!(l.duty().unwrap(), 0, "an idle machine stays silent");
+    }
+
+    #[test]
+    fn a_real_bucket_edge_does_not_pulse_either() {
+        // The outlier rejection alone would not have fixed this one: 54:51 and 56:66
+        // are both genuine, and a sensor parked between them still has to produce one
+        // duty rather than two. This is the half FloorHold is responsible for.
+        let root = fixture("edge-pulse");
+        let l = lease(&root);
+        l.restore_floor(MEASURED_FLOOR.to_vec());
+        l.set_duty(0, th(56.9)).unwrap();
+        let raised = l.duty().unwrap();
+        assert!(
+            raised >= 66,
+            "the floor should have raised it, got {raised}"
+        );
+
+        for c in [55.9, 56.9, 55.9, 56.9] {
+            assert!(
+                l.enforce_floor(th(c)).is_none(),
+                "{c} C moved the fan across a bucket edge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuine_cooldown_still_gets_its_silence_back() {
+        // Hysteresis, not a ratchet. The whole point of the floor is that a quiet idle
+        // is allowed once firmware itself would be quiet.
+        let root = fixture("edge-cooldown");
+        let l = lease(&root);
+        l.restore_floor(MEASURED_FLOOR.to_vec());
+        l.set_duty(0, th(56.9)).unwrap();
+        assert!(l.duty().unwrap() >= 66);
+
+        match l.enforce_floor(th(44.9)) {
+            Some(Enforced::Corrected { to, .. }) => assert_eq!(to, 0),
+            other => panic!("expected the fan to come back down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn taking_the_fan_starts_a_fresh_hysteresis() {
+        // A floor justified at 56.9 C in a previous session says nothing about a fan
+        // taken again at idle.
+        let root = fixture("hold-reset");
+        let l = lease(&root);
+        l.restore_floor(MEASURED_FLOOR.to_vec());
+        l.set_duty(0, th(56.9)).unwrap();
+        assert!(l.duty().unwrap() >= 66);
+
+        l.release().unwrap();
+        l.set_duty(0, th(55.9)).unwrap();
+        assert_eq!(
+            l.duty().unwrap(),
+            53,
+            "the 54 C bucket's own floor, not the one held at 56.9 C"
+        );
+    }
+    /// A thermal reading with both sensors set, for the guard that keys on the battery.
+    fn th_bat(cpu: f64, battery: f64) -> Thermal {
+        Thermal {
+            celsius: Some(cpu),
+            ceiling: real_ceiling(),
+            battery_celsius: Some(battery),
+            battery: BatteryGuard::from_crit(Some(49.9)),
+        }
+    }
+
+    #[test]
+    fn the_battery_guards_ramp_edge_does_not_pulse_either() {
+        // 2026-09-01, charging: the pack sat on `crit - 8` = 41.9 C exactly and dithered
+        // across it by its own 1 C quantization, so the guard's ramp alternated between
+        // duty 0 and duty 43 with the CPU steady at 52.9 C the whole time. Holding only
+        // the firmware floor left this untouched, which is why it needed its own hold.
+        let root = fixture("battery-edge");
+        let l = lease(&root);
+        l.restore_floor(MEASURED_FLOOR.to_vec());
+        l.set_duty(0, th_bat(52.9, 41.9)).unwrap();
+        assert_eq!(
+            l.duty().unwrap(),
+            0,
+            "below the ramp, the guard asks for nothing"
+        );
+
+        // The first step onto the ramp is a real change and must be obeyed at once.
+        match l.enforce_floor(th_bat(52.9, 42.9)) {
+            Some(Enforced::Corrected { to, .. }) => assert_eq!(to, 43),
+            other => panic!("the guard should have raised the fan, got {other:?}"),
+        }
+        for bat in [41.9, 42.9, 41.9, 42.9, 41.9] {
+            assert!(
+                l.enforce_floor(th_bat(52.9, bat)).is_none(),
+                "battery at {bat} C moved the fan; the pack is sitting still"
+            );
+        }
+    }
+
+    #[test]
+    fn a_battery_driven_floor_names_the_battery() {
+        // The message that sent this diagnosis the wrong way for an evening: a floor the
+        // pack demanded, reported against the CPU's temperature.
+        let root = fixture("battery-named");
+        let l = lease(&root);
+        l.restore_floor(MEASURED_FLOOR.to_vec());
+        l.set_duty(0, th_bat(52.9, 41.9)).unwrap();
+
+        match l.enforce_floor(th_bat(52.9, 42.9)) {
+            Some(Enforced::Corrected {
+                source: FloorSource::Battery { celsius, firmware },
+                floor,
+                ..
+            }) => {
+                assert_eq!(celsius, 42.9);
+                assert_eq!(firmware, 0, "the CPU at 52.9 C needs nothing");
+                assert_eq!(floor, 43);
+            }
+            other => panic!("expected a battery-sourced correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_battery_hold_is_released_by_the_battery_not_the_cpu() {
+        // Why the two holds cannot be one. A floor the pack justified has to wait for
+        // the pack to cool; the CPU dropping 2 C says nothing about it, and a composed
+        // hold would have let the CPU release a guard it never triggered.
+        let root = fixture("battery-release");
+        let l = lease(&root);
+        l.restore_floor(MEASURED_FLOOR.to_vec());
+        l.set_duty(0, th_bat(52.9, 42.9)).unwrap();
+        assert_eq!(l.duty().unwrap(), 43);
+
+        assert!(
+            l.enforce_floor(th_bat(50.0, 42.9)).is_none(),
+            "the CPU cooled; the battery did not, and it is the battery asking"
+        );
+        match l.enforce_floor(th_bat(50.0, 40.5)) {
+            Some(Enforced::Corrected { to, .. }) => {
+                assert_eq!(
+                    to, 0,
+                    "a pack that has genuinely cooled gets the quiet back"
+                )
+            }
+            other => panic!("expected the guard to stand down, got {other:?}"),
+        }
     }
 }

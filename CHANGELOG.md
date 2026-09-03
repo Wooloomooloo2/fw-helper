@@ -1,5 +1,104 @@
 # Changelog
 
+## 0.5.2 — 2026-09-01
+
+### Fixed
+
+- **The battery guard's ramp edge pulsed the fan too, and the log blamed the CPU for it.**
+  Found while checking the fix below, in the same evening's journal: `52.9 C puts the
+  firmware floor at 43/255; moved 0 -> 43` alternating with `... at 0/255; moved 43 -> 0`
+  every few seconds — at a **constant** temperature, which no bucket-edge effect can
+  produce. The floor was not the firmware floor at all. The pack was charging and sitting
+  at 41.9 °C, which is `crit - 8` and therefore the guard's ramp start exactly; its own
+  1 °C quantization walked it back and forth across the threshold, and 43 is what the ramp
+  returns one step up (`ceil(1/6 × 255)`).
+
+  Hysteresis is now applied to the firmware floor and the battery ramp **separately,
+  before they are combined**, each keyed on its own sensor. Composing first and holding
+  the result would be a different and wrong thing: the held floor would be released by
+  whichever sensor moved first, so the CPU cooling 2 °C could stand down a guard that only
+  the battery had triggered.
+
+  The message is split so it names the guard that actually demanded the duty — the old one
+  printed the CPU's temperature whatever the cause, which is why a battery guard firing for
+  the first time in the project's life read as the fan oscillating for no reason.
+
+### Changed
+
+- **The battery guard fired for the first time**, and it is not a malfunction — it did what
+  ADR 0011 designed it to do. It is recorded here because of *when*: while **charging**,
+  which is the heat source the 8 °C margin was never sized against. The pack reached
+  41.9 °C at 75% on mains, against 37.9 °C previously seen warm-and-not-charging and the
+  33.9 °C "peak under five minutes of 16-core load" the margin was actually chosen from.
+  No constant has been changed — one sample is not a measurement, and `battery.rs` is
+  explicit that a guard firing means either the thresholds are wrong or the situation is
+  new. This is the second, and the situation now looks routine rather than exceptional.
+
+- **The fan pulsed on and off at idle, indefinitely.** Observed on the 2026-09-01 boot: a
+  machine sitting still, logging `fan: 40.9 C puts the firmware floor at 53/255; moved
+  0 -> 54` and `fan: 39.9 C ... moved 54 -> 0` every couple of minutes with nothing
+  thermal happening. Two independent causes, both fixed.
+
+  *A sticky outlier in the learned floor table.* `/var/lib/fw-helper/state` held
+  `38:0, 40:51, 42:0, 44:0 ... 52:0` — firmware supposedly needing duty 51 at 40 °C and
+  silence for the twelve degrees above it, which no ascending-branch curve can produce.
+  Floors only ever rise within a bucket, so it could never age out; the earlier instance
+  was `62:184` against neighbours of 79, roughly 5200 rpm.
+
+  Corroboration by repetition would not have caught it — whatever produced the sample held
+  it for seconds at 1 Hz, so it corroborates itself. The usable signal is that firmware's
+  ascending branch is **monotone in temperature**: an observation sitting at least 24 duty
+  counts above each of its next three hotter neighbours contradicts them, and the weight of
+  evidence is against the lone bucket. The highest of those neighbours stands in. The check
+  is at read time and non-destructive, so a hotter bucket relearning restores the cooler one
+  without hand-editing the state file. It also settles a standing question: `54:51` has
+  `56:66`, `58:74` and `60:79` above it, so it is consistent with a monotone curve and
+  **stands as a real observation**.
+
+  The margin matters — the EC's own duty dithers, and the real table reads 153, 158, 166,
+  156 across the plateau above 78 °C. Suppressing on any inconsistency would trim those for
+  noise, in the band where airflow matters most.
+
+  *No hysteresis at a bucket edge.* Even a clean table is a step function over 2 °C buckets
+  read by a sensor quantized to ~1 °C, so a temperature parked on a boundary alternates
+  between two duties every tick — `54:0` next to `56:66` is a 68-count swing. `FloorHold`
+  applies the same Schmitt trigger `Direction` already uses for rising/falling, with the
+  safe asymmetry: a floor **rises the instant** the table says so, and only its release
+  waits, until the temperature has fallen a full bucket below where the held floor was last
+  justified. It resets when the fan changes hands, so a floor justified in a previous
+  session is never inherited.
+
+## 0.5.1 — 2026-09-01
+
+### Fixed
+
+- **The daemon did not start at boot at all, and said nothing about it.** 0.5.0 was the
+  first release carrying `After=power-profiles-daemon.service`, added in 0.4.0's boot-race
+  work. PPD declares `After=multi-user.target display-manager.target`; we are
+  `WantedBy=multi-user.target`. Ordering after PPD therefore orders us after the very
+  target that pulls us in, and systemd broke the cycle the way it always does — by
+  deleting a job, ours:
+
+  ```
+  multi-user.target: Found ordering cycle on fw-helperd.service/start
+  Found dependency on power-profiles-daemon.service/start
+  Found dependency on multi-user.target/start
+  Job fw-helperd.service/start deleted to break ordering cycle
+  ```
+
+  The failure is quiet in a way worth naming. The unit reports `enabled` and
+  `inactive (dead)` — not `failed` — and `journalctl -u fw-helperd` for that boot is
+  empty, because the process never existed to log anything. The only evidence is four
+  lines in the *system* journal, attributed to `multi-user.target`. The visible symptom
+  was the GUI's banner: `The name org.fwhelper.Daemon1 was not provided by any .service
+  files`.
+
+  The ordering is removed, with the reasoning in the unit so it is not re-added, and CI
+  now fails on any `After=`/`Before=`/`Requires=`/`Wants=` naming PPD. Nothing is lost:
+  0.4.0 already recorded that ordering "narrows the window without closing it", since
+  systemd considers a D-Bus-activated unit started before it owns its name. Adoption via
+  `NameOwnerChanged` was already the actual fix — this boot is the proof it has to be.
+
 ## 0.5.0 — 2026-09-01
 
 ### Removed

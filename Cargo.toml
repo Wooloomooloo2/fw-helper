@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.2"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/Wooloomooloo2/fw-helper"

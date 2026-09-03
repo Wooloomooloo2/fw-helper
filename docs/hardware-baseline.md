@@ -164,7 +164,27 @@ Two more facts worth having:
 its 49.9 °C crit. It lags heavily and was still rising during the cooldown. During that
 cooldown, with the fan still running hard, it fell to **26.9 °C — below its idle
 baseline** — so airflow does cool it. What is *not* measured is a long run with the fan
-held low, which is what a user-authored curve will allow.
+held low, which is what a user-authored curve will allow — nor, at the time, anything at
+all about charging, which turned out to be the hotter case (below).
+
+**Charging is a hotter source than the CPU, and it was measured much later.** The
+paragraph above is about CPU load *on battery*, and it was the only battery thermal data
+for six weeks. Measured 2026-09-01 while **charging** on mains at 75%, machine otherwise
+idle: `battery_temp@b` reached **41.9 °C** — above every figure above, and 8 °C from its
+49.9 °C crit. Two earlier readings fill in the shape: **37.9 °C** merely warm from a game
+and not charging (2026-08-30), and the **33.9 °C** five-minute 16-core peak above.
+
+So the ordering is the opposite of what was assumed: the pack is hottest when the CPU is
+doing nothing and the charger is working. This matters beyond the number, because the fan
+curve follows `peci-temp` alone — charger heat cannot move the fan at all except through
+the battery guard, and at 41.9 °C the CPU read 52.9 °C and was asking for nothing.
+
+**41.9 °C is exactly ADR 0011's guard ramp start** (`crit - 8`), a margin chosen when
+33.9 °C was the known peak. The guard duly fired for the first time in the project's life,
+holding the fan at duty 43. It worked; the question it raises is whether a threshold that
+ordinary charging reaches is in the right place. **Not yet answered** — one sample is not a
+measurement, and no constant has been changed. What is needed is `battery_temp@b` logged
+against time across a full charge cycle, to find the actual peak and how long it is held.
 
 **The CPU protects itself at 100 °C.** Constraining the fan costs performance, not
 hardware. The components with no protection of their own are the battery above all, then

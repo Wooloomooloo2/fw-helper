@@ -30,8 +30,9 @@ actually exposes. **Do not re-derive hardware facts — they are measured and re
 
 ### Resume here
 
-Last session ended 2026-08-26. **M0-M7 are complete**, and M2 is complete *for the first
-time honestly*: the battery charge limit now actually stops charging.
+Last session ended 2026-09-01. **M0-M7 are complete**, M2 is complete *for the first
+time honestly* (the battery charge limit now actually stops charging), and the 2026-09-01
+cold boot cleared three of the four items that were queued here.
 
 **The headline, because it changes what the project claims about itself.** The charge
 limit had never worked. `charge_control_end_threshold` accepted 80, read back 80,
@@ -50,42 +51,40 @@ refuses to run on battery or when already above the limit.
 
 **Do these in order.**
 
-**1 - The descent test. Still the highest-value unproven claim**, and now unblocked: the
-floor table has largely relearned. `/var/lib/fw-helper/state` reads all zeros through the
-44-62 C band except a residual `54:51`, against the corrupted `44:48 46:66 48:66 50:74
-52:66 54:66` that provoked the fix. Draw a curve reaching duty 0 by 55 C, heat with
-`stress-ng`, and listen on the way **down** - firmware holds duty 50-90 to 44.9 C, so ours
-should be silent where firmware would not be (ADR 0011). Decide whether `54:51` is a real
-observation or the same one-off anomaly problem in miniature.
+**1 - The descent test. Still the highest-value unproven claim.** Draw a curve reaching
+duty 0 by 55 C, heat with `stress-ng`, and listen on the way **down** - firmware holds duty
+50-90 to 44.9 C, so ours should be silent where firmware would not be (ADR 0011). Nothing
+blocks it; the floor table is clean through the band that matters (`44:0` through `52:0`).
 
-**2 - The PPD boot race is fixed in code, and needs a boot to confirm it.** The probe is
-now bounded at 2 s, a miss is no longer final, and the daemon adopts PPD on
-`NameOwnerChanged` on either bus name - releasing it only when *both* are gone, since PPD
-owns two. The proxy is mutable state behind a mutex, never held across an await. The
-`ActiveProfile` subscription is re-armed on adoption and the previous one aborted, so a
-restarted PPD cannot leave two streams applying the same slider move twice.
-`After=power-profiles-daemon.service` narrows the window but cannot close it: systemd
-calls a D-Bus-activated unit started before it owns its name, which is why adoption is the
-actual fix rather than ordering. **Unverified on hardware.** What to look for on a cold
-boot: startup no longer blocking, and either `delegating to PPD at ... (N ms)` or
-`PPD did not answer within 2s` followed by `PPD appeared at ...; adopting it`. Seeing
-neither adoption line nor a fast delegate is the failure.
+**2 - The fan pulse, from all THREE causes.** Written, tested, **unverified on hardware**
+(0.5.2). Two tests, because the causes fire in different conditions:
 
-**3 - The ADR 0008 leftovers are retired.** `data/fw-helper-enable-charge-control` and
-`data/fw-helper.modprobe.conf` are gone from the tree and the package;
-`install-dev.sh --enable-charge-control` now exits with an explanation. The postinst and
-`install-dev.sh` **delete** `/etc/modprobe.d/fw-helper.conf` rather than advising it,
-matching on content so an unrelated drop-in sharing the name survives. The point is not
-tidiness: the drop-in forces `cros_charge-control` to bind, and a bound driver produces a
-`charge_control_end_threshold` that reads back correctly and does not stop charging - the
-appearance that kept ADR 0008 alive for weeks. **Unverified on hardware:** this machine
-still has the drop-in, so installing 0.5.0 is itself the test.
+- *Idle, cool, on battery.* **VERIFIED 2026-09-02.** Under `stress-ng --cpu 8` the machine
+  held 40.9-41.9 C for 48 s - inside the bucket that carried `40:51`, crossing the 38/40
+  boundary both ways - and logged **zero** floor corrections. The same 16-minute window
+  under 0.5.1 the night before logged **77**.
+- *Charging, pack warm.* **STILL UNVERIFIED** - the third cause, found only because the
+  evening journal was read again. It cannot be provoked at will: it needs the pack near
+  41.9 C, which so far has only happened while charging. Put it on mains below the charge
+  limit and watch for a battery-sourced correction repeating. The message now names the
+  pack, so it is obvious which guard is talking - and that same run is the chance to log
+  `battery_temp@b` against time for the guard's margin, which needs a real charge cycle
+  before any constant moves.
 
-**4 - Reboot and confirm the charge limit survives it.** The EC limit was set at run time
-and the daemon re-applies from `/var/lib/fw-helper/state` at startup, but that re-apply has
-only ever been exercised against the *sysfs* mechanism. It is now a different code path.
+**3 - Measure the battery under charge.** The oldest untested assumption left, and the
+guard is sized against the wrong heat source. See the open defects.
 
 **Open defects, in severity order:**
+
+- **The battery guard has now FIRED, while charging, and the margin looks too tight.**
+  2026-09-01 ~22:55 on mains at 75%: the pack reached **41.9 C**, which is `crit - 8` and
+  the ramp start exactly, and the guard held the fan at duty 43 while the CPU sat at
+  52.9 C needing nothing. It behaved as designed. What it says is that the situation the
+  margin was sized for is now **routine**: 41.9 C charging against 37.9 C seen warm and
+  not charging, against the **33.9 C** five-minute 16-core peak the 8 C was chosen from.
+  Charging heat finally has a number, and it is the highest yet. **No constant has been
+  changed on one sample** - measure a full charge cycle first, `battery_temp@b` against
+  time, and find the actual peak before touching `RAMP_BELOW_CRIT_C`.
 
 - **The battery guard was sized against CPU heat, and charging is a different source.**
   Its ramp starts at crit - 8 C = 41.9 C, a margin chosen because the pack peaked at
@@ -97,10 +96,29 @@ only ever been exercised against the *sysfs* mechanism. It is now a different co
   move the fan except through this guard, which has never fired. Measure before changing
   any constant - `battery.rs` says outright that a guard firing often means either the
   thresholds are wrong or the situation is new, and this would be the second.
-- **A one-off floor anomaly is permanent.** Floors only ever rise within a bucket, so a
-  single bad sample sticks forever - the cleared table had held `62:184` against neighbours
-  of 79, roughly 5200 rpm. Needs outlier rejection or corroboration before a large jump is
-  trusted; not attempted. `54:51` in the current table may be an instance.
+- **A one-off floor anomaly is permanent, and one of them is now audible.** Floors only
+  ever rise within a bucket, so a single bad sample sticks forever. The 2026-09-01 table
+  reads `38:0, 40:51, 42:0, 44:0 ... 52:0` - a duty of 51 at 40 C with silence either side,
+  which no ascending-branch curve can produce. Its consequence is a **fan that pulses at
+  idle**: `peci-temp` dithers 39.9 <-> 40.9 C, the 40 bucket demands 53, and the journal
+  logs `moved 0 -> 54` / `moved 54 -> 0` every couple of minutes, indefinitely. The earlier
+  instance was `62:184` against neighbours of 79, roughly 5200 rpm.
+
+  Two separate causes, and the fix addresses both:
+
+  - *No outlier rejection.* Corroboration by repetition is not enough - whatever produced
+    `40:51` held for seconds, so it would have corroborated itself. The usable signal is
+    that firmware's ascending branch is **monotone in temperature**, so a bucket
+    contradicted by several consecutive hotter ones is the outlier. Suppression is at read
+    time and non-destructive, so a hotter bucket relearning restores the cooler one.
+  - *No hysteresis at a bucket edge.* Even a clean monotone table flaps where the sensor
+    dithers across a boundary - `54:0` next to `56:66` is a 0 <-> 68 oscillation at 1 Hz.
+    Raise immediately, lower only after the temperature has fallen clear of the boundary,
+    the same Schmitt trigger [`Direction`] already uses for rising/falling.
+
+  This also settles the standing question about `54:51`: its hotter neighbours are `56:66`,
+  `58:74`, `60:79`, all higher, so it is consistent with a monotone curve and **stands as a
+  real observation**. Only `40:51` is rejected.
 
 **Verified on hardware and no longer in doubt:**
 
@@ -110,6 +128,21 @@ only ever been exercised against the *sysfs* mechanism. It is now a different co
   re-applying the charge and power limits.
 - **A curve drawn in the GUI drives a real fan**, end to end: at 35.9 C, where firmware
   would have the fan off, a hand-drawn curve held 3389 rpm.
+- **PPD adoption works on a cold boot** (2026-09-01, 0.5.1). The probe missed, startup did
+  not block, and adoption landed one second later: `PPD did not answer within 2s` at
+  13:58:17, `listening on org.fwhelper.Daemon1` the same second, `PPD appeared at
+  org.freedesktop.UPower.PowerProfiles; adopting it` at 13:58:18. `grep 'ordering cycle'`
+  over the boot is empty and the unit is `active (running)`. The 0.5.1 unit fix holds.
+  Caveat on the message: `probe()` tries both bus names sequentially, each bounded by
+  `PROBE_TIMEOUT`, so the real worst case is **2 x 2 s** - the log said "within 2s" while
+  the timestamps said 4.
+- **The ADR 0008 leftovers are gone from a real machine.** After installing over the old
+  layout: `/etc/modprobe.d/fw-helper.conf` absent, `probe_with_fwk_charge_control=N`, and
+  `charge_control_end_threshold` **does not exist** on BAT1 - while the daemon still serves
+  `charge limit available` at 85%. The capability rests on ADR 0012's EC path alone.
+- **The charge limit re-apply works against the EC path** - and the EC does **not** persist
+  it. See the trap table: the limit came back at 100% and only the daemon's re-apply from
+  `/var/lib/fw-helper/state` restored 85%.
 
 **Housekeeping:** `Cargo.lock` is gitignored. For a workspace shipping binaries that is
 arguably wrong - the `libc` dependency added for ADR 0012 is not captured anywhere in
@@ -282,7 +315,13 @@ All of these cost real time once. Do not rediscover them.
 | An **opcode from memory** is a coin flip | Looking up `EC_CMD_CHARGE_LIMIT_CONTROL` returned `0x3E07` from one summary and `0x3E03` from another. The real answer is **`0x3E03`**, settled by reading the enum with its neighbours and since corroborated by [CrOS_EC_Python](https://github.com/Steve-Tech/CrOS_EC_Python), an unrelated implementation. A wrong opcode is not a compile error and often not a runtime error either — the EC simply answers a different question. Pin it in a test, and **prefer a real implementation to a summary** — `CrOS_EC_Python` is the clearest catalogue of Framework EC command numbers we have found, and would have skipped the detour |
 | A **disconnected** GUI still looks operable | Sensitivity is decided by `sync_controls` from a snapshot, which cannot run with no daemon — so controls keep whatever state they were built with. Cold-started against no daemon, every control accepted input and discarded it, which reads as "the app does nothing" rather than "nothing is installed". Build controls insensitive; gate the groups on connection, and let per-row capability sensitivity sit underneath |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |
+| A **cyclic `After=` deletes your unit silently** | `After=power-profiles-daemon.service` looks harmless and cost a whole boot. PPD is `After=multi-user.target`; anything `WantedBy=multi-user.target` that orders after PPD closes a loop, and systemd breaks it by deleting *your* start job. The unit then reads `enabled` / `inactive (dead)` — **not `failed`** — with an empty `journalctl -u`, because the process never existed. The evidence is in the system journal under `multi-user.target`: grep the boot for `ordering cycle`. Never order against a D-Bus-activated service; adopt it at run time |
 | MSRV silently picks stale deps | At `rust-version = "1.74"` the resolver chose zbus 3 while 5 existed. **Check what resolved, not just that it resolved** |
+| The EC charge limit is **volatile across a reboot** | It is not stored in the EC's own persistent config: measured 2026-09-01, a limit of 85% set before a clean shutdown came back reading **100%**, and only the daemon's startup re-apply from `/var/lib/fw-helper/state` restored it (`charge limit is 100%, expected 85%; re-applying`). So a boot where the daemon does not start is a boot that charges to 100% — which is exactly what the cyclic `After=` produced. Same for PL1: firmware came back at 35 W |
+| A floor is **two guards**, and the log named the wrong one | The enforced floor is `max(firmware floor, battery ramp)`, but the message printed the **CPU** temperature whatever the source. So a battery guard firing for the first time ever — pack parked on `crit - 8` while charging, dithering across it — read as `52.9 C puts the firmware floor at 43/255` alternating with `at 0/255`, i.e. a fan oscillating at a constant temperature for no reason. A constant temperature with a changing floor means **the floor came from another sensor** |
+| Hysteresis must go **before** the `max`, not after | Holding the composed floor looks equivalent and is not: the held value is then released by whichever sensor moves first, so the CPU cooling 2 °C stands down a battery guard the CPU never triggered. Each guard's hold is keyed on the sensor that justifies it |
+| A floor bucket edge makes the fan **flap** | The floor is a step function over 2 °C buckets and `peci-temp` dithers ~1 °C, so a temperature sitting on a boundary alternates between the two buckets' duties every tick — `moved 0 -> 54` / `moved 54 -> 0` forever, audible at idle. A step function read from a dithering sensor needs hysteresis of its own, exactly as `Direction` does. Raise on the instant value, lower only after clearing the boundary |
+| Floor observations are **monotone or wrong** | Firmware's ascending-branch duty cannot fall as temperature rises, so `40:51` sitting between `38:0` and `52:0` is not a curiosity — it is proof that one of the two is bad, and the isolated one loses. This internal contradiction is the only outlier detector available; repetition is not one, because whatever produced the bad sample held it for seconds and would corroborate itself |
 
 ## Coexistence
 
@@ -315,6 +354,10 @@ Measured on the target machine, not estimated:
   in the register and still settles at 35.07 W, cold, with zero throttle events — a firmware
   power budget, not a thermal limit. Efficiency falls ~9% per 5 W step
 - Tjmax **100 °C** (`coretemp` crit). Peak in ordinary use **92.8 °C**, not 76.8 °C
+- **The battery is hottest while charging, not under load.** `battery_temp@b` reached
+  **41.9 C** charging at 75% on mains with the CPU idle (2026-09-01) — against 37.9 C warm
+  from a game not charging, and 33.9 C at the five-minute 16-core peak. Crit is 49.9 C and
+  ADR 0011's guard ramp starts at 41.9 C, so ordinary charging now reaches it
 - Duty → RPM is **concave**: 30→1107, 50→1879, 77→2693, 90→3052, 120→3840, 180→5201 rpm.
   Stiction between duty 20 and 30
 - **The EC's curve is hysteretic**, and the descending branch is what M0 recorded. Climbing,

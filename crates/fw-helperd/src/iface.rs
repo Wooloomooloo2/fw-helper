@@ -43,6 +43,11 @@ pub struct Shared {
     pub applied_ppd: Arc<std::sync::atomic::AtomicU8>,
     /// Behind a mutex because saving a profile changes it at run time.
     pub profiles: Arc<Mutex<Vec<fw_helper_core::Profile>>>,
+    /// The recording in progress, shared with the poll loop that feeds it rows.
+    pub recording: Arc<crate::record::Recording>,
+    /// Set when a client reads telemetry, so the poll loop knows the GPU scan is
+    /// worth its cost.
+    pub watchers: Arc<crate::record::Watchers>,
 }
 
 pub struct Daemon {
@@ -77,6 +82,11 @@ pub struct Daemon {
     applied_ppd: Arc<std::sync::atomic::AtomicU8>,
     /// Built-ins merged with anything in `/etc/fw-helper/profiles.d/`.
     profiles: Arc<Mutex<Vec<fw_helper_core::Profile>>>,
+    /// Machine load, published separately from telemetry because it is sampled
+    /// differently — the GPU half only runs while somebody is watching.
+    usage: Mutex<fw_helper_core::Usage>,
+    recording: Arc<crate::record::Recording>,
+    watchers: Arc<crate::record::Watchers>,
 }
 
 impl Daemon {
@@ -92,6 +102,9 @@ impl Daemon {
             axis: shared.axis,
             applied_ppd: shared.applied_ppd,
             profiles: shared.profiles,
+            usage: Mutex::new(fw_helper_core::Usage::default()),
+            recording: shared.recording,
+            watchers: shared.watchers,
         }
     }
 
@@ -318,6 +331,32 @@ impl Daemon {
         *latest = t;
         changed
     }
+
+    /// Publish the latest load sample. Called by the poll task alongside [`Self::update`].
+    pub fn update_usage(&self, u: fw_helper_core::Usage) {
+        if let Ok(mut latest) = self.usage.lock() {
+            *latest = u;
+        }
+    }
+
+    /// A snapshot of the control state a recorded row needs and telemetry does not
+    /// carry: what limit we are enforcing, who owns the fan, which profile is on.
+    pub fn record_context(&self) -> crate::record::Context {
+        crate::record::Context {
+            pl1_watts: self.state.lock().ok().and_then(|s| s.power_limit),
+            fan_mode: Some(match self.fan.mode() {
+                Some(fw_helper_core::FanMode::Manual) => "manual".to_string(),
+                Some(m) => m.to_string(),
+                None => "unavailable".to_string(),
+            }),
+            fan_duty: self.fan.duty(),
+            profile: self.state.lock().ok().and_then(|s| s.profile.clone()),
+        }
+    }
+
+    pub fn recording(&self) -> &Arc<crate::record::Recording> {
+        &self.recording
+    }
 }
 
 #[zbus::interface(name = "org.fwhelper.Daemon1")]
@@ -334,10 +373,111 @@ impl Daemon {
     /// must not be able to drive sampling cadence.
     #[zbus(property)]
     async fn telemetry(&self) -> HashMap<String, OwnedValue> {
+        // Somebody is looking. The poll loop reads this to decide whether the GPU
+        // client scan earns its cost this tick.
+        self.watchers.touch();
         match self.latest.lock() {
             Ok(t) => wire::telemetry_dict(&t),
             Err(_) => Default::default(),
         }
+    }
+
+    /// Machine load: CPU, memory and GPU.
+    ///
+    /// Separate from `Telemetry` because it is sampled on different terms. The GPU
+    /// figures require walking every process's file descriptors, so they are only
+    /// collected while a client is reading this — their keys appear a tick or so after
+    /// somebody starts watching and disappear again afterwards, which is a property of
+    /// the sampler rather than of the hardware.
+    #[zbus(property)]
+    async fn usage(&self) -> HashMap<String, OwnedValue> {
+        self.watchers.touch();
+        match self.usage.lock() {
+            Ok(u) => wire::usage_dict(&u),
+            Err(_) => Default::default(),
+        }
+    }
+
+    /// The recording in progress as `(label, name, path, started_unix, samples)`.
+    /// An empty label means nothing is being recorded.
+    #[zbus(property(emits_changed_signal = "false"))]
+    async fn recording_session(&self) -> (String, String, String, u64, u64) {
+        match self.recording.status() {
+            Some(s) => (s.label, s.name, s.path, s.started_unix, s.samples),
+            None => (String::new(), String::new(), String::new(), 0, 0),
+        }
+    }
+
+    /// Recorded sessions as `(name, label, path, started_unix, bytes)`, newest first.
+    ///
+    /// The rows themselves are deliberately not served here. A session is tens of
+    /// thousands of rows, the files are world-readable by design, and a client that
+    /// wants to plot one opens it directly rather than dragging it across the bus.
+    #[zbus(property(emits_changed_signal = "false"))]
+    async fn sessions(&self) -> Vec<(String, String, String, u64, u64)> {
+        fw_helper_core::session::list(&crate::record::session_dir())
+            .into_iter()
+            .map(|m| {
+                (
+                    m.name,
+                    m.label,
+                    m.path.display().to_string(),
+                    m.started_unix,
+                    m.bytes,
+                )
+            })
+            .collect()
+    }
+
+    /// Begin recording. Returns the file being written.
+    async fn start_recording(
+        &self,
+        label: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<String> {
+        let sender = Self::authorize(&header, conn, polkit::actions::RECORD).await?;
+        let path = self
+            .recording
+            .start(label)
+            .map_err(zbus::fdo::Error::Failed)?;
+        eprintln!("recording started by {sender}");
+        Ok(path)
+    }
+
+    /// Stop recording. Returns the finished file.
+    async fn stop_recording(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<String> {
+        Self::authorize(&header, conn, polkit::actions::RECORD).await?;
+        self.recording.stop().map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// Delete a recorded session by name.
+    async fn delete_session(
+        &self,
+        name: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        Self::authorize(&header, conn, polkit::actions::RECORD).await?;
+
+        // Never the recording in progress. Unlinking a file that is still open does not
+        // fail the writes - the descriptor keeps addressing the now-nameless inode, so
+        // the recording would carry on into nothing and hand back a path that no longer
+        // exists when it stopped. Refuse, and say what to do instead.
+        if self.recording.active_name().as_deref() == Some(name) {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "{name} is being recorded right now; stop the recording first"
+            )));
+        }
+
+        // The name is validated as a bare file stem inside `session::delete`; a caller
+        // sending `../../etc/passwd` must not be able to reach outside the directory.
+        fw_helper_core::session::delete(&crate::record::session_dir(), name)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("cannot delete {name:?}: {e}")))
     }
 
     /// Validated critical thresholds per sensor. Sensors reporting implausible
@@ -922,6 +1062,8 @@ mod tests {
                 applied_ppd: Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 profiles: Arc::new(Mutex::new(fw_helper_core::Profile::built_ins())),
                 ec,
+                recording: Arc::new(crate::record::Recording::new()),
+                watchers: Arc::new(crate::record::Watchers::default()),
             },
         )
     }

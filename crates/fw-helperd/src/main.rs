@@ -18,11 +18,12 @@ mod logind;
 mod polkit;
 mod ppd;
 mod profiles;
+mod record;
 mod state;
 mod watchdog;
 mod wire;
 
-use fw_helper_core::{Capabilities, Monitor, Ppd, Profile, Sysfs};
+use fw_helper_core::{Capabilities, Monitor, Ppd, Profile, Sysfs, UsageSampler};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,6 +31,9 @@ use std::time::Duration;
 
 const BUS_NAME: &str = "org.fwhelper.Daemon1";
 const OBJECT_PATH: &str = "/org/fwhelper/Daemon1";
+
+/// How many ticks the GPU client scan stays on after the last client read telemetry.
+const WATCH_GRACE_TICKS: u8 = 5;
 
 /// One second. This is the publication rate cap from ADR 0009, not a performance
 /// tuning knob — do not raise it without superseding that ADR.
@@ -99,6 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let applied_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let known_profiles = Arc::new(std::sync::Mutex::new(profiles::load()));
+    let recording = Arc::new(record::Recording::new());
+    let watchers = Arc::new(record::Watchers::default());
 
     let daemon = iface::Daemon::new(
         fs.clone(),
@@ -111,6 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             applied_ppd: Arc::clone(&applied_ppd),
             profiles: Arc::clone(&known_profiles),
             ec: Arc::clone(&cros_ec),
+            recording: Arc::clone(&recording),
+            watchers: Arc::clone(&watchers),
         },
     );
     daemon.reapply_charge_limit();
@@ -170,6 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persisted_profile,
         persisted_power_limit: state_power_limit,
         known_profiles: Arc::clone(&known_profiles),
+        usage: UsageSampler::new(fs.clone()),
+        recording: Arc::clone(&recording),
+        watchers: Arc::clone(&watchers),
     }));
 
     // Shut down cleanly on either signal, and hand the fan back before doing anything
@@ -193,6 +204,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     shut_down_fan(&lease, &watchdog);
+    // Nothing should read numbers from a daemon that has stopped. systemd's
+    // RuntimeDirectory= covers the packaged case; this covers a daemon run by hand.
+    record::clear_hud();
     poll.abort();
     Ok(())
 }
@@ -704,6 +718,9 @@ struct Poll {
     persisted_profile: Option<String>,
     persisted_power_limit: Option<u32>,
     known_profiles: Arc<std::sync::Mutex<Vec<Profile>>>,
+    usage: UsageSampler,
+    recording: Arc<record::Recording>,
+    watchers: Arc<record::Watchers>,
 }
 
 async fn poll_loop(ctx: Poll) {
@@ -721,6 +738,9 @@ async fn poll_loop(ctx: Poll) {
         persisted_profile,
         persisted_power_limit,
         known_profiles,
+        mut usage,
+        recording,
+        watchers,
     } = ctx;
     let iface_ref = match conn
         .object_server()
@@ -747,6 +767,13 @@ async fn poll_loop(ctx: Poll) {
     let mut last_on_ac: Option<bool> = None;
     let mut last_floor_save = std::time::Instant::now();
     let mut saved_floor_revision = 0u64;
+    // Ticks of GPU scanning left after the last client read telemetry. A few, not one,
+    // so a client polling at our own 1 Hz does not flicker the scan on and off and
+    // lose its reference point every other tick.
+    let mut watch_grace: u8 = 0;
+    // Wall-clock seconds into the current recording, so rows are evenly spaced even if
+    // a tick is late.
+    let mut recording_started: Option<std::time::Instant> = None;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         ticker.tick().await;
@@ -761,7 +788,11 @@ async fn poll_loop(ctx: Poll) {
         // swap(false) so the resume is consumed exactly once.
         if resumed.swap(false, Ordering::SeqCst) {
             mon.on_resume();
-            eprintln!("resumed from sleep; energy reference invalidated");
+            // Same reasoning, different counters: /proc/stat keeps counting across
+            // s2idle while the GPU's clock does not, so every rate spanning the sleep
+            // is wrong in one direction or the other.
+            usage.invalidate();
+            eprintln!("resumed from sleep; energy and load references invalidated");
             // The fan is restored below rather than here, on the freshly sampled
             // telemetry: the machine may have woken warmer than it slept, and the
             // floor must be computed from temperatures read after the wake.
@@ -781,6 +812,18 @@ async fn poll_loop(ctx: Poll) {
         }
 
         let sample = mon.sample();
+
+        // The GPU half of the load sample walks every file descriptor on the machine
+        // to find DRM clients, so it runs only while someone would see the result:
+        // a client reading telemetry, or a recording in progress.
+        if watchers.take() {
+            watch_grace = WATCH_GRACE_TICKS;
+        } else {
+            watch_grace = watch_grace.saturating_sub(1);
+        }
+        let recording_now = recording.is_active();
+        usage.set_gpu_scan(watch_grace > 0 || recording_now);
+        let load = usage.sample(std::time::Instant::now());
 
         // Apply the persisted profile on the first tick that has real telemetry: the
         // fan curve needs a temperature, and at startup there is not one yet.
@@ -953,6 +996,31 @@ async fn poll_loop(ctx: Poll) {
         // as long as the dialog is on screen. Telemetry - and therefore the watchdog's
         // heartbeat - must not depend on how quickly someone types a password.
         let guard = iface_ref.get().await;
+
+        // Recording and the HUD line both need control state the telemetry sample does
+        // not carry - the limit we are enforcing, who owns the fan, the active profile.
+        let context = guard.record_context();
+
+        if recording_now {
+            let started = recording_started.get_or_insert_with(std::time::Instant::now);
+            let elapsed = started.elapsed().as_secs();
+            guard
+                .recording()
+                .push(&record::row(elapsed, &sample, &load, &context));
+        } else {
+            recording_started = None;
+        }
+
+        // Written every tick regardless: an overlay reading this in a game's frame loop
+        // must never be the reason the daemon does extra work, and one short file is
+        // cheaper than answering a D-Bus call per frame.
+        record::write_hud(&record::hud_line(
+            &sample,
+            &context,
+            recording.status().as_ref(),
+        ));
+
+        guard.update_usage(load);
         if guard.update(sample) {
             let emitter = iface_ref.signal_emitter();
             let _ = guard.telemetry_changed(emitter).await;

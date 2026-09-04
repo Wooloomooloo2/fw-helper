@@ -141,4 +141,12 @@ pub mod actions {
     pub const SET_CHARGE_LIMIT: &str = "org.fwhelper.set-charge-limit";
     pub const SET_FAN: &str = "org.fwhelper.set-fan";
     pub const SET_POWER_LIMIT: &str = "org.fwhelper.set-power-limit";
+    /// Start, stop and delete monitoring sessions.
+    ///
+    /// Still an action rather than an unchecked method, because it makes the daemon
+    /// write root-owned files on a caller's say-so — but the policy grants it to any
+    /// active session without a prompt. It changes no hardware, and a password dialog
+    /// on a Record button is exactly the "trains people to click through prompts"
+    /// failure the other actions here are written to avoid.
+    pub const RECORD: &str = "org.fwhelper.record";
 }

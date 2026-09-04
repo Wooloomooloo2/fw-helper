@@ -9,6 +9,14 @@
 use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 
+/// A recorded session on the wire: `(name, label, path, started_unix, bytes)`.
+/// Decoded into [`SessionInfo`] the moment it arrives.
+pub type SessionTuple = (String, String, String, u64, u64);
+
+/// The recording in progress on the wire: `(label, name, path, started_unix, samples)`.
+/// An empty label means nothing is being recorded.
+pub type RecordingTuple = (String, String, String, u64, u64);
+
 #[zbus::proxy(
     interface = "org.fwhelper.Daemon1",
     default_service = "org.fwhelper.Daemon1",
@@ -29,6 +37,37 @@ pub trait Daemon {
     fn capabilities(&self) -> zbus::Result<HashMap<String, (bool, String)>>;
     #[zbus(property)]
     fn telemetry(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+
+    /// Machine load: CPU, memory and GPU.
+    ///
+    /// Must not be cached. Beyond the usual staleness, *reading* this is what tells the
+    /// daemon somebody is watching — the GPU half of the sample is only collected while
+    /// a client is asking for it, so a cached proxy would switch the scan off and then
+    /// wonder why the numbers never arrive.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn usage(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+
+    /// The recording in progress as `(label, name, path, started_unix, samples)`.
+    /// An empty label means nothing is being recorded.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn recording_session(&self) -> zbus::Result<RecordingTuple>;
+
+    /// Recorded sessions as `(name, label, path, started_unix, bytes)`, newest first.
+    ///
+    /// Metadata only. The rows live in world-readable CSV files and a client that wants
+    /// to plot one opens it directly rather than pulling tens of thousands of rows
+    /// across the bus.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn sessions(&self) -> zbus::Result<Vec<SessionTuple>>;
+
+    /// Start recording a session. Returns the file being written.
+    fn start_recording(&self, label: &str) -> zbus::Result<String>;
+
+    /// Stop recording. Returns the finished file.
+    fn stop_recording(&self) -> zbus::Result<String>;
+
+    /// Delete a recorded session by name.
+    fn delete_session(&self, name: &str) -> zbus::Result<()>;
     #[zbus(property)]
     fn critical_temperatures(&self) -> zbus::Result<HashMap<String, f64>>;
     #[zbus(property(emits_changed_signal = "false"))]
@@ -204,6 +243,83 @@ pub struct Snapshot {
     pub battery_wh_full: Option<f64>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
+    /// Machine load. Every field is `None` until the daemon has two samples to compare,
+    /// and the GPU ones stay `None` on a machine whose driver we cannot read.
+    pub load: Load,
+    /// The recording in progress, if any.
+    pub recording: Option<Recording>,
+    /// Recorded sessions, newest first. Metadata only — a client that plots one opens
+    /// the file itself, which is why these are world-readable.
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// Machine load, as decoded from the daemon's `Usage` property.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Load {
+    pub cpu_percent: Option<f64>,
+    pub cpu_mhz: Option<u64>,
+    pub gpu_percent: Option<f64>,
+    pub gpu_mhz: Option<u64>,
+    pub mem_used_kb: Option<u64>,
+    pub mem_total_kb: Option<u64>,
+    pub swap_used_kb: Option<u64>,
+    /// Throttle events during the last interval, not since boot.
+    pub throttle_events: u64,
+    pub throttle_ms: u64,
+    /// GPU throttle reasons currently asserted, `+`-joined. The CPU exposes no
+    /// equivalent flag - read power against the limit instead.
+    pub gpu_throttle: Option<String>,
+    /// The process using the GPU most, and its share.
+    pub gpu_top: Option<(String, f64)>,
+    /// Per-engine GPU busy, busiest first.
+    pub gpu_engines: Vec<(String, f64)>,
+}
+
+impl Load {
+    pub fn mem_percent(&self) -> Option<f64> {
+        let (used, total) = (self.mem_used_kb?, self.mem_total_kb?);
+        (total > 0).then(|| used as f64 * 100.0 / total as f64)
+    }
+
+    pub fn throttled(&self) -> bool {
+        self.throttle_events > 0 || self.gpu_throttle.is_some()
+    }
+}
+
+/// A recording in progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recording {
+    pub label: String,
+    pub name: String,
+    pub path: String,
+    pub started_unix: u64,
+    pub samples: u64,
+}
+
+/// One recorded session on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub name: String,
+    pub label: String,
+    pub path: String,
+    pub started_unix: u64,
+    pub bytes: u64,
+}
+
+impl SessionInfo {
+    pub fn fetch(d: &DaemonProxyBlocking<'_>) -> Vec<Self> {
+        d.sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, label, path, started_unix, bytes)| Self {
+                name,
+                label,
+                path,
+                started_unix,
+                bytes,
+            })
+            .collect()
+    }
 }
 
 impl Snapshot {
@@ -263,6 +379,21 @@ impl Snapshot {
             control_sensor: t.get("control_sensor").and_then(as_string),
             temps,
             capabilities: caps,
+            load: decode_load(&d.usage().unwrap_or_default()),
+            sessions: SessionInfo::fetch(d),
+            recording: d.recording_session().ok().and_then(
+                |(label, name, path, started_unix, samples)| {
+                    // The daemon reports an empty label for "not recording"; keep that
+                    // sentinel here rather than leaking it to consumers.
+                    (!label.is_empty()).then_some(Recording {
+                        label,
+                        name,
+                        path,
+                        started_unix,
+                        samples,
+                    })
+                },
+            ),
         })
     }
 
@@ -271,6 +402,42 @@ impl Snapshot {
             .iter()
             .find(|(k, _, _)| k == name)
             .map(|(_, ok, why)| (*ok, why.as_str()))
+    }
+}
+
+fn decode_load(u: &HashMap<String, OwnedValue>) -> Load {
+    let mut engines: Vec<(String, f64)> = u
+        .get("gpu_engines")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| HashMap::<String, f64>::try_from(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    engines.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Load {
+        cpu_percent: u.get("cpu_percent").and_then(as_f64),
+        cpu_mhz: u.get("cpu_mhz").and_then(as_u64),
+        gpu_percent: u.get("gpu_percent").and_then(as_f64),
+        gpu_mhz: u.get("gpu_mhz").and_then(as_u64),
+        mem_used_kb: u.get("mem_used_kb").and_then(as_u64),
+        mem_total_kb: u.get("mem_total_kb").and_then(as_u64),
+        swap_used_kb: u.get("swap_used_kb").and_then(as_u64),
+        throttle_events: u
+            .get("throttle_events")
+            .and_then(as_u64)
+            .unwrap_or_default(),
+        throttle_ms: u.get("throttle_ms").and_then(as_u64).unwrap_or_default(),
+        gpu_throttle: u.get("gpu_throttle").and_then(as_string),
+        gpu_top: u.get("gpu_top").and_then(as_string).map(|comm| {
+            (
+                comm,
+                u.get("gpu_top_percent")
+                    .and_then(as_f64)
+                    .unwrap_or_default(),
+            )
+        }),
+        gpu_engines: engines,
     }
 }
 

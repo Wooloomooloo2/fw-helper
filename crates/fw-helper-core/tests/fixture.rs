@@ -66,6 +66,16 @@ impl Fixture {
         f.write(&format!("{rapl}/energy_uj"), "1000000\n");
         f.write(&format!("{rapl}/max_energy_range_uj"), "262143328850\n");
 
+        // coretemp is a separate chip from the EC, and the reference machine lists
+        // `Package id 0` among sixteen per-core sensors in no useful order.
+        f.write("sys/class/hwmon/hwmon9/name", "coretemp\n");
+        f.write("sys/class/hwmon/hwmon9/temp1_label", "Core 0\n");
+        f.write("sys/class/hwmon/hwmon9/temp1_input", "49000\n");
+        f.write("sys/class/hwmon/hwmon9/temp1_crit", "100000\n");
+        f.write("sys/class/hwmon/hwmon9/temp5_label", "Package id 0\n");
+        f.write("sys/class/hwmon/hwmon9/temp5_input", "50000\n");
+        f.write("sys/class/hwmon/hwmon9/temp5_crit", "100000\n");
+
         f.write("sys/firmware/acpi/platform_profile", "balanced\n");
         f.write("sys/class/power_supply/BAT1/capacity", "100\n");
         // Named ACAD on this board, so resolution must be by type, not by name.
@@ -178,12 +188,25 @@ fn samples_telemetry_and_picks_the_control_sensor() {
     );
     assert_eq!(t.battery_percent, Some(100));
     assert_eq!(t.platform_profile.as_deref(), Some("balanced"));
-    assert_eq!(t.temps.len(), 2);
+    assert_eq!(t.temps.len(), 3);
 
     let ctrl = t.control_temp().expect("a control sensor");
     assert_eq!(ctrl.label, "peci-temp");
     assert_eq!(ctrl.celsius, 64.8);
     assert_eq!(ctrl.critical, Some(119.85));
+
+    // The CPU package, found by label among the per-core sensors. Its critical point is
+    // Tjmax, 100 C - the usable one. peci-temp above declares 119.85 C, which is above
+    // Tjmax and therefore cannot be drawn as a limit.
+    let package = t
+        .temps
+        .iter()
+        .find(|r| r.label == fw_helper_core::PACKAGE_TEMP_LABEL)
+        .expect("the coretemp package sensor");
+    assert_eq!(package.celsius, 50.0);
+    assert_eq!(package.critical, Some(100.0));
+    // And it must not have displaced the fan curve's input.
+    assert_ne!(ctrl.label, fw_helper_core::PACKAGE_TEMP_LABEL);
 
     // First sample has no prior reference, so power is not yet derivable.
     assert_eq!(t.package_watts, None);

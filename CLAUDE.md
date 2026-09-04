@@ -4,7 +4,7 @@ Guidance for Claude Code working in this repository.
 
 ## What this is
 
-`fw-helper` — firmware control for the **Framework Laptop 13** on Ubuntu: fan curves, power
+`fw-helper` — firmware control for the **Framework Laptop 13 Pro** on Ubuntu: fan curves, power
 limits, battery charge limit, performance profiles. Same product idea as
 [G-Helper](https://github.com/seerge/g-helper) (ASUS/Windows), sharing **no code** with it.
 

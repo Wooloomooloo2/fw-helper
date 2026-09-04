@@ -5,7 +5,7 @@
 //! daemon is installed, but then package power needs root, because `energy_uj` is
 //! 0400 (the PLATYPUS mitigation, ADR 0009).
 
-use fw_helper_client::{connect, DaemonProxyBlocking, Snapshot, SUPPORTED_VERSION};
+use fw_helper_client::{connect, DaemonProxyBlocking, SessionInfo, Snapshot, SUPPORTED_VERSION};
 use fw_helper_core::{Monitor, Sysfs};
 use std::thread::sleep;
 use std::time::Duration;
@@ -29,6 +29,11 @@ USAGE:
     fw-helperctl auto-profile          show power-source switching
     fw-helperctl auto-profile AC BATT  switch profile when the cable changes
     fw-helperctl auto-profile off      stop switching automatically
+    fw-helperctl record            what is being recorded, and what has been
+    fw-helperctl record start [NAME]  start recording a session
+    fw-helperctl record stop       stop recording
+    fw-helperctl record rm NAME    delete a recorded session
+    fw-helperctl hud               one status line, for an in-game overlay
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -50,6 +55,11 @@ fn main() {
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
         ),
+        Some("record") => record(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        Some("hud") => hud(),
         Some("-h") | Some("--help") => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -556,7 +566,10 @@ fn watch(secs: u64) {
             std::process::exit(1);
         }
     };
-    println!("{:>6}  {:>9}  {:>8}  {:>9}", "t", "power", "fan", "cpu");
+    println!(
+        "{:>6}  {:>9}  {:>8}  {:>9}  {:>6}  {:>6}  {:>6}  throttle",
+        "t", "power", "fan", "cpu", "cpu%", "gpu%", "mem%"
+    );
     for i in 1..=secs {
         sleep(Duration::from_secs(1));
         let Ok(s) = Snapshot::fetch(&d) else { continue };
@@ -574,6 +587,163 @@ fn watch(secs: u64) {
             .and_then(|label| s.temps.iter().find(|t| &t.label == label))
             .map(|t| format!("{:.1} C", t.celsius))
             .unwrap_or_else(|| "-".into());
-        println!("{i:>5}s  {power:>9}  {fan:>8}  {cpu:>9}");
+        // A dash, not a zero. The load sampler yields nothing until it has two samples
+        // to compare, and on the first tick "0%" would be a lie rather than a reading.
+        let pct = |v: Option<f64>| v.map(|x| format!("{x:.0}%")).unwrap_or_else(|| "-".into());
+        let throttle = throttle_note(&s);
+        println!(
+            "{i:>5}s  {power:>9}  {fan:>8}  {cpu:>9}  {:>6}  {:>6}  {:>6}  {throttle}",
+            pct(s.load.cpu_percent),
+            pct(s.load.gpu_percent),
+            pct(s.load.mem_percent()),
+        );
+    }
+}
+
+/// What was being held back this second, if anything.
+fn throttle_note(s: &Snapshot) -> String {
+    let mut parts = Vec::new();
+    if s.load.throttle_events > 0 {
+        parts.push(format!(
+            "cpu thermal x{} ({} ms)",
+            s.load.throttle_events, s.load.throttle_ms
+        ));
+    }
+    if let Some(reasons) = &s.load.gpu_throttle {
+        parts.push(format!("gpu {reasons}"));
+    }
+    // Power limiting on the package has no flag to read: draw sitting on the setpoint
+    // is the only signal, so say so rather than leaving the column blank.
+    if let (Some(w), Some(limit)) = (s.package_watts, s.power_limit) {
+        if w >= f64::from(limit) * 0.97 {
+            parts.push(format!("at PL1 {limit} W"));
+        }
+    }
+    parts.join(", ")
+}
+
+fn record(action: Option<&str>, name: Option<&str>) {
+    let (d, _version) = match connect() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fw-helperd unavailable ({e}); recording happens in the daemon");
+            eprintln!("hint: it must keep running after this command exits, and package");
+            eprintln!("      power needs root, so there is no direct-sysfs fallback here");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        None | Some("list") => record_list(&d),
+        Some("start") => {
+            // A session with no name is still a session; date it and move on rather
+            // than refusing over a label.
+            let label = name.unwrap_or("session");
+            match d.start_recording(label) {
+                Ok(path) => println!("recording to {path}\nstop it with: fw-helperctl record stop"),
+                Err(e) => {
+                    eprintln!("could not start recording: {}", describe(e));
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("stop") => match d.stop_recording() {
+            Ok(path) => println!("recorded {path}"),
+            Err(e) => {
+                eprintln!("could not stop recording: {}", describe(e));
+                std::process::exit(1);
+            }
+        },
+        Some("rm") | Some("delete") => {
+            let Some(name) = name else {
+                eprintln!("which session? `fw-helperctl record` lists them");
+                std::process::exit(2);
+            };
+            match d.delete_session(name) {
+                Ok(()) => println!("deleted {name}"),
+                Err(e) => {
+                    eprintln!("could not delete {name}: {}", describe(e));
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("unknown record action: {other}\n");
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn record_list(d: &DaemonProxyBlocking<'_>) {
+    match d.recording_session() {
+        Ok((label, _, path, _, samples)) if !label.is_empty() => {
+            println!("recording {label:?}: {samples} samples so far");
+            println!("  {path}\n");
+        }
+        _ => println!("not recording\n"),
+    }
+
+    let sessions = SessionInfo::fetch(d);
+    if sessions.is_empty() {
+        println!("no recorded sessions yet");
+        println!("  start one with: fw-helperctl record start <name>");
+        return;
+    }
+    println!("{:<34}  {:>8}  label", "session", "size");
+    for s in &sessions {
+        println!("{:<34}  {:>8}  {}", s.name, human_bytes(s.bytes), s.label);
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    match n {
+        0..=1023 => format!("{n} B"),
+        1024..=1_048_575 => format!("{:.0} KB", n as f64 / 1024.0),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
+}
+
+/// The one-line status an in-game overlay shows.
+///
+/// Reads the file the daemon writes rather than asking over D-Bus: this is meant to be
+/// wired into MangoHud's `exec=`, which runs inside the game's frame loop, and opening
+/// a bus connection per frame would be a frame-time bug. The D-Bus path is only the
+/// fallback for when the file is missing.
+fn hud() {
+    const HUD_FILE: &str = "/run/fw-helper/hud";
+    if let Ok(line) = std::fs::read_to_string(HUD_FILE) {
+        print!("{line}");
+        return;
+    }
+    match connect().and_then(|(d, _)| Snapshot::fetch(&d)) {
+        Ok(s) => {
+            let mut parts = Vec::new();
+            if let Some(w) = s.power_limit {
+                parts.push(format!("PL1 {w} W"));
+            }
+            if let Some(rpm) = s.fan_rpm {
+                parts.push(format!("fan {rpm} rpm"));
+            }
+            if let Some(p) = &s.profile {
+                parts.push(p.clone());
+            }
+            println!("{}", parts.join(" | "));
+        }
+        Err(_) => {
+            eprintln!("no {HUD_FILE} and no daemon");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// D-Bus errors arrive wrapped; the daemon's own message is the useful part, and it is
+/// written to be read by a person. Generic over `Display` so this crate need not depend
+/// on zbus directly.
+fn describe(e: impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    match text.split_once(": ") {
+        Some((_, rest)) if !rest.is_empty() => rest.to_string(),
+        _ => text,
     }
 }

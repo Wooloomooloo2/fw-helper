@@ -6,7 +6,9 @@
 //! Controls mirror what the daemon exposes; anything it reports as unavailable is
 //! shown disabled with the reason rather than silently omitted.
 
+mod chart;
 mod curve;
+mod monitor;
 mod ui;
 mod units;
 mod worker;

@@ -35,6 +35,9 @@ pub enum Command {
     AutoProfiles(String, String),
     SaveProfile(String),
     DeleteProfile(String),
+    StartRecording(String),
+    StopRecording,
+    DeleteSession(String),
 }
 
 impl Command {
@@ -52,6 +55,9 @@ impl Command {
             // Saving and deleting change the profile *list* rather than a control's
             // value, so there is nothing to hold and confirm.
             Self::SaveProfile(_) | Self::DeleteProfile(_) => "profiles",
+            // Recording has no control to hold: the button's state comes straight from
+            // the daemon's own report of what it is recording.
+            Self::StartRecording(_) | Self::StopRecording | Self::DeleteSession(_) => "record",
         }
     }
 }
@@ -105,6 +111,18 @@ fn spawn_commands(tx: async_channel::Sender<Update>) -> std::sync::mpsc::Sender<
                         .map_err(describe),
                     Command::DeleteProfile(name) => d
                         .delete_profile(&name)
+                        .map(|()| format!("deleted {name}"))
+                        .map_err(describe),
+                    Command::StartRecording(label) => d
+                        .start_recording(&label)
+                        .map(|path| format!("recording to {path}"))
+                        .map_err(describe),
+                    Command::StopRecording => d
+                        .stop_recording()
+                        .map(|path| format!("recorded {path}"))
+                        .map_err(describe),
+                    Command::DeleteSession(name) => d
+                        .delete_session(&name)
                         .map(|()| format!("deleted {name}"))
                         .map_err(describe),
                     Command::AutoProfiles(ac, batt) => d

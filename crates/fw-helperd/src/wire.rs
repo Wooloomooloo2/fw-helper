@@ -3,7 +3,7 @@
 //! These live here, not in `fw-helper-core` — the hardware layer takes no external
 //! dependencies, so serde and zvariant stop at this boundary. See ADR 0010.
 
-use fw_helper_core::{Capabilities, Telemetry};
+use fw_helper_core::{Capabilities, Telemetry, Usage};
 use std::collections::HashMap;
 use zbus::zvariant::{OwnedValue, Value};
 
@@ -77,6 +77,67 @@ pub fn telemetry_dict(t: &Telemetry) -> HashMap<String, OwnedValue> {
     if !temps.is_empty() {
         if let Ok(v) = OwnedValue::try_from(Value::from(temps)) {
             d.insert("temps".to_string(), v);
+        }
+    }
+
+    d
+}
+
+/// `a{sv}` — machine load, same absent-key-means-unavailable convention as
+/// [`telemetry_dict`].
+///
+/// Published separately from telemetry rather than merged into it because it is
+/// sampled differently: the GPU half is only collected while somebody is watching, so
+/// its keys come and go for reasons that have nothing to do with the hardware.
+pub fn usage_dict(u: &Usage) -> HashMap<String, OwnedValue> {
+    let mut d: HashMap<String, OwnedValue> = HashMap::new();
+
+    let mut put = |key: &str, value: Value<'_>| {
+        if let Ok(v) = OwnedValue::try_from(value) {
+            d.insert(key.to_string(), v);
+        }
+    };
+
+    if let Some(v) = u.cpu_percent {
+        put("cpu_percent", Value::F64(v));
+    }
+    if let Some(v) = u.cpu_mhz {
+        put("cpu_mhz", Value::U64(v));
+    }
+    if let Some(v) = u.gpu_percent {
+        put("gpu_percent", Value::F64(v));
+    }
+    if let Some(v) = u.gpu_mhz {
+        put("gpu_mhz", Value::U64(v));
+    }
+    if let Some(v) = u.mem_used_kb {
+        put("mem_used_kb", Value::U64(v));
+    }
+    if let Some(v) = u.mem_total_kb {
+        put("mem_total_kb", Value::U64(v));
+    }
+    if let Some(v) = u.swap_used_kb {
+        put("swap_used_kb", Value::U64(v));
+    }
+    // Deltas for the interval just ended, not since-boot totals: a client showing
+    // "throttled" must be able to stop showing it again.
+    put("throttle_events", Value::U64(u.cpu_throttle_events));
+    put("throttle_ms", Value::U64(u.cpu_throttle_ms));
+    if !u.gpu_throttle.is_empty() {
+        put(
+            "gpu_throttle",
+            Value::Str(u.gpu_throttle.join("+").as_str().into()),
+        );
+    }
+    if let Some((comm, pct)) = &u.top_gpu_client {
+        put("gpu_top", Value::Str(comm.as_str().into()));
+        put("gpu_top_percent", Value::F64(*pct));
+    }
+
+    let engines: HashMap<String, f64> = u.gpu_engines.iter().cloned().collect();
+    if !engines.is_empty() {
+        if let Ok(v) = OwnedValue::try_from(Value::from(engines)) {
+            d.insert("gpu_engines".to_string(), v);
         }
     }
 

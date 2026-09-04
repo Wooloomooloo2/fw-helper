@@ -21,6 +21,21 @@ jobs:
       - name: D-Bus policy is well-formed
         run: python3 -c "import xml.dom.minidom; xml.dom.minidom.parse('data/org.fwhelper.Daemon1.conf')"
 
+      # Ordering the unit after power-profiles-daemon deadlocks the boot: PPD is
+      # After=multi-user.target, we are WantedBy=multi-user.target, and systemd breaks
+      # the resulting cycle by silently deleting our start job. The daemon then never
+      # runs and the unit still reports `enabled`. Measured on hardware 2026-09-01.
+      - name: unit does not order against power-profiles-daemon
+        run: |
+          if grep -nE '^\s*(After|Before|Requires|Wants)=.*power-profiles-daemon' \
+                 data/fw-helperd.service; then
+            echo "::error::fw-helperd.service must not order against PPD - it creates a"
+            echo "::error::cycle through multi-user.target and the daemon never starts."
+            echo "::error::PPD is adopted at run time via NameOwnerChanged instead."
+            exit 1
+          fi
+          echo "fw-helperd.service: no PPD ordering"
+
       - name: fw-helper-core has no dependencies
         run: |
           deps=$(cargo tree -p fw-helper-core --prefix none \

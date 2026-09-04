@@ -20,3 +20,7 @@ async-channel = "2"
 zbus = { version = "5.13.2", default-features = false }
 gtk = { version = "0.10.3", package = "gtk4", features = ["v4_14"] }
 adw = { version = "0.8", package = "libadwaita", features = ["v1_5"] }
+
+# Temporary, for the render-chart example only.
+[dev-dependencies]
+cairo-rs = { version = "0.21.5", features = ["png"] }

@@ -47,4 +47,21 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+  <action id="org.fwhelper.record">
+    <description>Record a monitoring session</description>
+    <message>Authentication is required to record a monitoring session</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!--
+        yes, not auth_admin_keep. Unlike every other action here this changes no
+        hardware; it makes the daemon append to a file under /var/lib/fw-helper.
+        The daemon must still be asked, because it is the daemon writing as root,
+        but a password dialog on a Record button would be the same mistake the
+        other actions above are worded to avoid: a prompt that appears often
+        enough to be dismissed without reading.
+      -->
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
 </policyconfig>

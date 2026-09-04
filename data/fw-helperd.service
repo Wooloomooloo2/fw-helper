@@ -3,16 +3,25 @@ Description=fw-helper firmware control daemon
 Documentation=https://github.com/Wooloomooloo2/fw-helper
 After=dbus.service
 Requires=dbus.service
-# Ordering only, deliberately no Wants=: if PPD is part of this boot we would rather
-# start after it than race it, but we must not be the reason it starts. A machine
-# without PPD is a supported configuration (ADR 0005's fallback), and pulling it in
-# would change that machine's behaviour just by installing us.
+# There is deliberately NO ordering against power-profiles-daemon here, and adding one
+# breaks the boot. PPD declares `After=multi-user.target display-manager.target`, and we
+# are WantedBy=multi-user.target - so `After=power-profiles-daemon.service` orders us
+# after the very target that pulls us in. systemd finds the cycle and breaks it by
+# deleting *our* start job:
 #
-# This is ordering, not a guarantee: systemd considers PPD "started" as soon as its
-# unit is active, which for a D-Bus-activated service is before it owns its name. The
-# daemon adopts PPD on NameOwnerChanged for exactly that reason; this only narrows the
-# window.
-After=power-profiles-daemon.service
+#   multi-user.target: Found ordering cycle on fw-helperd.service/start
+#   Found dependency on power-profiles-daemon.service/start
+#   Found dependency on multi-user.target/start
+#   Job fw-helperd.service/start deleted to break ordering cycle
+#
+# The daemon then does not run at all, and leaves no trace that says so: the unit sits
+# `enabled` and `inactive (dead)`, not failed, with no journal entry under its own name.
+# Measured on hardware 2026-09-01, first boot after installing 0.5.0.
+#
+# Nothing is lost by omitting it. Ordering could never close the race anyway - systemd
+# considers a D-Bus-activated PPD "started" before it owns its bus name - which is why
+# the daemon adopts PPD on NameOwnerChanged instead. That adoption is the actual fix,
+# and this boot is the proof it has to be.
 
 [Service]
 Type=dbus
@@ -47,6 +56,16 @@ SystemCallFilter=~@privileged @resources @obsolete
 # usable here. ReadWritePaths is deliberately narrow.
 ProtectSystem=full
 PrivateTmp=yes
+
+# /run/fw-helper, for the one-line status file an in-game overlay reads. systemd
+# creates it on start and removes it on stop, which is the property that matters: a
+# stale line outliving the daemon would show a game numbers that stopped being true.
+#
+# Note what is NOT here. Reading per-engine GPU load could have gone through the xe
+# PMU, which needs perf_event_open - a syscall in systemd's @debug group and therefore
+# excluded by SystemCallFilter=@system-service below. The load figures are read from
+# /proc/<pid>/fdinfo instead precisely so this sandbox does not have to be widened.
+RuntimeDirectory=fw-helper
 PrivateNetwork=yes
 #
 # /etc/fw-helper is writable because `fw-helperctl profile save` writes a profile

@@ -1,6 +1,12 @@
 use crate::{paths, Cap, Capabilities, EnergySampler, Sysfs};
 use std::time::Instant;
 
+/// What the CPU package sensor is published as.
+///
+/// Its own hwmon calls it `Package id 0`, which means nothing next to `peci-temp` and
+/// `battery_temp@b` in the same list.
+pub const PACKAGE_TEMP_LABEL: &str = "cpu-package";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TempReading {
     pub label: String,
@@ -82,6 +88,14 @@ pub struct Monitor {
     fs: Sysfs,
     caps: Capabilities,
     energy: Option<EnergySampler>,
+    /// The `coretemp` hwmon, resolved by name like every other one.
+    ///
+    /// Separate from the EC's node because it is a different chip. Worth reading even
+    /// though `peci-temp` also reports the CPU: `peci-temp` declares its critical point
+    /// at 119.8 °C, *above* Tjmax, so it cannot be drawn as a limit. `Package id 0`
+    /// declares 100 °C, which is the real one and the number a temperature graph has to
+    /// be read against.
+    coretemp: Option<String>,
 }
 
 impl Monitor {
@@ -94,7 +108,13 @@ impl Monitor {
         } else {
             None
         };
-        Self { fs, caps, energy }
+        let coretemp = fs.find_hwmon("coretemp");
+        Self {
+            fs,
+            caps,
+            energy,
+            coretemp,
+        }
     }
 
     pub fn capabilities(&self) -> &Capabilities {
@@ -138,6 +158,10 @@ impl Monitor {
             t.temps = self.read_temps(&hwmon);
         }
 
+        if let Some(reading) = self.read_package_temp() {
+            t.temps.push(reading);
+        }
+
         if let Some(sampler) = self.energy.as_mut() {
             let path = format!("{}/energy_uj", paths::RAPL_MMIO);
             if let Ok(uj) = self.fs.read_u64(&path) {
@@ -148,6 +172,38 @@ impl Monitor {
         }
 
         t
+    }
+
+    /// The CPU package temperature from `coretemp`, labelled so it cannot be confused
+    /// with the EC's own sensors.
+    ///
+    /// Found by label, not index: the reference machine reports seventeen sensors here
+    /// in no useful order, and `Package id 0` is the only one that is not a single core.
+    fn read_package_temp(&self) -> Option<TempReading> {
+        let hwmon = self.coretemp.as_ref()?;
+        for i in 1..=32 {
+            if self
+                .fs
+                .read_string(&format!("{hwmon}/temp{i}_label"))
+                .ok()
+                .as_deref()
+                != Some("Package id 0")
+            {
+                continue;
+            }
+            let milli = self.fs.read_i64(&format!("{hwmon}/temp{i}_input")).ok()?;
+            return Some(TempReading {
+                label: PACKAGE_TEMP_LABEL.to_string(),
+                celsius: milli as f64 / 1000.0,
+                critical: self
+                    .fs
+                    .read_i64(&format!("{hwmon}/temp{i}_crit"))
+                    .ok()
+                    .map(|c| c as f64 / 1000.0)
+                    .filter(|c| Self::plausible_threshold(*c)),
+            });
+        }
+        None
     }
 
     /// Discharge rate and time remaining, in whichever unit family the board uses.

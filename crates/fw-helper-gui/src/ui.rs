@@ -67,6 +67,7 @@ struct Widgets {
     save_group: adw::PreferencesGroup,
     auto_group: adw::PreferencesGroup,
     curve: Rc<crate::curve::CurveEditor>,
+    monitor: Rc<crate::monitor::MonitorPage>,
     // Controls. Each is refreshed from telemetry, which means every update would
     // otherwise look like the user operating it — see `settling`.
     profile_row: adw::ComboRow,
@@ -263,15 +264,46 @@ pub fn build(app: &adw::Application) {
         .child(&columns)
         .build();
 
+    // The second page. Its own scroller, because the chart is tall and has nothing to
+    // do with the control column's scroll position.
+    let monitor = crate::monitor::MonitorPage::new(commands.clone());
+
+    let stack = adw::ViewStack::new();
+    stack.add_titled_with_icon(
+        &scroll,
+        Some("control"),
+        "Control",
+        "preferences-system-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &monitor.widget,
+        Some("monitor"),
+        "Monitor",
+        "utilities-system-monitor-symbolic",
+    );
+
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
     outer.append(&banner);
-    outer.append(&scroll);
+    outer.append(&stack);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&outer));
+
+    // The switcher takes the header's title slot, so the connection state that used to
+    // live in the subtitle moves to the banner - which is already the mechanism for a
+    // standing condition, and the place a disconnected daemon was reported anyway.
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    header.set_title_widget(Some(&switcher));
+
+    // Below the breakpoint the wide switcher does not fit; a bottom bar does.
+    let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).build();
+    toolbar.add_bottom_bar(&switcher_bar);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -299,6 +331,10 @@ pub fn build(app: &adw::Application) {
                 Some(&gtk::Orientation::Vertical.to_value()),
             );
             breakpoint.add_setter(&columns, "homogeneous", Some(&false.to_value()));
+            // Narrow: the header has no room for the switcher, so it moves to the
+            // bottom bar. Both are driven by the same stack, so the page does not change.
+            breakpoint.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
+            breakpoint.add_setter(&header, "title-widget", Some(&title.to_value()));
             window.add_breakpoint(breakpoint);
         }
         // A window that cannot adapt is worth having; one that refuses to open is not.
@@ -344,6 +380,7 @@ pub fn build(app: &adw::Application) {
         save_group,
         auto_group,
         curve: Rc::clone(&curve_editor),
+        monitor: Rc::clone(&monitor),
     }));
 
     // Controls send commands; they never touch hardware from the main loop.
@@ -501,6 +538,11 @@ fn expected(cmd: &Command) -> String {
         Command::FanCurve(_) => "curve".to_string(),
         Command::AutoProfiles(ac, batt) => format!("{ac}/{batt}"),
         Command::SaveProfile(name) | Command::DeleteProfile(name) => name.clone(),
+        // Nothing to wait for: the recording controls are driven directly by what the
+        // daemon reports it is recording, so there is no widget to hold meanwhile.
+        Command::StartRecording(_) | Command::StopRecording | Command::DeleteSession(_) => {
+            String::new()
+        }
     }
 }
 
@@ -854,6 +896,7 @@ fn disconnected(w: &mut Widgets, why: &str) {
     // the window jump - but they are dimmed to say they are no longer live.
     w.sensors_group.set_sensitive(false);
     w.caps_group.set_sensitive(false);
+    w.monitor.set_disconnected();
 }
 
 /// Enable or disable the control groups as a whole.
@@ -872,6 +915,7 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
     w.sensors_group.set_sensitive(true);
     w.caps_group.set_sensitive(true);
     w.curve.update(s);
+    w.monitor.update(s);
 
     // Refresh the controls from the daemon. The signals this fires are suppressed by
     // the mutable borrow we are already holding - see the handlers.

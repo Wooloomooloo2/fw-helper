@@ -37,6 +37,8 @@ pub struct Capabilities {
     pub charge_limit: Cap,
     pub platform_profile: Cap,
     pub package_power: Cap,
+    /// Whether per-engine GPU load can be measured on this machine.
+    pub gpu_usage: Cap,
     /// Resolved hwmon path for the EC, if found.
     pub ec_hwmon: Option<String>,
 }
@@ -113,12 +115,25 @@ impl Capabilities {
             Cap::Yes
         };
 
+        // Load is read from `/proc/*/fdinfo`, which only the `xe` driver's counters
+        // have been verified against here. Anything else names its driver rather than
+        // reporting a number nobody has checked — i915 publishes the same statistics in
+        // a different unit and would be a small change, on a machine we could test it.
+        let gpu_usage = match crate::usage::drm_driver(fs).as_deref() {
+            Some("xe") => Cap::Yes,
+            Some(other) => Cap::no(format!(
+                "GPU load is only implemented for the xe driver; this machine uses {other}"
+            )),
+            None => Cap::no("no DRM device found under /sys/class/drm"),
+        };
+
         Self {
             fan_control,
             power_limit,
             charge_limit,
             platform_profile,
             package_power,
+            gpu_usage,
             ec_hwmon,
         }
     }
@@ -130,6 +145,7 @@ impl Capabilities {
             ("charge limit", &self.charge_limit),
             ("platform profile", &self.platform_profile),
             ("package power", &self.package_power),
+            ("gpu usage", &self.gpu_usage),
         ]
     }
 }

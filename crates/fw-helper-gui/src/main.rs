@@ -9,6 +9,7 @@
 mod chart;
 mod curve;
 mod monitor;
+mod overlay;
 mod ui;
 mod units;
 mod worker;
@@ -17,15 +18,43 @@ use adw::prelude::*;
 use gtk::glib;
 
 const APP_ID: &str = "org.fwhelper.Gui";
+const OVERLAY_APP_ID: &str = "org.fwhelper.Gui.Overlay";
+
+const USAGE: &str = "\
+fw-helper \u{2014} Framework laptop firmware control
+
+USAGE:
+    fw-helper              the main window
+    fw-helper --overlay    a compact readout
+
+The overlay is an ordinary window. On GNOME/Wayland no ordinary window can be kept
+above a fullscreen game, so for numbers inside one, use MangoHud - it is loaded into
+the game itself. See /usr/share/fw-helper/mangohud/fw-helper.conf.
+";
 
 /// `SIGINT` and `SIGTERM`. Spelled out rather than pulling in libc for two integers.
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
 
 fn main() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // A compact readout instead of the main window. Its own application id, because GTK
+    // applications are single-instance: sharing one would make `--overlay` activate an
+    // already-open main window and appear to do nothing.
+    let overlay = std::env::args().any(|a| a == "--overlay");
+    if std::env::args().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return glib::ExitCode::SUCCESS;
+    }
+
+    let app = adw::Application::builder()
+        .application_id(if overlay { OVERLAY_APP_ID } else { APP_ID })
+        .build();
     app.connect_startup(|_| ui::load_css());
-    app.connect_activate(ui::build);
+    if overlay {
+        app.connect_activate(overlay::build);
+    } else {
+        app.connect_activate(ui::build);
+    }
 
     // Quit cleanly on Ctrl-C and on SIGTERM.
     //
@@ -43,5 +72,9 @@ fn main() -> glib::ExitCode {
         });
     }
 
-    app.run()
+    // GApplication parses argv itself and rejects anything it does not recognise, so
+    // `--overlay` would be an "Unknown option" error before ever reaching us. Our flags
+    // are read above and only the program name is handed on.
+    let argv0 = std::env::args().next().unwrap_or_default();
+    app.run_with_args(&[argv0])
 }

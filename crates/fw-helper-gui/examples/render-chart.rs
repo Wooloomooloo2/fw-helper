@@ -4,7 +4,10 @@ use std::f64::consts::PI;
 // Pulled in only to switch on cairo-rs's `png` feature for this example.
 use cairo as _;
 
+// Only `draw` and `Sample` are used here; ChartView and the Sample constructors
+// belong to the GUI, and are dead only in this compilation unit.
 #[path = "../src/chart.rs"]
+#[allow(dead_code)]
 mod chart;
 
 fn session() -> Vec<chart::Sample> {

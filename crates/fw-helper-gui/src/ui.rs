@@ -13,6 +13,9 @@ const CSS: &str = "
 .stat-label  { font-size: 0.85rem; opacity: 0.6; }
 .stat-card   { padding: 14px 18px; border-radius: 12px; }
 .sensor-crit { opacity: 0.5; font-size: 0.8rem; }
+/* The overlay's numbers: tabular figures so a changing value does not shuffle the
+   column width every second, which is what makes a 1 Hz readout feel unsettled. */
+.overlay-value { font-size: 1.1rem; font-feature-settings: \"tnum\"; }
 ";
 
 pub fn load_css() {
@@ -50,6 +53,12 @@ struct Widgets {
     cpu_temp: gtk::Label,
     system: gtk::Label,
     system_caption: gtk::Label,
+    cpu_load: gtk::Label,
+    /// Captions carry the clock, and for the GPU the throttle reason when one is
+    /// asserted — the number alone does not say whether the silicon is being held back.
+    cpu_load_caption: gtk::Label,
+    gpu_load: gtk::Label,
+    gpu_load_caption: gtk::Label,
     profile: gtk::Label,
     battery: adw::ActionRow,
     sensors_group: adw::PreferencesGroup,
@@ -102,13 +111,19 @@ pub fn build(app: &adw::Application) {
     let banner = adw::Banner::builder().revealed(false).build();
     let banner_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
-    // The four numbers worth seeing without scrolling: what the CPU is drawing, how
-    // hot it is, how hard the fan is working, and what the whole machine costs.
+    // The numbers worth seeing without scrolling: what the CPU is drawing, how hot it
+    // is, how hard the fan is working, what the whole machine costs, and how busy the
+    // two processors actually are. Draw without load is ambiguous — 15 W could be a
+    // capped machine working hard or an idle one doing nothing.
     let power = stat_label();
     let fan = stat_label();
     let cpu_temp = stat_label();
     let system = stat_label();
     let (system_card, system_caption) = stat_card_with_caption(&system, "system");
+    let cpu_load = stat_label();
+    let (cpu_load_card, cpu_load_caption) = stat_card_with_caption(&cpu_load, "cpu load");
+    let gpu_load = stat_label();
+    let (gpu_load_card, gpu_load_caption) = stat_card_with_caption(&gpu_load, "gpu load");
 
     let stats = gtk::Grid::builder()
         .row_spacing(12)
@@ -121,6 +136,10 @@ pub fn build(app: &adw::Application) {
     stats.attach(&stat_card(&cpu_temp, "cpu temperature"), 1, 0, 1, 1);
     stats.attach(&stat_card(&fan, "fan"), 0, 1, 1, 1);
     stats.attach(&system_card, 1, 1, 1, 1);
+    // A third row rather than a wider one: the two-across rule above is what keeps
+    // these readable at a glance.
+    stats.attach(&cpu_load_card, 0, 2, 1, 1);
+    stats.attach(&gpu_load_card, 1, 2, 1, 1);
 
     let profile = gtk::Label::builder().xalign(0.0).label("—").build();
     let profile_row = adw::ComboRow::builder()
@@ -381,6 +400,10 @@ pub fn build(app: &adw::Application) {
         auto_group,
         curve: Rc::clone(&curve_editor),
         monitor: Rc::clone(&monitor),
+        cpu_load: cpu_load.clone(),
+        cpu_load_caption: cpu_load_caption.clone(),
+        gpu_load: gpu_load.clone(),
+        gpu_load_caption: gpu_load_caption.clone(),
     }));
 
     // Controls send commands; they never touch hardware from the main loop.
@@ -811,6 +834,37 @@ fn describe_fan(s: &Snapshot) -> String {
     }
 }
 
+/// CPU and GPU load, with the clock in the caption.
+///
+/// Load is what makes the power reading interpretable: 15 W is a capped machine under
+/// load or an idle one, and the two look identical without this. The GPU caption also
+/// carries its throttle reason when one is asserted, because the GPU publishes real
+/// reasons where the CPU package publishes none — for the CPU, read power against the
+/// limit instead (see chart.rs).
+fn set_load_cards(w: &Widgets, s: &Snapshot) {
+    match s.load.cpu_percent {
+        Some(pct) => w.cpu_load.set_label(&format!("{pct:.0}%")),
+        None => w.cpu_load.set_label("—"),
+    }
+    w.cpu_load_caption.set_label(&match s.load.cpu_mhz {
+        Some(mhz) if mhz > 0 => format!("cpu load · {:.1} GHz", mhz as f64 / 1000.0),
+        _ => "cpu load".to_string(),
+    });
+
+    match s.load.gpu_percent {
+        Some(pct) => w.gpu_load.set_label(&format!("{pct:.0}%")),
+        None => w.gpu_load.set_label("—"),
+    }
+    // A throttle reason displaces the clock: when the GPU is being held back, that is
+    // the more useful of the two.
+    w.gpu_load_caption
+        .set_label(&match (&s.load.gpu_throttle, s.load.gpu_mhz) {
+            (Some(reason), _) if !reason.is_empty() => format!("gpu load · {reason}"),
+            (_, Some(mhz)) if mhz > 0 => format!("gpu load · {:.1} GHz", mhz as f64 / 1000.0),
+            _ => "gpu load".to_string(),
+        });
+}
+
 fn stat_label() -> gtk::Label {
     let l = gtk::Label::builder().label("—").build();
     l.add_css_class("stat-value");
@@ -887,6 +941,10 @@ fn disconnected(w: &mut Widgets, why: &str) {
     w.fan.set_label("—");
     w.cpu_temp.set_label("—");
     w.system.set_label("—");
+    w.cpu_load.set_label("—");
+    w.cpu_load_caption.set_label("cpu load");
+    w.gpu_load.set_label("—");
+    w.gpu_load_caption.set_label("gpu load");
     w.profile.set_label("—");
     // A control that cannot reach the daemon must not look operable. Switching the
     // groups off leaves each row's own sensitivity untouched underneath, so whatever
@@ -959,6 +1017,8 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
         _ => w.system.set_label("—"),
     }
     w.system_caption.set_label(&caption.join(" · "));
+
+    set_load_cards(w, s);
 
     w.fan.set_label(&match s.fan_rpm {
         // The EC keeps the fan stopped below roughly 45 C, so zero is a state

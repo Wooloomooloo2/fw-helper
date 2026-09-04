@@ -654,3 +654,91 @@ fn format_elapsed(secs: f64) -> String {
         _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(t: f64, cpu: f64) -> Sample {
+        Sample {
+            t,
+            cpu_pct: Some(cpu),
+            ..Default::default()
+        }
+    }
+
+    fn cpu(s: &Sample) -> Option<f64> {
+        s.cpu_pct
+    }
+
+    #[test]
+    fn sparse_data_is_not_aggregated_at_all() {
+        // Fewer samples than pixels: every column is one sample, so mean == min == max
+        // and the line is exactly the data.
+        let samples = vec![at(0.0, 10.0), at(1.0, 50.0), at(2.0, 30.0)];
+        let cols = columns(&samples, cpu, 0.0, 2.0, |t| t * 100.0, 600.0);
+        assert_eq!(cols.len(), 3);
+        for c in &cols {
+            assert_eq!(c.min, c.max);
+            assert_eq!(c.min, c.mean);
+        }
+        assert_eq!(cols[1].mean, 50.0);
+    }
+
+    #[test]
+    fn a_spike_narrower_than_a_pixel_survives_downsampling() {
+        // The reason min and max are carried alongside the mean. An hour of samples in
+        // a few hundred pixels, and a one-second throttle spike is exactly what someone
+        // opened the view to find - taking every nth sample would drop it.
+        let mut samples: Vec<Sample> = (0..1000).map(|i| at(f64::from(i), 20.0)).collect();
+        samples[500] = at(500.0, 99.0);
+
+        let cols = columns(&samples, cpu, 0.0, 999.0, |t| t, 50.0);
+        assert!(cols.len() <= 50, "should have downsampled: {}", cols.len());
+        let peak = cols.iter().map(|c| c.max).fold(f64::MIN, f64::max);
+        assert_eq!(peak, 99.0, "the spike must still be in the range band");
+        // And it must not distort the line, which is the mean.
+        let highest_mean = cols.iter().map(|c| c.mean).fold(f64::MIN, f64::max);
+        assert!(
+            highest_mean < 99.0,
+            "the mean should absorb it, got {highest_mean}"
+        );
+    }
+
+    #[test]
+    fn a_series_with_no_readings_produces_no_columns() {
+        // Absent is not zero. A machine whose GPU we cannot read must draw nothing,
+        // not a flat line along the bottom that reads as "idle".
+        let samples = vec![at(0.0, 10.0), at(1.0, 20.0)];
+        let cols = columns(&samples, |s| s.gpu_pct, 0.0, 1.0, |t| t, 600.0);
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn gaps_in_a_series_do_not_shift_later_samples() {
+        // The first sample of a rate has no reading, which is the normal case at
+        // startup. The columns that do exist must still land at the right time.
+        let samples = vec![
+            Sample {
+                t: 0.0,
+                ..Default::default()
+            },
+            at(1.0, 40.0),
+            at(2.0, 60.0),
+        ];
+        let cols = columns(&samples, cpu, 0.0, 2.0, |t| t * 10.0, 600.0);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].mean, 40.0);
+        assert!((cols[0].x - 10.0).abs() < 0.1, "x was {}", cols[0].x);
+        assert_eq!(cols[1].mean, 60.0);
+        assert!((cols[1].x - 20.0).abs() < 0.1, "x was {}", cols[1].x);
+    }
+
+    #[test]
+    fn elapsed_time_reads_in_the_largest_useful_unit() {
+        assert_eq!(format_elapsed(0.0), "0s");
+        assert_eq!(format_elapsed(59.0), "59s");
+        assert_eq!(format_elapsed(125.0), "2m05s");
+        assert_eq!(format_elapsed(7325.0), "2h02m");
+    }
+}

@@ -9,10 +9,12 @@
 # Run it, then immediately start the benchmark run.
 #
 # Reading the output:
-#   power at the PL1 setpoint + GPU busy high   -> power limited, raise PL1
-#   power well under setpoint + GPU busy ~100%  -> GPU bound (compute or bandwidth)
-#   power well under setpoint + GPU busy low    -> CPU bound; check the top thread
-#   GPU busy high but act_freq below max        -> GPU stalling, typically memory
+#   power at the PL1 setpoint + rcs high    -> power limited, raise PL1
+#   power under setpoint + rcs ~100%        -> GPU bound (compute or bandwidth)
+#   power under setpoint + rcs low          -> CPU bound; check the top thread
+#   rcs high but act_mhz well below cur_mhz -> GPU stalling, typically memory
+#
+# rcs is the render engine and ccs the compute engine; both do graphics work here.
 
 set -uo pipefail
 SECS=${1:-60}
@@ -36,8 +38,14 @@ PID=${2:-$(find_renderer)}
 [[ -n "$PID" ]] || { echo "no DRM client found; is the game running?" >&2; exit 1; }
 echo "renderer pid $PID ($(tr -d '\0' < /proc/"$PID"/comm 2>/dev/null))"
 
-cycles() { grep -h "drm-cycles" /proc/"$PID"/fdinfo/* 2>/dev/null | awk '{s+=$2} END{print s+0}'; }
-total()  { grep -h "drm-total-cycles" /proc/"$PID"/fdinfo/* 2>/dev/null | awk '{s+=$2} END{print s+0}'; }
+# fdinfo reports cycles PER ENGINE (rcs render, ccs compute, bcs blit, vcs video),
+# and every DRM client of the process reports the SAME drm-total-cycles-<eng> --- it is
+# the GT-wide clock, not a per-client total. So the busy fraction is
+#     sum(drm-cycles-<eng> over clients) / drm-total-cycles-<eng> taken ONCE.
+# Summing the denominator across clients, or across idle engines, deflates the result
+# several-fold and makes a fully loaded GPU look idle.
+cycles() { grep -h "drm-cycles-$1:" /proc/"$PID"/fdinfo/* 2>/dev/null | awk '{s+=$2} END{print s+0}'; }
+total()  { grep -hm1 "drm-total-cycles-$1:" /proc/"$PID"/fdinfo/* 2>/dev/null | head -1 | awk '{print $2+0}'; }
 
 watts() {
     busctl get-property org.fwhelper.Daemon1 /org/fwhelper/Daemon1 \
@@ -48,19 +56,21 @@ watts() {
 setpoint=$(awk '{printf "%.0f", $1/1000000}' \
     /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw 2>/dev/null)
 echo "PL1 setpoint: ${setpoint} W"
-printf "\n%5s %8s %7s %8s %8s %7s  %s\n" t power gpu% act_mhz cur_mhz cpu_C top_thread
+printf "\n%5s %8s %7s %7s %8s %8s %7s  %s\n" t power rcs% ccs% act_mhz cur_mhz cpu_C top_thread
 
-c1=$(cycles); t1=$(total)
+r1=$(cycles rcs); c1=$(cycles ccs); t1=$(total rcs)
 for (( i = 1; i <= SECS; i++ )); do
     sleep 1
-    c2=$(cycles); t2=$(total)
-    busy=$(awk -v a=$((c2-c1)) -v b=$((t2-t1)) 'BEGIN{ printf "%.1f", (b>0)? 100*a/b : 0 }')
-    c1=$c2; t1=$t2
+    r2=$(cycles rcs); c2=$(cycles ccs); t2=$(total rcs)
+    den=$((t2-t1))
+    busy=$(awk -v a=$((r2-r1)) -v b="$den" 'BEGIN{ printf "%.1f", (b>0)? 100*a/b : 0 }')
+    cbusy=$(awk -v a=$((c2-c1)) -v b="$den" 'BEGIN{ printf "%.1f", (b>0)? 100*a/b : 0 }')
+    r1=$r2; c1=$c2; t1=$t2
 
     top=$(top -H -b -n1 -p "$PID" 2>/dev/null | tail -n +8 | awk 'NR==1{printf "%s %s%%", $12, $9}')
     temp=$(cat "$EC/temp5_input" 2>/dev/null | awk '{printf "%.0f", $1/1000}')
-    printf "%4ss %7s W %6s%% %8s %8s %6s  %s\n" \
-        "$i" "$(watts)" "$busy" \
+    printf "%4ss %7s W %6s%% %6s%% %8s %8s %6s  %s\n" \
+        "$i" "$(watts)" "$busy" "$cbusy" \
         "$(cat $GT/freq0/act_freq 2>/dev/null)" "$(cat $GT/freq0/cur_freq 2>/dev/null)" \
         "$temp" "$top"
 done

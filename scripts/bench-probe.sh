@@ -26,11 +26,26 @@ for d in /sys/class/hwmon/hwmon*; do
     [[ "$(cat "$d/name" 2>/dev/null)" == cros_ec ]] && { EC=$d; break; }
 done
 
+# Pick the process doing the most render work *right now*, by rate rather than by
+# accumulated total: the compositor has been running for days and would otherwise
+# always win. Name-agnostic, so a game under Proton, Wine or native looks the same.
+rcs_of() { grep -h "drm-cycles-rcs:" /proc/"$1"/fdinfo/* 2>/dev/null | awk '{s+=$2} END{print s+0}'; }
+
 find_renderer() {
-    local best="" bestn=0 pid n
-    for pid in $(pgrep -u "$(id -u)" -f -i 'horizon|\.exe' 2>/dev/null); do
-        n=$(grep -ls "drm-driver" /proc/"$pid"/fdinfo/* 2>/dev/null | wc -l)
-        (( n > bestn )) && { bestn=$n; best=$pid; }
+    local pid c candidates=() before=() after=()
+    for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+        [[ -r /proc/$pid/fdinfo && -O /proc/$pid ]] || continue
+        grep -qlm1 "drm-driver" /proc/"$pid"/fdinfo/* 2>/dev/null || continue
+        candidates+=("$pid"); before+=("$(rcs_of "$pid")")
+    done
+    (( ${#candidates[@]} )) || return
+    sleep 1
+    local best="" bestd=0 i d
+    for i in "${!candidates[@]}"; do
+        pid=${candidates[$i]}
+        [[ -d /proc/$pid ]] || continue
+        d=$(( $(rcs_of "$pid") - ${before[$i]} ))
+        (( d > bestd )) && { bestd=$d; best=$pid; }
     done
     echo "$best"
 }

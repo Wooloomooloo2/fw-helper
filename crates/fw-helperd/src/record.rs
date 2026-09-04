@@ -286,11 +286,27 @@ fn board_temp(t: &Telemetry) -> Option<f64> {
 
 /// One line for an in-game HUD: the things MangoHud cannot know.
 ///
-/// MangoHud already reports frame rate, CPU and GPU load, and package power far better
-/// than a shelled-out command could. What it has no way to see is fw-helper's own
-/// control state, so that is all this carries.
-pub fn hud_line(t: &Telemetry, ctx: &Context, recording: Option<&Status>) -> String {
+/// MangoHud reports frame rate, CPU load and package power far better than a shelled-out
+/// command could, and none of that is repeated here. Two things it cannot see:
+///
+/// 1. **fw-helper's own control state** — the limit being enforced, who owns the fan,
+///    the active profile, the pack temperature.
+/// 2. **GPU load on this machine.** Measured 2026-09-04 with MangoHud 0.6.9.1: its
+///    Intel support is i915-only, and this board runs `xe`, so it logs "no
+///    discrete/integrated i915 devices found" and *disables gpu_stats entirely*. It
+///    then falls back to `intel_gpu_top`, which needs `perf_event_open` and hits the
+///    same `perf_event_paranoid` wall that ruled the PMU out for us. So the in-game HUD
+///    has no GPU number at all unless we supply one — and we can, because the fdinfo
+///    counters need no permission.
+pub fn hud_line(t: &Telemetry, u: &Usage, ctx: &Context, recording: Option<&Status>) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    if let Some(pct) = u.gpu_percent {
+        match u.gpu_mhz.filter(|m| *m > 0) {
+            Some(mhz) => parts.push(format!("GPU {pct:.0}% {mhz}MHz")),
+            None => parts.push(format!("GPU {pct:.0}%")),
+        }
+    }
 
     if let Some(w) = ctx.pl1_watts {
         parts.push(format!("PL1 {w}W"));
@@ -439,7 +455,7 @@ mod tests {
     fn the_hud_line_says_who_owns_the_fan() {
         // A speed means a different thing under each owner, and ADR 0006 turns on the
         // user being able to tell deliberate control from a stuck fan.
-        let line = hud_line(&telemetry(), &context(), None);
+        let line = hud_line(&telemetry(), &Usage::default(), &context(), None);
         assert!(line.contains("PL1 35W"), "{line}");
         assert!(line.contains("4820rpm"), "{line}");
         assert!(line.contains("fw"), "{line}");
@@ -450,8 +466,21 @@ mod tests {
             fan_duty: None,
             ..context()
         };
-        let line = hud_line(&telemetry(), &ec, None);
+        let line = hud_line(&telemetry(), &Usage::default(), &ec, None);
         assert!(line.contains("fan 4820rpm ec"), "{line}");
+    }
+
+    #[test]
+    fn the_hud_line_carries_gpu_load_because_mangohud_cannot() {
+        // MangoHud disables gpu_stats entirely on this board - its Intel path is
+        // i915-only and this is xe - so without this the in-game HUD has no GPU number.
+        let usage = Usage {
+            gpu_percent: Some(91.4),
+            gpu_mhz: Some(1950),
+            ..Default::default()
+        };
+        let line = hud_line(&telemetry(), &usage, &context(), None);
+        assert!(line.contains("GPU 91% 1950MHz"), "{line}");
     }
 
     #[test]
@@ -462,7 +491,7 @@ mod tests {
             elapsed_secs: 872,
             ..Default::default()
         };
-        let line = hud_line(&telemetry(), &context(), Some(&status));
+        let line = hud_line(&telemetry(), &Usage::default(), &context(), Some(&status));
         assert_eq!(line.lines().count(), 1);
         assert!(line.contains("REC 14:32"), "{line}");
     }

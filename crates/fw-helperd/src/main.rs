@@ -1016,6 +1016,7 @@ async fn poll_loop(ctx: Poll) {
         // cheaper than answering a D-Bus call per frame.
         record::write_hud(&record::hud_line(
             &sample,
+            &load,
             &context,
             recording.status().as_ref(),
         ));

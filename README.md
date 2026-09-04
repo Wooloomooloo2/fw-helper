@@ -35,6 +35,8 @@ once, switchable from a tray icon or a hotkey.
 | Performance profiles | **Working** — layered over power-profiles-daemon; the GNOME slider stays in sync |
 | Custom profiles | **Working** — saved from the app, or written by hand in `/etc/fw-helper/profiles.d/` |
 | Fan curve editing | **Working** — graphical editor in the app, or `fw-helperctl fan curve` |
+| Session recording | **Working** — record a run, come back and read the graph. CPU/GPU/RAM load, temps, power against the limit, fan, throttle events |
+| In-game numbers | **Working via MangoHud** — no ordinary window can be drawn over a fullscreen game on Wayland, so fw-helper feeds the overlay that can. See below |
 | PL2 (short-term limit) | Not touched — it governs burst response, not sustained thermals |
 | **Undervolting** | **Not possible.** See below |
 
@@ -55,6 +57,60 @@ Power limits (PL1/PL2) deliver most of what people actually want from undervolti
 laptop — lower sustained temperatures, quieter fan, longer battery. Measured on this machine:
 dropping the sustained limit from 25 W to 15 W took the CPU from **76.8 °C to 64.8 °C** under
 full load. See [ADR 0007](docs/adr/0007-no-undervolting.md).
+
+## Recording a session
+
+The question this started from was *"is 35 W actually the ceiling on this laptop?"*, and
+answering it once took a bespoke script and four manual runs. Now:
+
+```bash
+fw-helperctl record start "cyberpunk at 35W"
+# ... play something ...
+fw-helperctl record stop
+```
+
+Recording happens in the **daemon**, not the app, for two reasons. `energy_uj` is
+root-only (the PLATYPUS mitigation), so an unprivileged recorder cannot read package
+power at all; and a recording has to survive the window being closed, which is the whole
+point of coming back to look at it later.
+
+Open the **Monitor** tab in the app to read one back: five plots on a shared time axis —
+load, power, temperature, fan, memory. Sessions are plain CSV under
+`/var/lib/fw-helper/sessions/`, world-readable, with columns matching
+`scripts/sustained-perf-test.sh`, so a recorded game session and a benchmark run drop
+into the same spreadsheet.
+
+**How to tell whether the power limit was the thing holding you back.** The package
+publishes no "I am power limited" flag — unlike the GPU, which publishes real throttle
+reasons. So the PL1 setpoint is drawn as a dashed line over the power trace: draw sitting
+on the line *is* PL1 binding. That inference is how the 35 W ceiling was found.
+
+The last 20 sessions are kept, and a single recording stops itself after 12 hours.
+
+## In-game numbers, and why fw-helper does not draw them
+
+On GNOME/Wayland an ordinary window **cannot** be kept above a fullscreen window — Mutter
+implements no protocol for it, so this is not something an application can work around.
+`fw-helper --overlay` gives a compact readout that works beside a borderless game or on a
+second display, and is covered by a genuinely fullscreen one.
+
+For numbers *inside* a fullscreen game, use [MangoHud](https://github.com/flightlessmango/MangoHud).
+It is not a window: the Vulkan loader loads it into the game's own process and it paints
+into the frame before presentation, so the compositor never learns an overlay exists.
+fw-helper feeds it what it cannot know:
+
+```
+MANGOHUD=1 MANGOHUD_CONFIGFILE=/usr/share/fw-helper/mangohud/fw-helper.conf %command%
+```
+
+as Steam launch options. That adds the power limit being enforced, who owns the fan, the
+active profile, the battery pack temperature, and whether a recording is running.
+
+**It also adds GPU load, which MangoHud cannot show on this laptop.** Measured with
+MangoHud 0.6.9.1: its Intel support is i915-only, and this board runs `xe`, so it
+disables `gpu_stats` outright and falls back to `intel_gpu_top`, which needs
+`perf_event_open` and is blocked by `kernel.perf_event_paranoid=4`. fw-helper reads the
+per-engine counters out of `/proc/<pid>/fdinfo` instead, which needs no permission.
 
 ## Hardware support
 

@@ -18,7 +18,7 @@ cargo build --release --all
 install -d "$STAGE/DEBIAN" \
     "$STAGE/usr/bin" "$STAGE/usr/libexec" \
     "$STAGE/usr/share/applications" "$STAGE/usr/share/fw-helper" \
-    "$STAGE/usr/share/doc/fw-helper" \
+    "$STAGE/usr/share/doc/fw-helper" "$STAGE/usr/share/fw-helper/mangohud" \
     "$STAGE/usr/share/polkit-1/actions" \
     "$STAGE/etc/dbus-1/system.d" "$STAGE/etc/fw-helper/profiles.d" \
     "$STAGE/lib/systemd/system"
@@ -35,6 +35,10 @@ install -m 644 data/org.fwhelper.policy       "$STAGE/usr/share/polkit-1/actions
 install -m 644 data/fw-helperd.service        "$STAGE/lib/systemd/system/"
 install -m 644 data/fw-helper.desktop         "$STAGE/usr/share/applications/"
 install -m 644 data/example-profile.conf      "$STAGE/usr/share/fw-helper/"
+# For in-game numbers. No ordinary window can be drawn over a fullscreen game on
+# Wayland, so this hands MangoHud - which is loaded into the game itself - the state
+# only fw-helper knows.
+install -m 644 data/mangohud/fw-helper.conf   "$STAGE/usr/share/fw-helper/mangohud/"
 install -m 644 README.md LICENSE CHANGELOG.md "$STAGE/usr/share/doc/fw-helper/"
 
 # Debian expects a machine-readable copyright file; shipping LICENSE alone is not it.

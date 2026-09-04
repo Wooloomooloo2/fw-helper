@@ -24,55 +24,54 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M5 — profiles | complete: PPD delegation, user profiles, save/delete, AC/battery switching |
 | M6 — GUI | **complete**: profile, save/delete, power limit, charge limit, fan release, auto-switching, and the fan curve editor in a two-column adaptive window |
 | M7 — packaging | **complete**: install, GNOME app-grid launch and `apt remove` (fan back to the EC, `pwm1_enable=2`) all verified on hardware |
+| M8 — recording & monitoring | **built, unit-tested, GPU load verified on hardware**; recording itself unverified against the packaged daemon (polkit is a system-bus service, so it cannot run in session-bus dev mode) |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
 ### Resume here
 
-Last session ended 2026-09-01. **M0-M7 are complete**, M2 is complete *for the first
-time honestly* (the battery charge limit now actually stops charging), and the 2026-09-01
-cold boot cleared three of the four items that were queued here.
+Last session ended 2026-09-04. **M0-M7 are complete. M8 is built and unit-tested but its
+central claim is unverified**: nothing has recorded a session against the packaged daemon.
 
-**The headline, because it changes what the project claims about itself.** The charge
-limit had never worked. `charge_control_end_threshold` accepted 80, read back 80,
-persisted and re-applied across suspend and reboot - and the battery charged to 100%.
-Cause: **this board has two charge-control mechanisms and sysfs is wired to the losing
-one.** Measured with the standard threshold at 80, Framework's custom EC command reported
-`max=100`, and 100 is what happened. ADR 0008 forced `cros_charge-control` to bind with
-`probe_with_fwk_charge_control=1`; the kernel's refusal to bind was a correct verdict
-about this hardware, not an inconvenience to route around.
-
-Replaced by **[ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)**: command
-`0x3E03` over `/dev/cros_ec`. Verified 2026-08-26 - charged from below the limit on AC and
-stopped at exactly 80%, `status=Not charging`, `current_now=0`, `charge_now` 3 859 000 of
-`charge_full` 4 821 000. Repeatable via `scripts/q2-charge-limit-efficacy.sh`, which
-refuses to run on battery or when already above the limit.
+**The one thing M8 cannot do in development mode, and why.** Recording is gated by a
+polkit action, and polkit is a **system-bus** service. `FW_HELPERD_SESSION_BUS=1` puts the
+daemon on the session bus, where `org.freedesktop.PolicyKit1` does not exist, so every
+write method fails closed with `ServiceUnknown`. That is correct behaviour and applies to
+every knob, not just recording - it is simply the first feature whose *whole point* is a
+write. Everything else in M8 was exercised: GPU load, memory, the HUD line, the session
+list, the CLI and both GUI windows all work against a session-bus daemon.
 
 **Do these in order.**
 
-**1 - The descent test. Still the highest-value unproven claim.** Draw a curve reaching
-duty 0 by 55 C, heat with `stress-ng`, and listen on the way **down** - firmware holds duty
-50-90 to 44.9 C, so ours should be silent where firmware would not be (ADR 0011). Nothing
-blocks it; the floor table is clean through the band that matters (`44:0` through `52:0`).
+**1 - Record a session against the packaged daemon.** `sudo ./scripts/install-dev.sh
+--systemd`, then `fw-helperctl record start test`, wait, `record stop`, and read the CSV.
+This is the first exercise of the polkit gate, the `/var/lib/fw-helper/sessions` path and
+`RuntimeDirectory=fw-helper`. Note the unit changed, so it needs `enable` + **`restart`**,
+not `enable --now`.
 
-**2 - The fan pulse, from all THREE causes.** Written, tested, **unverified on hardware**
-(0.5.2). Two tests, because the causes fire in different conditions:
+**2 - Cross-check the new instrument against the trusted one.** Record a session while
+`sudo ./scripts/sustained-perf-test.sh --monitor` runs over the same window. They must
+agree on watts and temperatures. This is the check that matters: everything else in M8
+is a new instrument agreeing with itself.
 
-- *Idle, cool, on battery.* **VERIFIED 2026-09-02.** Under `stress-ng --cpu 8` the machine
-  held 40.9-41.9 C for 48 s - inside the bucket that carried `40:51`, crossing the 38/40
-  boundary both ways - and logged **zero** floor corrections. The same 16-minute window
-  under 0.5.1 the night before logged **77**.
-- *Charging, pack warm.* **STILL UNVERIFIED** - the third cause, found only because the
-  evening journal was read again. It cannot be provoked at will: it needs the pack near
-  41.9 C, which so far has only happened while charging. Put it on mains below the charge
-  limit and watch for a battery-sourced correction repeating. The message now names the
-  pack, so it is obvious which guard is talking - and that same run is the chance to log
-  `battery_temp@b` against time for the guard's margin, which needs a real charge cycle
-  before any constant moves.
+**3 - Replicate Q7 through the new path.** Record at PL1 25/30/35/40 W under `stress-ng`,
+cooling between runs, and read the sustained plateau off each graph. Should reproduce
+24.95 / 30.06 / 35.08 / 35.07 W. This is the question M8 exists to make repeatable, and
+passing it retires `sustained-perf-test.sh` as the only way to ask it.
 
-**3 - Measure the battery under charge.** The oldest untested assumption left, and the
-guard is sized against the wrong heat source. See the open defects.
+**4 - The descent test. Still the highest-value unproven claim, and now easier.** Draw a
+curve reaching duty 0 by 55 C, heat with `stress-ng`, and listen on the way **down** -
+firmware holds duty 50-90 to 44.9 C, so ours should be silent where firmware would not be
+(ADR 0011). M8 makes this a recording rather than a listening exercise: the fan strip
+shows exactly where each branch sits.
+
+**5 - The fan pulse from the third cause, still unverified.** *Charging, pack warm.* It
+cannot be provoked at will: it needs the pack near 41.9 C, which so far has only happened
+while charging. Put it on mains below the charge limit and watch for a battery-sourced
+correction repeating. **Record it** - that same run is the chance to log `battery_temp@b`
+against time for the guard's margin, which needs a real charge cycle before any constant
+moves. The other two causes were verified 2026-09-02.
 
 **Open defects, in severity order:**
 
@@ -122,6 +121,15 @@ guard is sized against the wrong heat source. See the open defects.
 
 **Verified on hardware and no longer in doubt:**
 
+- **GPU load reads correctly, and near zero at idle** (2026-09-04). 4.1% on an idle
+  desktop, attributed to `firefox-bin`, with the media engine at 0.6% while video was
+  playing - against the 27-55% the rejected `gtidle` source reported on the same idle
+  machine. Under load it tracked to 41%. This is the measurement that chose the source.
+- **MangoHud loads and parses the shipped config**, confirmed by running `vkcube` under
+  it: `parsing config: .../fw-helper.conf`. The same run is what revealed MangoHud
+  disables `gpu_stats` entirely on this board.
+- **The HUD line is published every tick** and carries what MangoHud cannot see:
+  `GPU 1% | PL1 15W | fan 0rpm 0% fw | quiet | pack 30C`.
 - **The charge limit stops charging** (above). The mechanism, the write path through
   polkit and D-Bus, and the efficacy test all check out.
 - **The packaged stack comes up clean from cold**, serving all five capabilities and
@@ -218,8 +226,12 @@ fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the
 fw-helperctl fan curve | fan curve 55:0,70:65,85:120   # follow a temp->duty curve
 fw-helperctl power-limit 15               # sustained CPU watts; ~32s to take effect
 fw-helperctl profile | profile quiet      # quiet|balanced|performance|turbo|max; moves the GNOME slider
+fw-helperctl record                       # what is recording, and what has been recorded
+fw-helperctl record start "a name" | record stop | record rm NAME
+fw-helperctl hud                          # one status line; what MangoHud's exec= reads
 /etc/fw-helper/profiles.d/*.conf          # user profiles; see data/example-profile.conf
 ./target/debug/fw-helper                  # the GUI
+./target/debug/fw-helper --overlay        # compact readout; an ORDINARY window (see traps)
 
 ./scripts/fw-probe.sh                     # read-only hardware survey
 sudo ./scripts/fw-probe.sh --write-test   # writes and restores; read it first
@@ -321,6 +333,13 @@ All of these cost real time once. Do not rediscover them.
 | A floor is **two guards**, and the log named the wrong one | The enforced floor is `max(firmware floor, battery ramp)`, but the message printed the **CPU** temperature whatever the source. So a battery guard firing for the first time ever — pack parked on `crit - 8` while charging, dithering across it — read as `52.9 C puts the firmware floor at 43/255` alternating with `at 0/255`, i.e. a fan oscillating at a constant temperature for no reason. A constant temperature with a changing floor means **the floor came from another sensor** |
 | Hysteresis must go **before** the `max`, not after | Holding the composed floor looks equivalent and is not: the held value is then released by whichever sensor moves first, so the CPU cooling 2 °C stands down a battery guard the CPU never triggered. Each guard's hold is keyed on the sensor that justifies it |
 | A floor bucket edge makes the fan **flap** | The floor is a step function over 2 °C buckets and `peci-temp` dithers ~1 °C, so a temperature sitting on a boundary alternates between the two buckets' duties every tick — `moved 0 -> 54` / `moved 54 -> 0` forever, audible at idle. A step function read from a dithering sensor needs hysteresis of its own, exactly as `Direction` does. Raise on the instant value, lower only after clearing the boundary |
+| **GPU "idle residency" is not idle** | `gt0/gtidle/idle_residency_ms` is **RC6** residency, so "not in RC6" counts as busy and includes powered-but-doing-nothing. It reported **27-55% busy on a completely idle machine**. It is the obvious source and it does not measure this. Use `/proc/<pid>/fdinfo` `drm-cycles-*` |
+| `perf_event_open` is blocked by **our own unit** | It lives in systemd's `@debug` syscall group, and `fw-helperd.service` sets `SystemCallFilter=@system-service`, which excludes it. So the `xe` PMU - the textbook way to read GPU busy - costs a sandbox widening. `perf_event_paranoid` is also **4** on this machine, so nothing unprivileged can use it either. Check `systemd-analyze syscall-filter @system-service` before assuming a syscall is available |
+| `drm-total-cycles-*` is a **GT clock**, not a per-client total | Verified across three processes of very different ages: 4846074419573 / 4846078603831 / 4846097985026, differing only by the interval between reads. So it is the denominator. And a process holding one DRM client through several **dup'd** descriptors publishes the full counter set on each - summing them multiplies its usage by its descriptor count, so deduplicate by `drm-client-id` |
+| **Unlinking an open file does not fail the writes** | Deleting a session while it is being recorded looked like it would surface as a write error. It does not: the descriptor keeps addressing the now-nameless inode, the rows go nowhere, and `stop` returns a path that no longer exists. `DeleteSession` refuses the active recording for this reason. Corollary: a test that removes a directory to simulate a full disk proves nothing |
+| **MangoHud shows no GPU on this laptop** | 0.6.9.1, measured 2026-09-04: its Intel support is **i915-only** and this board is `xe`, so it logs "no discrete/integrated i915 devices found" and *disables `gpu_stats`*; the `intel_gpu_top` fallback then hits the same `perf_event_paranoid` wall. Do not enable `gpu_stats` in the shipped config - fw-helper supplies the figure through `exec=` instead |
+| **No window can sit above a fullscreen game on GNOME/Wayland** | Mutter implements no protocol for it (`wlr-layer-shell` is a wlroots thing and `gtk4-layer-shell` is not installed here anyway). This is not something an application can work around. MangoHud is not a counter-example: it is **not a window**: the Vulkan loader loads it into the game's own process and it paints into the frame before presentation, so the compositor never learns an overlay exists. Its layer JSON is in `/usr/share/vulkan/implicit_layer.d/` |
+| **GApplication parses argv and rejects what it does not know** | `fw-helper --overlay` died with "Unknown option --overlay" before any of our code ran. Read our own flags from `std::env::args`, then hand GTK only the program name via `run_with_args` |
 | Floor observations are **monotone or wrong** | Firmware's ascending-branch duty cannot fall as temperature rises, so `40:51` sitting between `38:0` and `52:0` is not a curiosity — it is proof that one of the two is bad, and the isolated one loses. This internal contradiction is the only outlier detector available; repetition is not one, because whatever produced the bad sample held it for seconds and would corroborate itself |
 
 ## Coexistence
@@ -360,6 +379,13 @@ Measured on the target machine, not estimated:
   ADR 0011's guard ramp starts at 41.9 C, so ordinary charging now reaches it
 - Duty → RPM is **concave**: 30→1107, 50→1879, 77→2693, 90→3052, 120→3840, 180→5201 rpm.
   Stiction between duty 20 and 30
+- **GPU load costs 5-11 ms per sample** and only while something is watching. The naive
+  version - every file descriptor on the machine, every tick - was 7475 files and
+  **145 ms in release**, which is syscall-bound and cannot be optimised, only rationed
+  (full sweep every 10 s, one descriptor per client between sweeps)
+- **Tjmax is on `coretemp`'s `Package id 0`, published as `cpu-package`**: crit exactly
+  100 °C. `peci-temp` declares 119.85 °C, *above* Tjmax, so only the former can be drawn
+  as a limit
 - **The EC's curve is hysteretic**, and the descending branch is what M0 recorded. Climbing,
   firmware is silent past 64.8 °C and starts at 66–73 °C. Falling, it holds duty 50–90 all
   the way to 44.9 °C — duty 0 vs 92 at the same 61.9 °C.

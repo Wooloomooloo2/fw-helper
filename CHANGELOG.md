@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.6.0 — 2026-09-04
+
+M8: record what the machine does, and read it back as a graph.
+
+### Added
+
+- **Session recording.** `fw-helperctl record start [name]` / `record stop`, or the
+  Record button on the app's new **Monitor** tab. Rows go to
+  `/var/lib/fw-helper/sessions/<name>-<UTC stamp>.csv` at 1 Hz, world-readable, with
+  columns a superset of `scripts/sustained-perf-test.sh`'s so a game session and a
+  benchmark run open in the same spreadsheet. The last 20 sessions are kept and a single
+  recording stops itself after 12 hours.
+
+  Recording lives in the **daemon**, not the app. Not a preference: `energy_uj` is 0400
+  under the PLATYPUS mitigation, so an unprivileged recorder cannot read package power at
+  all — and a recording has to outlive the window being closed, which is the whole point.
+
+- **CPU, GPU and memory load** (`fw_helper_core::usage`), published as a new `Usage`
+  D-Bus property and shown in the app, the CLI's `watch`, and the overlay.
+
+  The GPU figure took three attempts and only the third is honest:
+
+  | Source | Verdict |
+  |---|---|
+  | `gt0/gtidle/idle_residency_ms` | **Wrong.** It is RC6 residency, so "not in RC6" counts as busy — it reported 27–55% on a completely idle machine |
+  | `xe` PMU `engine-active-ticks` | **Correct but costly.** Needs `perf_event_open`, which is in systemd's `@debug` group and excluded by our own `SystemCallFilter=@system-service`. Not worth widening the sandbox for |
+  | `/proc/<pid>/fdinfo` `drm-cycles-*` | **Shipped.** Accurate, no sandbox change, no dependency, and it names the process using the GPU |
+
+  `drm-total-cycles-*` was verified to be a GT-wide free-running clock, not a per-client
+  lifetime, by reading it from three processes of very different ages.
+
+- **The CPU package temperature** (`coretemp`'s `Package id 0`) is now published as
+  `cpu-package`. It matters because its critical point is **Tjmax, 100 °C** — the usable
+  one. `peci-temp` declares 119.8 °C, above Tjmax, so it can never be drawn as a limit.
+
+- **`fw-helper --overlay`**, a compact readout, and **MangoHud integration**
+  (`/usr/share/fw-helper/mangohud/fw-helper.conf`) for numbers inside a fullscreen game.
+  See below for why these are two different things.
+
+- **`fw-helperctl hud`** and `/run/fw-helper/hud`: one line of state, rewritten each
+  tick. Read by MangoHud's `exec=`, which runs inside the game's frame loop — hence a
+  file rather than a D-Bus call per frame.
+
+### Fixed
+
+- **`DeleteSession` on the recording in progress** would have unlinked the file while the
+  daemon kept writing to it. That does not fail on Linux: the descriptor keeps addressing
+  the now-nameless inode, so the rows go nowhere and `stop` hands back a path that no
+  longer exists. It is refused now, and says to stop the recording first. Found by a test
+  written to prove something else.
+
+### Notes
+
+- **MangoHud cannot show GPU load on this laptop**, measured with 0.6.9.1 on 2026-09-04:
+  its Intel path is i915-only and this board is `xe`, so it logs "no discrete/integrated
+  i915 devices found" and disables `gpu_stats`; its `intel_gpu_top` fallback hits the same
+  `perf_event_paranoid` wall that ruled out the PMU for us. The shipped config therefore
+  leaves `gpu_stats` off and takes the GPU figure from fw-helper instead.
+
+- **No ordinary window can be drawn above a fullscreen game on GNOME/Wayland.** Mutter
+  implements no protocol for it. `--overlay` is an ordinary window and behaves like one;
+  MangoHud works because it is *not* a window — the Vulkan loader loads it into the game's
+  own process and it paints into the frame before presentation.
+
+- **The `/proc` sweep for DRM clients is rationed.** Opening every file descriptor on the
+  machine is 7475 files here and measured **145 ms** even in release. It now runs at most
+  every 10 s to discover clients, re-reads one descriptor per client in between, and does
+  not run at all unless something is watching — 145 ms → **5–11 ms** per sample.
+
+### Unverified
+
+- Recording has **not been exercised against the packaged daemon**. It is gated by
+  polkit, which is a system-bus service, so it cannot run in the session-bus development
+  mode. The recording logic itself is covered by tests end to end, minus that gate.
+
 ## 0.5.2 — 2026-09-01
 
 ### Fixed

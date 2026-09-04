@@ -587,6 +587,59 @@ Still to do below. Controls arrive as M2–M5 land.
   (no undervolting, and why)
 - Consider a PPA
 
+### M8 — Session recording and live monitoring  🟡 built and unit-tested; recording unverified against the packaged daemon
+
+The founding question was Q7's: *is 35 W really this machine's ceiling?* Answering it once
+took `scripts/sustained-perf-test.sh`, four manual runs and a cooldown between each. M8
+turns that into something a user can do: **turn recording on, play a game, come back and
+read the graph.**
+
+- [x] **Load sampling** (`fw-helper-core/src/usage.rs`), dependency-free and counter-delta
+  based, following `EnergySampler`'s discipline exactly — first sample yields nothing, an
+  untrustworthy delta is discarded rather than interpolated, and everything is invalidated
+  on resume.
+- [x] **GPU load from `/proc/<pid>/fdinfo`**, after rejecting two more obvious sources.
+  `gtidle/idle_residency_ms` is RC6 residency and reported 27–55% busy on an idle machine;
+  the `xe` PMU is correct but needs `perf_event_open`, which our own
+  `SystemCallFilter=@system-service` excludes. The fdinfo counters are accurate, need no
+  permission, and name the process using the GPU.
+- [x] **The sweep is rationed.** Opening every descriptor on the machine is 7475 files and
+  145 ms in release — syscall-bound, so it cannot be optimised, only run less often. Full
+  sweep at most every 10 s, one descriptor per client in between, nothing at all unless
+  something is watching. 145 ms → 5–11 ms.
+- [x] **The CPU package sensor** (`coretemp` `Package id 0`) is published as `cpu-package`.
+  Its critical point is Tjmax, 100 °C — the usable one, where `peci-temp` declares 119.8 °C.
+- [x] **Recording in the daemon** (`fw-helperd/src/record.rs`), CSV under
+  `/var/lib/fw-helper/sessions/`. In the daemon because `energy_uj` is 0400 and because a
+  recording must outlive the window. Retention: 20 sessions, 12 h each.
+- [x] **D-Bus**: `Usage`, `RecordingSession` and `Sessions` properties; `StartRecording`,
+  `StopRecording`, `DeleteSession` methods behind a new `org.fwhelper.record` polkit
+  action — `allow_active=yes`, because it touches no hardware and a password dialog on a
+  Record button is the click-through failure the other actions are worded to avoid.
+- [x] **CLI**: `record start|stop|list|rm`, `hud`, and load columns on `watch`.
+- [x] **GUI**: a `ViewStack` with the existing controls and a new Monitor page — five strip
+  charts on a shared time axis, a live rolling window, and any recorded session loaded from
+  disk with a summary. Palettes validated for colour-vision deficiency in both themes.
+- [x] **`--overlay`** and **MangoHud integration**, which are different answers to
+  different situations. See the note below.
+- [ ] **Record a session against the packaged daemon.** Recording is gated by polkit, a
+  system-bus service, so it cannot be exercised in session-bus development mode. The logic
+  is covered by tests end to end, minus that gate.
+- [ ] **Cross-check against `sustained-perf-test.sh --monitor`** over the same window: the
+  two must agree on watts and temperatures. This is the check that matters, because it
+  validates a new instrument against a trusted one.
+- [ ] **Replicate Q7** at PL1 25/30/35/40 W through the new path and read the plateau off
+  each graph. Should reproduce 24.95 / 30.06 / 35.08 / 35.07 W.
+
+**On overlays, because it is a hardware-shaped constraint rather than a coding one.** On
+GNOME/Wayland an ordinary client cannot be kept above a fullscreen window; Mutter
+implements no protocol for it. So there are two answers, not one: `fw-helper --overlay`
+is an ordinary window, useful beside a borderless game or on a second display; and
+MangoHud, which is *not* a window — the Vulkan loader loads it into the game's own
+process and it paints into the frame before presentation. fw-helper feeds MangoHud rather
+than competing with it, and supplies the GPU figure MangoHud cannot produce here at all
+(its Intel path is i915-only; this board is `xe`).
+
 ---
 
 ## Risks

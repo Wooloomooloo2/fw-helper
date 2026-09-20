@@ -34,6 +34,37 @@ actually exposes. **Do not re-derive hardware facts — they are measured and re
 Last session ended 2026-09-20. **M0-M8 are complete, and M8's central claim is now
 verified**: a session has been recorded against the packaged daemon, with GPU load in it.
 
+**What the 2026-09-20 session did**, in the order it happened, because two of the three
+findings were invisible from inside the code:
+
+1. **GPU load had never worked outside development.** The packaged daemon published
+   `gpu_percent` not once, in any release. Root with `CapabilityBoundingSet=` empty holds
+   no capabilities, and reading another uid's `/proc/<pid>/fdinfo` needs
+   `CAP_SYS_PTRACE`. ADR 0013; fixed in the unit; verified `CapEff 0000000000080000`.
+2. **The Monitor page became one card per measurement**, each with its own y-axis and the
+   limit it is read against. Reviewed on hardware: *"MUCH cleaner"*.
+3. **A session was recorded against the packaged daemon** - M8's open item - and writing
+   it exposed the `t_s` truncation bug.
+4. **CI had been red for a month and nobody knew.** Since 2026-08-18, the day the GTK4
+   crate landed: the runner has no `libgtk-4-dev`, so clippy died in a build script in 17
+   seconds and every step after it never ran. `cargo-deny` was separately rejecting this
+   repository's own crates. Both fixed; run 35509964241 is the first green one since
+   August, and `check` now takes 2m0s rather than 17s - which is what a job that actually
+   compiles the workspace looks like.
+
+**Immediately after the reboot that followed** (the machine was rebooted at the end of the
+session, so this is unverified and worth ten seconds):
+
+- `systemctl is-active fw-helperd` - the cyclic `After=` trap reads as `enabled` /
+  `inactive (dead)`, never `failed`, so absence is the symptom. `journalctl -b | grep
+  'ordering cycle'` should be empty.
+- `fw-helperctl status` - the charge limit must read **85%**. The EC does not persist it
+  across a reboot; only the daemon's startup re-apply from `/var/lib/fw-helper/state`
+  restores it, so a boot without the daemon is a boot that charges to 100%.
+- `cat /run/fw-helper/hud` - **should carry a `GPU N%` field.** This is the cold-boot
+  confirmation that the capability grant survives a reboot rather than a `systemctl
+  restart`; the unit is installed, so it should, and it has never been observed.
+
 **The one thing M8 cannot do in development mode, and why.** Recording is gated by a
 polkit action, and polkit is a **system-bus** service. `FW_HELPERD_SESSION_BUS=1` puts the
 daemon on the session bus, where `org.freedesktop.PolicyKit1` does not exist, so every

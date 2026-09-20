@@ -390,6 +390,11 @@ All of these cost real time once. Do not rediscover them.
 | **No window can sit above a fullscreen game on GNOME/Wayland** | Mutter implements no protocol for it (`wlr-layer-shell` is a wlroots thing and `gtk4-layer-shell` is not installed here anyway). This is not something an application can work around. MangoHud is not a counter-example: it is **not a window**: the Vulkan loader loads it into the game's own process and it paints into the frame before presentation, so the compositor never learns an overlay exists. Its layer JSON is in `/usr/share/vulkan/implicit_layer.d/` |
 | **GApplication parses argv and rejects what it does not know** | `fw-helper --overlay` died with "Unknown option --overlay" before any of our code ran. Read our own flags from `std::env::args`, then hand GTK only the program name via `run_with_args` |
 | Floor observations are **monotone or wrong** | Firmware's ascending-branch duty cannot fall as temperature rises, so `40:51` sitting between `38:0` and `52:0` is not a curiosity — it is proof that one of the two is bad, and the isolated one loses. This internal contradiction is the only outlier detector available; repetition is not one, because whatever produced the bad sample held it for seconds and would corroborate itself |
+| `min_perf_pct` **accepts a value it never applies** | Written 75, reads back 75 — and `scaling_min_freq` stays at 400000 on all 16 cores while APERF/MPERF says the P-cores are running at 1738 MHz. Under `intel_pstate` in **active** mode with HWP, the per-core policy is what maps to HWP.MIN, so write `cpu*/cpufreq/scaling_min_freq` instead. Same family as `max_power_uw` and the sysfs charge limit: the knob Linux offers is not the one holding the value |
+| `governor=performance` is **nearly a no-op under HWP** | With `intel_pstate` active and HWP enabled it only forces EPP to 0, so if EPP already reads `performance` nothing changes at all. Measured across two Horizon Zero Dawn runs: P-cores 1808 → 1858 MHz, package 18.5 → 18.6 W, average fps 34 → 34. Frequency selection stays with the hardware, which scales on **per-core** utilisation — a workload spread thin across 16 cores never looks busy enough to boost, however much it needs single-thread speed |
+| The GPU reports a **continuous `pl4` clamp** | `xe`'s `tile0/gt0/freq0/throttle/reasons` read `pl4` on every sample across five runs, holding the GPU at 1850 of 2500 MHz, while `reason_thermal` and `reason_pl1` stayed 0 at 63 °C. PL4 is a microsecond current ceiling, so it clips transients without moving a 1 Hz power average — the package read 18.6 W of a 35 W budget the whole time. Never read "power headroom" off an averaged figure and conclude nothing is limiting; ask the driver what it thinks is limiting it |
+| **PL1 is not a lever for GPU-bound gaming** | Five Horizon Zero Dawn runs at PL1 30 W and 35 W: package power spanned **18.5–18.7 W**, a 2.1 W spread across every configuration tried, zero throttle events, 63 °C of a 100 °C Tjmax. Average fps moved 33 → 34. Raising PL1 only helps a workload actually asking for the watts — `stress-ng` under `sustained-perf-test.sh` does, a translation-layer game does not. Q7's 35 W ceiling is real and irrelevant here |
+| A game's **own instrumentation outranks `top`** | Horizon Zero Dawn reports CPU FPS 34 against GPU FPS 45 — CPU-bound — while no thread exceeded 50% and the busiest core sat at 47%. Both are true: the engine measures CPU *frame time* along the critical path, which counts blocking, and utilisation measures execution. A latency-bound CPU limit is invisible to per-core or per-thread load. The tell is arithmetic — ~190 ms of CPU time per frame across 16 cores producing a 29 ms frame is ~40% parallel efficiency, the signature of vkd3d-proton translation overhead rather than slow silicon |
 
 ## Coexistence
 
@@ -440,3 +445,13 @@ Measured on the target machine, not estimated:
   the way to 44.9 °C — duty 0 vs 92 at the same 61.9 °C.
   **That descent is where a custom curve wins**, not the "flat top" M0 predicted: measured,
   the built-in curve beats firmware by 13–36 duty counts through 50–60 °C
+- **A real game loads this machine to 18.6 W and 63 °C, and nothing moves it** (Horizon Zero
+  Dawn Remastered, 1080p Medium + FSR Balanced, 2026-09-20). Five runs across PL1 30/35 W,
+  a removed 40 fps cap, `governor=performance` + `hwp_dynamic_boost`, and `min_perf_pct=75`:
+  package **18.5–18.7 W**, P-cores **~1850 MHz of 4700**, GPU **1850 MHz of 2500** clamped
+  by `pl4`, peci **63 °C of 100**, **zero throttle events**, average **33 → 34 fps**.
+  The game's own counters read CPU FPS 34 against GPU FPS 45 — CPU-bound, in a workload
+  where no thread exceeded 50%. This is the profile of a **translation-layer** limit
+  (vkd3d-proton), not a firmware one, and it is the case where every knob fw-helper owns is
+  correctly irrelevant. Useful as a negative control: if a change appears to move these
+  numbers, suspect the measurement

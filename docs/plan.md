@@ -587,7 +587,7 @@ Still to do below. Controls arrive as M2–M5 land.
   (no undervolting, and why)
 - Consider a PPA
 
-### M8 — Session recording and live monitoring  🟡 built and unit-tested; recording unverified against the packaged daemon
+### M8 — Session recording and live monitoring  ✅ verified on hardware
 
 The founding question was Q7's: *is 35 W really this machine's ceiling?* Answering it once
 took `scripts/sustained-perf-test.sh`, four manual runs and a cooldown between each. M8
@@ -601,8 +601,17 @@ read the graph.**
 - [x] **GPU load from `/proc/<pid>/fdinfo`**, after rejecting two more obvious sources.
   `gtidle/idle_residency_ms` is RC6 residency and reported 27–55% busy on an idle machine;
   the `xe` PMU is correct but needs `perf_event_open`, which our own
-  `SystemCallFilter=@system-service` excludes. The fdinfo counters are accurate, need no
-  permission, and name the process using the GPU.
+  `SystemCallFilter=@system-service` excludes. The fdinfo counters are accurate and name
+  the process using the GPU.
+
+  **They do need a permission, and the claim that they did not cost 0.6.0 the feature
+  entirely** ([ADR 0013](adr/0013-cap-sys-ptrace-for-gpu-load.md)). Reading another uid's
+  fdinfo needs `CAP_SYS_PTRACE`, which root does **not** get for free — the unit's empty
+  `CapabilityBoundingSet=` left the daemon uid 0 with no capabilities at all, so every
+  read failed with `EACCES` and no packaged daemon ever published `gpu_percent`. It
+  passed in development because session-bus mode runs as the user. The unit now grants
+  that one capability, and `usage::fdinfo_blocked` makes the capability probe ask the
+  question rather than stopping at "the right driver is loaded".
 - [x] **The sweep is rationed.** Opening every descriptor on the machine is 7475 files and
   145 ms in release — syscall-bound, so it cannot be optimised, only run less often. Full
   sweep at most every 10 s, one descriptor per client in between, nothing at all unless
@@ -617,14 +626,23 @@ read the graph.**
   action — `allow_active=yes`, because it touches no hardware and a password dialog on a
   Record button is the click-through failure the other actions are worded to avoid.
 - [x] **CLI**: `record start|stop|list|rm`, `hud`, and load columns on `watch`.
-- [x] **GUI**: a `ViewStack` with the existing controls and a new Monitor page — five strip
-  charts on a shared time axis, a live rolling window, and any recorded session loaded from
-  disk with a summary. Palettes validated for colour-vision deficiency in both themes.
+- [x] **GUI**: a `ViewStack` with the existing controls and a new Monitor page — five
+  measurement cards on a shared time axis, a live rolling window, and any recorded session
+  loaded from disk with a summary. Palettes validated for colour-vision deficiency in both
+  themes. Each measurement is its own card, carrying its own y-axis and the limit it is
+  read against: PL1 over the power trace, Tjmax and the battery's critical point over
+  temperature. Drawn as one continuous surface those boundaries were implicit, and a
+  dashed threshold could be read as belonging to the strip above it.
 - [x] **`--overlay`** and **MangoHud integration**, which are different answers to
   different situations. See the note below.
-- [ ] **Record a session against the packaged daemon.** Recording is gated by polkit, a
-  system-bus service, so it cannot be exercised in session-bus development mode. The logic
-  is covered by tests end to end, minus that gate.
+- [x] **Record a session against the packaged daemon** (2026-09-20). 48 rows to
+  `/var/lib/fw-helper/sessions/`, one per second by `unix_time`, through the polkit gate
+  with no prompt, under `stress-ng --cpu 4`: peak 37.1% cpu, 18.10 W, 61.9 °C peci,
+  3963 rpm, with `gpu_pct` and `gpu_top` populated on every row. The polkit gate, the
+  `/var/lib` path and `RuntimeDirectory=fw-helper` all needed nothing. It found two
+  defects that no test could have: the `CAP_SYS_PTRACE` one above, and `t_s` truncated
+  from a monotonic `Instant`, which turned milliseconds of tick jitter into whole seconds
+  of error (`0 1 1 3 3 5 5 …` beside a `unix_time` advancing by exactly 1). Both fixed.
 - [ ] **Cross-check against `sustained-perf-test.sh --monitor`** over the same window: the
   two must agree on watts and temperatures. This is the check that matters, because it
   validates a new instrument against a trusted one.

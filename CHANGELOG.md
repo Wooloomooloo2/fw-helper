@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.6.2 — 2026-09-20
+
+### Fixed
+
+- **A recorded session's `t_s` column repeated and skipped seconds.** It was truncated
+  from a monotonic `Instant`, so a few milliseconds of tick jitter either side of a whole
+  second became a whole second of error. Measured on the first session recorded through
+  the packaged daemon: `0 1 1 3 3 5 5 6 8 8 …` across 48 rows whose `unix_time` column
+  advanced by exactly 1 every row. It rounds now, which moves the flip point to the
+  half-second — where no sample sits — so it takes accumulated drift rather than jitter to
+  produce a repeat.
+
+
+## 0.6.1 — 2026-09-20
+
+### Fixed
+
+- **GPU load was never recorded by the packaged daemon.** It worked in development and
+  nowhere else. Per-client load is read from `/proc/<pid>/fdinfo`, and opening the
+  fdinfo of a process owned by someone else goes through
+  `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` — which needs `CAP_SYS_PTRACE`. Being
+  root does not supply it: the kernel grants root nothing except through capabilities,
+  and `fw-helperd.service` set `CapabilityBoundingSet=` empty, so the daemon ran as
+  uid 0 holding **none**. Every GPU client belongs to the desktop user, so every read
+  failed with `EACCES` and `gpu_percent` was never published — in the window, the HUD
+  line, or a recorded session. `gpu_mhz`, an ordinary sysfs read, arrived every tick and
+  made the GPU look present throughout.
+
+  Session-bus development mode runs as the user and reads the user's own processes,
+  which is why this only existed once packaged. The unit now grants exactly one
+  capability, `CAP_SYS_PTRACE`, read-only and with the bounding set holding it to that.
+
+- **`gpu usage available` was logged beside a permanently blank number.** The capability
+  asked which DRM driver was loaded and stopped there, so it could not see the sandbox
+  that was blocking it. It now probes the whole path and, when blocked, says which
+  capability the unit is missing.
+
+### Changed
+
+- **The Monitor page draws one card per measurement.** Load, CPU package power,
+  temperature, fan and memory each get their own container, y-axis and — where one
+  exists — the limit that measurement is read against: PL1 over the power trace, Tjmax
+  and the battery's critical point over temperature. They share one time axis at the
+  foot of the column. Previously the five strips were drawn onto one continuous surface,
+  where a dashed threshold could as easily be read as belonging to the strip above it.
+
+
 ## 0.6.0 — 2026-09-04
 
 M8: record what the machine does, and read it back as a graph.

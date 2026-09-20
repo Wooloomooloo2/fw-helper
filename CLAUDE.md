@@ -24,15 +24,15 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M5 — profiles | complete: PPD delegation, user profiles, save/delete, AC/battery switching |
 | M6 — GUI | **complete**: profile, save/delete, power limit, charge limit, fan release, auto-switching, and the fan curve editor in a two-column adaptive window |
 | M7 — packaging | **complete**: install, GNOME app-grid launch and `apt remove` (fan back to the EC, `pwm1_enable=2`) all verified on hardware |
-| M8 — recording & monitoring | **built, unit-tested, GPU load verified on hardware**; recording itself unverified against the packaged daemon (polkit is a system-bus service, so it cannot run in session-bus dev mode) |
+| M8 — recording & monitoring | **complete and verified on hardware** (2026-09-20): a session recorded against the packaged daemon, 48 rows with GPU load and attribution on every one. Two defects found doing it, both fixed — GPU load was **published by no packaged daemon** at all (uid 0 with an empty capability set cannot read another user's `fdinfo`; see traps), and `t_s` was truncated rather than rounded. The Monitor page now draws one card per measurement |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
 ### Resume here
 
-Last session ended 2026-09-04. **M0-M7 are complete. M8 is built and unit-tested but its
-central claim is unverified**: nothing has recorded a session against the packaged daemon.
+Last session ended 2026-09-20. **M0-M8 are complete, and M8's central claim is now
+verified**: a session has been recorded against the packaged daemon, with GPU load in it.
 
 **The one thing M8 cannot do in development mode, and why.** Recording is gated by a
 polkit action, and polkit is a **system-bus** service. `FW_HELPERD_SESSION_BUS=1` puts the
@@ -44,11 +44,18 @@ list, the CLI and both GUI windows all work against a session-bus daemon.
 
 **Do these in order.**
 
-**1 - Record a session against the packaged daemon.** `sudo ./scripts/install-dev.sh
---systemd`, then `fw-helperctl record start test`, wait, `record stop`, and read the CSV.
-This is the first exercise of the polkit gate, the `/var/lib/fw-helper/sessions` path and
-`RuntimeDirectory=fw-helper`. Note the unit changed, so it needs `enable` + **`restart`**,
-not `enable --now`.
+**1 - DONE (2026-09-20). Recording works against the packaged daemon.** 48 rows to
+`/var/lib/fw-helper/sessions/`, one per second by `unix_time`, through the polkit gate
+with no prompt (`allow_active` is `yes` for `org.fwhelper.record`) and with `stress-ng
+--cpu 4` on the wire: peak 37.1% cpu, 18.10 W, 61.9 C peci, 3963 rpm. `gpu_pct` and
+`gpu_top` are populated on every row - which they could not have been before the same
+day's `CAP_SYS_PTRACE` fix. The polkit gate, the `/var/lib` path and
+`RuntimeDirectory=fw-helper` are all exercised and none of them needed anything.
+
+One defect in what it wrote, fixed: `t_s` was truncated from a monotonic `Instant`, so a
+few milliseconds of tick jitter around a whole second became a whole second of error -
+recorded `0 1 1 3 3 5 5 6 8 8 ...` while `unix_time` advanced by exactly 1 every row. It
+rounds now. **Not in the installed 0.6.1**, which was built before it.
 
 **2 - Cross-check the new instrument against the trusted one.** Record a session while
 `sudo ./scripts/sustained-perf-test.sh --monitor` runs over the same window. They must
@@ -125,6 +132,14 @@ moves. The other two causes were verified 2026-09-02.
   desktop, attributed to `firefox-bin`, with the media engine at 0.6% while video was
   playing - against the 27-55% the rejected `gtidle` source reported on the same idle
   machine. Under load it tracked to 41%. This is the measurement that chose the source.
+  **Read the caveat**: that run was a *session-bus* daemon, running as the user. The
+  packaged daemon published `gpu_percent` **not once** - see the `CapEff` trap - so what
+  2026-09-04 verified was the parsing, not the deployed path.
+- **GPU load reaches a recorded session, through the packaged daemon** (2026-09-20).
+  `CapEff` is `0000000000080000` - `CAP_SYS_PTRACE` and nothing else - and the HUD line
+  reads `GPU 13% | PL1 20W | ...` where it had no GPU field at all an hour earlier. Idle
+  desktop 12-15%, attributed (`code` at 5.8%). This is the deployed path, which the
+  2026-09-04 measurement was not.
 - **MangoHud loads and parses the shipped config**, confirmed by running `vkcube` under
   it: `parsing config: .../fw-helper.conf`. The same run is what revealed MangoHud
   disables `gpu_stats` entirely on this board.
@@ -335,6 +350,8 @@ All of these cost real time once. Do not rediscover them.
 | A floor bucket edge makes the fan **flap** | The floor is a step function over 2 °C buckets and `peci-temp` dithers ~1 °C, so a temperature sitting on a boundary alternates between the two buckets' duties every tick — `moved 0 -> 54` / `moved 54 -> 0` forever, audible at idle. A step function read from a dithering sensor needs hysteresis of its own, exactly as `Direction` does. Raise on the instant value, lower only after clearing the boundary |
 | **GPU "idle residency" is not idle** | `gt0/gtidle/idle_residency_ms` is **RC6** residency, so "not in RC6" counts as busy and includes powered-but-doing-nothing. It reported **27-55% busy on a completely idle machine**. It is the obvious source and it does not measure this. Use `/proc/<pid>/fdinfo` `drm-cycles-*` |
 | `perf_event_open` is blocked by **our own unit** | It lives in systemd's `@debug` syscall group, and `fw-helperd.service` sets `SystemCallFilter=@system-service`, which excludes it. So the `xe` PMU - the textbook way to read GPU busy - costs a sandbox widening. `perf_event_paranoid` is also **4** on this machine, so nothing unprivileged can use it either. Check `systemd-analyze syscall-filter @system-service` before assuming a syscall is available |
+| **Root is not enough to read another process's `fdinfo`** | The kernel grants root nothing except through capabilities, and the unit set `CapabilityBoundingSet=` empty — so the packaged daemon ran as uid 0 holding **zero** capabilities. Opening `/proc/<pid>/fdinfo/<fd>` of another uid goes through `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`, which needs `CAP_SYS_PTRACE`; every GPU client belongs to the desktop user, so every read was EACCES and `gpu_percent` was **never published** — window, HUD line and recorded sessions alike. Passed in development only because session-bus mode runs as the user. Fixed with `AmbientCapabilities=CAP_SYS_PTRACE`. Check `/proc/<pid>/status` `CapEff`, not `Uid`, before concluding a root daemon can read something |
+| A capability can be **`Yes` beside a permanently blank number** | `gpu usage available` was logged at every startup while nothing was ever measured: the probe asked which DRM driver was loaded and stopped there, and the sandbox that actually blocked it was never part of the question. A capability has to probe the whole path it is promising, sandbox included — `usage::fdinfo_blocked` |
 | `drm-total-cycles-*` is a **GT clock**, not a per-client total | Verified across three processes of very different ages: 4846074419573 / 4846078603831 / 4846097985026, differing only by the interval between reads. So it is the denominator. And a process holding one DRM client through several **dup'd** descriptors publishes the full counter set on each - summing them multiplies its usage by its descriptor count, so deduplicate by `drm-client-id` |
 | **Unlinking an open file does not fail the writes** | Deleting a session while it is being recorded looked like it would surface as a write error. It does not: the descriptor keeps addressing the now-nameless inode, the rows go nowhere, and `stop` returns a path that no longer exists. `DeleteSession` refuses the active recording for this reason. Corollary: a test that removes a directory to simulate a full disk proves nothing |
 | **MangoHud shows no GPU on this laptop** | 0.6.9.1, measured 2026-09-04: its Intel support is **i915-only** and this board is `xe`, so it logs "no discrete/integrated i915 devices found" and *disables `gpu_stats`*; the `intel_gpu_top` fallback then hits the same `perf_event_paranoid` wall. Do not enable `gpu_stats` in the shipped config - fw-helper supplies the figure through `exec=` instead |

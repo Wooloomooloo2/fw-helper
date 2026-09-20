@@ -4,6 +4,7 @@ description = "Hardware access and telemetry for Framework laptops"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 # Intentionally dependency-free. Everything here is std-only so the hardware

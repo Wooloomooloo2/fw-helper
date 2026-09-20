@@ -9,6 +9,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # `fw-helper-gui` links GTK4 and libadwaita, and the runner image carries neither,
+      # so anything building the whole workspace dies in gtk4-sys's build script within
+      # seconds - before clippy has looked at a line of our code, and before the test
+      # step runs at all. CI was red from the commit that added the GUI crate
+      # (adb1a3a, 2026-08-18) until this was noticed a month later, which is its own
+      # lesson: a check nobody can see fail is not a check.
+      - name: system libraries for the GUI crate
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       # Tests run against synthetic sysfs fixtures, so no hardware is needed (ADR 0004).

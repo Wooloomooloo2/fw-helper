@@ -10,6 +10,9 @@ members = [
 ]
 
 [workspace.package]
+# Not published to crates.io: these are the pieces of one application, and
+# `allow-wildcard-paths` in deny.toml depends on them being private.
+publish = false
 version = "0.6.2"
 edition = "2021"
 license = "GPL-3.0-only"

@@ -4,6 +4,7 @@ description = "Returns the fan to EC control; the crash path for ADR 0006"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 # Deliberately depends on nothing but the (itself dependency-free) hardware layer.

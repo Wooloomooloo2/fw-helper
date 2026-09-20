@@ -12,7 +12,11 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "GPL-3.0",
+    # The workspace's own crates declare GPL-3.0-only, which is a different SPDX
+    # identifier from the deprecated "GPL-3.0" - so allowing only the latter rejected
+    # every crate in this repository. That is what failed `cargo deny check licenses`
+    # in CI from the day the check was added.
+    "GPL-3.0-only",
     "ISC",
     "MIT",
     "MPL-2.0",
@@ -24,6 +28,12 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# `wildcards = "deny"` also catches this workspace's own path dependencies, which carry
+# no version requirement because they are never published - `fw-helper-core = { path =
+# "../fw-helper-core" }` and its four siblings. The check is aimed at wildcards on
+# *registry* crates, where the next release can change under you; this exempts the
+# private ones and leaves that intact.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

@@ -18,3 +18,4 @@ and setting the old one's status to `Superseded by NNNN`.
 | [0010](0010-dependency-boundary.md) | `fw-helper-core` stays dependency-free | Accepted |
 | [0011](0011-quiet-is-a-legitimate-choice.md) | Fan floor tracks firmware's behaviour, not CPU safety | Accepted |
 | [0012](0012-charge-limit-via-custom-ec-command.md) | Charge limit via Framework's custom EC command | Accepted |
+| [0013](0013-cap-sys-ptrace-for-gpu-load.md) | The daemon holds `CAP_SYS_PTRACE`, and nothing else | Accepted |

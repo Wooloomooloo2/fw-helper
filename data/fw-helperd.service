@@ -36,6 +36,28 @@ User=root
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
+
+# The one capability granted back, and it is not decoration: without it GPU load is
+# silently never published.
+#
+# Per-client GPU load is read from /proc/<pid>/fdinfo (usage.rs says why the other two
+# sources are wrong). Opening the fdinfo of a process we do not own goes through
+# ptrace_may_access(PTRACE_MODE_READ_FSCREDS), and for a different uid that needs
+# CAP_SYS_PTRACE. Root does not get it for free - the kernel grants root nothing except
+# through capabilities, and the empty bounding set above left the daemon uid 0 holding
+# exactly none. Every process driving the GPU belongs to the desktop user, so every one
+# of those reads failed with EACCES.
+#
+# Measured 2026-09-20 against the packaged daemon: gpu_mhz arrived on every tick, which
+# proves the DRM device itself was found, while gpu_percent was never published once -
+# not in the window, the HUD line, or a recorded session. It passed in development only
+# because session-bus mode runs as the user, reading the user's own processes.
+#
+# This is a read-only use: no ptrace(2) call is made, and @debug stays out of the
+# syscall filter below. It is still the widest thing in this unit, which is why it is
+# the only capability granted and why the bounding set keeps it the only one available.
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_PTRACE
 ProtectHome=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

@@ -120,7 +120,14 @@ impl Capabilities {
         // reporting a number nobody has checked — i915 publishes the same statistics in
         // a different unit and would be a small change, on a machine we could test it.
         let gpu_usage = match crate::usage::drm_driver(fs).as_deref() {
-            Some("xe") => Cap::Yes,
+            // The driver being right is not sufficient: the counters live in other
+            // processes' /proc, behind a ptrace check the packaged daemon's empty
+            // capability set fails. That reads as "gpu load: available" beside a
+            // permanently blank number unless it is asked here too.
+            Some("xe") => match crate::usage::fdinfo_blocked(fs) {
+                None => Cap::Yes,
+                Some(reason) => Cap::no(reason),
+            },
             Some(other) => Cap::no(format!(
                 "GPU load is only implemented for the xe driver; this machine uses {other}"
             )),

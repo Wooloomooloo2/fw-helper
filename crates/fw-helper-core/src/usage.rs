@@ -433,8 +433,10 @@ fn sweep_drm_clients(fs: &Sysfs, pdev: &str) -> Vec<KnownClient> {
         }
         let dir = format!("proc/{pid}/fdinfo");
         let Ok(fds) = std::fs::read_dir(fs.path(&dir)) else {
-            // Ordinary: the process exited between the two readdirs, or it belongs to
-            // another user and we are not root. Neither is worth reporting.
+            // Ordinary: the process exited between the two readdirs, or it belongs
+            // to another user we have no ptrace access to. Neither is worth reporting
+            // per process - `fdinfo_blocked` says it once, as a capability, when the
+            // second is going to be true of every process on the machine.
             continue;
         };
         let mut comm: Option<String> = None;
@@ -574,6 +576,46 @@ pub fn drm_driver(fs: &Sysfs) -> Option<String> {
         }
     }
     None
+}
+
+/// `CAP_SYS_PTRACE`, which is what gates reading another process's `/proc/<pid>/fdinfo`.
+const CAP_SYS_PTRACE: u64 = 1 << 19;
+
+/// Why per-client GPU load cannot be read here, or `None` when it can.
+///
+/// Opening `/proc/<pid>/fdinfo/<fd>` of a process we do not own goes through
+/// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`, which for a different uid needs
+/// `CAP_SYS_PTRACE`. Being root is **not** enough: the kernel grants root nothing except
+/// through capabilities, and `fw-helperd.service` ran with `CapabilityBoundingSet=`
+/// empty, so the daemon was uid 0 with a capability set of exactly zero. Measured
+/// 2026-09-20: `gpu_mhz` arrived every tick, so the DRM device was found - and
+/// `gpu_percent` was never once published, because every GPU client on the machine
+/// belongs to the desktop user and not one of their fdinfo files could be opened.
+///
+/// Unprivileged is not blocked: a client running as the user reads its own processes,
+/// which is every process driving the GPU. That is why this only appeared once the
+/// daemon was packaged - session-bus development mode runs as the user.
+pub fn fdinfo_blocked(fs: &Sysfs) -> Option<String> {
+    let status = fs.read_string("proc/self/status").ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+            .map(str::trim)
+    };
+    // The effective uid is the second field of `Uid: real effective saved fs`.
+    let euid: u64 = field("Uid")?.split_whitespace().nth(1)?.parse().ok()?;
+    if euid != 0 {
+        // Running as a user: we see our own processes, which is all of the ones that
+        // drive the GPU on a desktop.
+        return None;
+    }
+    let effective = u64::from_str_radix(field("CapEff")?, 16).ok()?;
+    (effective & CAP_SYS_PTRACE == 0).then(|| {
+        "GPU load needs CAP_SYS_PTRACE to read other processes' /proc/<pid>/fdinfo; \
+         add AmbientCapabilities=CAP_SYS_PTRACE to fw-helperd.service"
+            .to_string()
+    })
 }
 
 /// Card directories under `/sys/class/drm`, sorted so resolution is deterministic on a
@@ -763,6 +805,47 @@ mod tests {
 
     fn at(base: Instant, secs: u64) -> Instant {
         base + Duration::from_secs(secs)
+    }
+
+    /// `/proc/self/status` as the kernel writes it, trimmed to the two lines that
+    /// decide whether another process's fdinfo can be opened.
+    fn status(euid: u64, cap_eff: u64) -> String {
+        format!(
+            "Name:\tfw-helperd\nUid:\t{euid}\t{euid}\t{euid}\t{euid}\nCapEff:\t{cap_eff:016x}\n"
+        )
+    }
+
+    #[test]
+    fn root_without_cap_sys_ptrace_cannot_read_gpu_clients() {
+        // The defect this exists for: the packaged daemon ran as uid 0 with
+        // `CapabilityBoundingSet=` empty, so it held no capabilities at all. Opening
+        // another user's /proc/<pid>/fdinfo needs CAP_SYS_PTRACE, every GPU client
+        // belongs to the desktop user, and so gpu_percent was never published - while
+        // gpu_mhz, which is an ordinary sysfs read, arrived on every tick and made the
+        // GPU look present. Measured on hardware 2026-09-20.
+        let t = Tree::new("blocked");
+        t.write("proc/self/status", &status(0, 0));
+        let reason = fdinfo_blocked(&t.sysfs()).expect("root with no capabilities is blocked");
+        // The reason has to name the fix, not the symptom.
+        assert!(reason.contains("CAP_SYS_PTRACE"), "{reason}");
+        assert!(reason.contains("fw-helperd.service"), "{reason}");
+    }
+
+    #[test]
+    fn the_capability_unblocks_it() {
+        let t = Tree::new("granted");
+        t.write("proc/self/status", &status(0, CAP_SYS_PTRACE));
+        assert_eq!(fdinfo_blocked(&t.sysfs()), None);
+    }
+
+    #[test]
+    fn an_unprivileged_client_is_never_reported_as_blocked() {
+        // Development mode runs as the user, which is the uid owning every process that
+        // drives the GPU - so it reads them all without any capability. Reporting this
+        // as blocked would have put a false explanation under a working number.
+        let t = Tree::new("user");
+        t.write("proc/self/status", &status(1000, 0));
+        assert_eq!(fdinfo_blocked(&t.sysfs()), None);
     }
 
     /// One xe fdinfo, as the reference machine writes them.

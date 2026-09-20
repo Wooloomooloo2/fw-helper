@@ -110,7 +110,15 @@ active profile, the battery pack temperature, and whether a recording is running
 MangoHud 0.6.9.1: its Intel support is i915-only, and this board runs `xe`, so it
 disables `gpu_stats` outright and falls back to `intel_gpu_top`, which needs
 `perf_event_open` and is blocked by `kernel.perf_event_paranoid=4`. fw-helper reads the
-per-engine counters out of `/proc/<pid>/fdinfo` instead, which needs no permission.
+per-engine counters out of `/proc/<pid>/fdinfo` instead.
+
+That last bit needs one capability, and the shipped systemd unit grants it: reading
+another user's `/proc/<pid>/fdinfo` goes through a ptrace access check, which needs
+`CAP_SYS_PTRACE` — being root is not enough, and every process using the GPU belongs to
+you rather than to root. It is the only capability the daemon holds
+([ADR 0013](docs/adr/0013-cap-sys-ptrace-for-gpu-load.md)). If you run `fw-helperd` by
+hand rather than through systemd, run it as your own user or GPU load will read as
+unavailable, with the reason in the startup capability list.
 
 ## Hardware support
 

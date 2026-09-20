@@ -1003,7 +1003,14 @@ async fn poll_loop(ctx: Poll) {
 
         if recording_now {
             let started = recording_started.get_or_insert_with(std::time::Instant::now);
-            let elapsed = started.elapsed().as_secs();
+            // Rounded, not truncated. The tick lands within a few milliseconds of a whole
+            // second of the recording, and truncation turns that jitter into a whole
+            // second of error every time it crosses an integer: a 48-row session measured
+            // 2026-09-20 recorded `0 1 1 3 3 5 5 6 8 8 ...` while its `unix_time` column
+            // advanced by exactly 1 on every row. Rounding moves the flip point to the
+            // half-second, where nothing is sitting, so it takes accumulated drift rather
+            // than jitter to produce a repeat.
+            let elapsed = started.elapsed().as_secs_f64().round() as u64;
             guard
                 .recording()
                 .push(&record::row(elapsed, &sample, &load, &context));

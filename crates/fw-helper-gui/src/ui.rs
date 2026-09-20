@@ -13,6 +13,10 @@ const CSS: &str = "
 .stat-label  { font-size: 0.85rem; opacity: 0.6; }
 .stat-card   { padding: 14px 18px; border-radius: 12px; }
 .sensor-crit { opacity: 0.5; font-size: 0.8rem; }
+/* One measurement per card on the Monitor page. The horizontal padding is shared with
+   .chart-axis so the time ticks under the column line up with the plots above it. */
+.chart-card  { padding: 8px 8px 6px 8px; }
+.chart-axis  { padding: 0 8px; }
 /* The overlay's numbers: tabular figures so a changing value does not shuffle the
    column width every second, which is what makes a 1 Hz readout feel unsettled. */
 .overlay-value { font-size: 1.1rem; font-feature-settings: \"tnum\"; }

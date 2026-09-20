@@ -1,14 +1,14 @@
 //! The Monitor page: record a session, and read one back.
 //!
-//! Two views over the same chart widget. **Live** is a rolling window fed by the
-//! telemetry the rest of the window already receives. **Session** loads a recorded CSV
-//! from disk and shows the whole run.
+//! Two views over the same stack of measurement cards. **Live** is a rolling window
+//! fed by the telemetry the rest of the window already receives. **Session** loads a
+//! recorded CSV from disk and shows the whole run.
 //!
 //! Reading the file directly is deliberate. A session is tens of thousands of rows and
 //! the daemon writes them world-readable precisely so a client can open one rather than
 //! drag it across the bus; the daemon only supplies the list and the paths.
 
-use crate::chart::{ChartView, Sample};
+use crate::chart::{ChartStack, Sample};
 use crate::worker::Command;
 use adw::prelude::*;
 use fw_helper_client::Snapshot;
@@ -30,7 +30,7 @@ enum Viewing {
 
 pub struct MonitorPage {
     pub widget: gtk::Widget,
-    chart: Rc<ChartView>,
+    chart: Rc<ChartStack>,
     live: RefCell<VecDeque<Sample>>,
     /// Ticks since the page started, which is the live view's time axis.
     elapsed: Cell<f64>,
@@ -60,7 +60,7 @@ pub struct MonitorPage {
 
 impl MonitorPage {
     pub fn new(commands: std::sync::mpsc::Sender<Command>) -> Rc<Self> {
-        let chart = ChartView::new();
+        let chart = ChartStack::new();
 
         let source_row = adw::ComboRow::builder()
             .title("Showing")
@@ -115,10 +115,15 @@ impl MonitorPage {
             )
             .build();
 
-        let chart_group = adw::PreferencesGroup::builder().title("Machine").build();
+        // One group, whose rows are the measurement cards. The summary sits under
+        // them because it is a sentence about all five, not about any one.
+        let chart_group = adw::PreferencesGroup::builder()
+            .title("Machine")
+            .description("each measurement in its own strip, against the limit it is read against")
+            .build();
         let chart_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(8)
+            .spacing(10)
             .build();
         chart_box.append(&chart.widget);
         chart_box.append(&summary);

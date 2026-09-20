@@ -5,6 +5,13 @@
 //! no common scale, and putting two of them on one pair of axes invents a correlation
 //! the data does not contain. Small multiples are the fix.
 //!
+//! Each of the five is its own **card**, and the boundary is the point: a strip carries
+//! one quantity, its own y-axis, and the limit that quantity is read against — Tjmax
+//! over temperature, PL1 over power. Drawn as one continuous surface those boundaries
+//! were implicit, and a dashed line could be taken for belonging to the strip above or
+//! below it. The cards share a single time axis at the foot of the column, because the
+//! one thing they genuinely do have in common is the clock.
+//!
 //! ## How the power strip answers the question this feature exists for
 //!
 //! There is no readable flag for "the CPU package is power limited". The GPU publishes
@@ -126,8 +133,14 @@ pub struct Palette {
     memory: (f64, f64, f64),
     /// Reserved for throttling, which is a state and not an identity.
     alert: (f64, f64, f64),
-    /// The window background this is drawn on. Only used to punch a hole behind a
-    /// threshold label so it stays readable where it crosses a series.
+    /// The background this is drawn on. Only used to punch a hole behind a threshold
+    /// label so it stays readable where it crosses a series.
+    ///
+    /// This is the **card's** background, not the window's: the strips sit on cards, and
+    /// libadwaita draws a card as a translucent white over the window, so the two differ
+    /// by enough to see. Approximated as a constant rather than queried from the style
+    /// context so that drawing stays a pure function of data and palette, and can be
+    /// rendered to an image surface with no display attached.
     surface: (f64, f64, f64),
 }
 
@@ -152,7 +165,8 @@ impl Palette {
                 fan: rgb(0x9085e9),
                 memory: rgb(0x5aa95a),
                 alert: rgb(0xe66767),
-                surface: rgb(0x242424),
+                // 8% white over the #242424 window, which is what `.card` paints.
+                surface: rgb(0x363636),
             }
         } else {
             Self {
@@ -165,7 +179,7 @@ impl Palette {
                 fan: rgb(0x4a3aa7),
                 memory: rgb(0x008300),
                 alert: rgb(0xe34948),
-                surface: rgb(0xfafafa),
+                surface: rgb(0xffffff),
             }
         }
     }
@@ -178,19 +192,51 @@ const TJMAX_C: f64 = 100.0;
 const BATTERY_CRIT_C: f64 = 49.9;
 
 const HEADER_H: f64 = 15.0;
-const PLOT_H: f64 = 58.0;
-const STRIP_GAP: f64 = 9.0;
+const PLOT_H: f64 = 64.0;
+/// Space between cards when the whole column is drawn onto one surface. The live
+/// widget gets this from the box's spacing plus the cards' own padding instead.
+#[allow(dead_code)]
+const STRIP_GAP: f64 = 16.0;
 const AXIS_H: f64 = 16.0;
 const PAD_L: f64 = 38.0;
 const PAD_R: f64 = 10.0;
 
-fn strip_count() -> usize {
-    5
+/// One measured quantity, which is one card.
+///
+/// Ordered as the eye should read them: what was asked of the machine, what that cost
+/// in watts, what it did to temperatures, what the fan did about it. Memory last — it
+/// is the one figure here that no thermal or power decision depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    Load,
+    Power,
+    Temperature,
+    Fan,
+    Memory,
 }
 
-/// Total height the widget needs.
+pub const METRICS: [Metric; 5] = [
+    Metric::Load,
+    Metric::Power,
+    Metric::Temperature,
+    Metric::Fan,
+    Metric::Memory,
+];
+
+/// Height of one card's drawing area: its header, and its plot.
+pub fn card_height() -> i32 {
+    (HEADER_H + PLOT_H) as i32
+}
+
+/// Height of the shared time axis under the column.
+pub fn axis_height() -> i32 {
+    AXIS_H as i32
+}
+
+/// Total height the whole column needs when drawn onto a single surface.
+#[allow(dead_code)]
 pub fn natural_height() -> i32 {
-    ((HEADER_H + PLOT_H + STRIP_GAP) * strip_count() as f64 + AXIS_H) as i32
+    ((HEADER_H + PLOT_H + STRIP_GAP) * METRICS.len() as f64 + AXIS_H) as i32
 }
 
 /// How one series is read out of a sample.
@@ -216,17 +262,10 @@ struct Strip {
     mark_throttle: bool,
 }
 
-fn strips(p: &Palette, samples: &[Sample]) -> Vec<Strip> {
-    // The setpoint in force at the end of the window: what the trace should be read
-    // against right now.
-    let pl1 = samples.iter().rev().find_map(|s| s.pl1_w);
-    let mut power_thresholds = Vec::new();
-    if let Some(w) = pl1 {
-        power_thresholds.push((w, format!("PL1 {w:.0} W")));
-    }
-
-    vec![
-        Strip {
+/// What one card plots, and what it is read against.
+fn strip(metric: Metric, p: &Palette, samples: &[Sample]) -> Strip {
+    match metric {
+        Metric::Load => Strip {
             title: "load",
             series: vec![("cpu", p.cpu, |s| s.cpu_pct), ("gpu", p.gpu, |s| s.gpu_pct)],
             y_min: 0.0,
@@ -235,18 +274,25 @@ fn strips(p: &Palette, samples: &[Sample]) -> Vec<Strip> {
             thresholds: Vec::new(),
             mark_throttle: false,
         },
-        Strip {
+        Metric::Power => Strip {
             title: "cpu package power",
             series: vec![("draw", p.power, |s| s.package_w)],
             y_min: 0.0,
             y_floor_max: 40.0,
             unit: "W",
-            thresholds: power_thresholds,
+            // The setpoint in force at the end of the window: what the trace should be
+            // read against right now.
+            thresholds: samples
+                .iter()
+                .rev()
+                .find_map(|s| s.pl1_w)
+                .map(|w| vec![(w, format!("PL1 {w:.0} W"))])
+                .unwrap_or_default(),
             // Throttle events belong here: this is the strip where being held back is
             // the thing under discussion.
             mark_throttle: true,
         },
-        Strip {
+        Metric::Temperature => Strip {
             title: "temperature",
             series: vec![
                 ("cpu", p.cpu, |s| s.cpu_c),
@@ -262,7 +308,7 @@ fn strips(p: &Palette, samples: &[Sample]) -> Vec<Strip> {
             ],
             mark_throttle: false,
         },
-        Strip {
+        Metric::Fan => Strip {
             title: "fan",
             series: vec![("speed", p.fan, |s| s.fan_rpm)],
             y_min: 0.0,
@@ -271,7 +317,7 @@ fn strips(p: &Palette, samples: &[Sample]) -> Vec<Strip> {
             thresholds: Vec::new(),
             mark_throttle: false,
         },
-        Strip {
+        Metric::Memory => Strip {
             title: "memory",
             series: vec![("used", p.memory, |s| s.mem_pct)],
             y_min: 0.0,
@@ -280,7 +326,7 @@ fn strips(p: &Palette, samples: &[Sample]) -> Vec<Strip> {
             thresholds: Vec::new(),
             mark_throttle: false,
         },
-    ]
+    }
 }
 
 /// A column of the plot after downsampling: the mean drawn as the line, the range kept
@@ -348,60 +394,179 @@ pub struct ChartData {
     pub placeholder: String,
 }
 
-pub struct ChartView {
-    pub widget: gtk::DrawingArea,
+/// One card per measurement, sharing one set of samples and one time axis.
+///
+/// The samples live in a single [`ChartData`] that every card borrows, rather than a
+/// copy each: a loaded session is tens of thousands of rows, and five clones of it per
+/// view would be megabytes moved every time the source row changes.
+pub struct ChartStack {
+    pub widget: gtk::Box,
     data: Rc<RefCell<ChartData>>,
+    /// The cards themselves, hidden wholesale when there is nothing to plot — five
+    /// empty boxes each saying "no data" is worse than one sentence saying why.
+    cards: Vec<gtk::Widget>,
+    areas: Vec<gtk::DrawingArea>,
+    axis: gtk::DrawingArea,
+    axis_holder: gtk::Widget,
+    empty: gtk::Label,
 }
 
-impl ChartView {
+impl ChartStack {
     pub fn new() -> Rc<Self> {
         let data: Rc<RefCell<ChartData>> = Rc::new(RefCell::new(ChartData {
             samples: Vec::new(),
             placeholder: "waiting for the first sample\u{2026}".into(),
         }));
 
-        let widget = gtk::DrawingArea::builder()
-            .content_height(natural_height())
-            .hexpand(true)
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(10)
             .build();
 
-        let for_draw = Rc::clone(&data);
-        widget.set_draw_func(move |_area, cr, w, h| {
-            // The theme decision is made here rather than inside `draw`, which keeps
-            // the drawing itself free of any GTK state - so it can be rendered to an
-            // image surface and looked at without a display.
-            let palette = Palette::for_theme(adw::StyleManager::default().is_dark());
-            draw(cr, w, h, &for_draw.borrow(), palette);
-        });
+        let empty = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["stat-label"])
+            .label("waiting for the first sample\u{2026}")
+            .build();
+        widget.append(&empty);
 
-        Rc::new(Self { widget, data })
+        let mut cards = Vec::new();
+        let mut areas = Vec::new();
+        for metric in METRICS {
+            let area = gtk::DrawingArea::builder()
+                .content_height(card_height())
+                .hexpand(true)
+                .build();
+            let for_draw = Rc::clone(&data);
+            area.set_draw_func(move |_area, cr, w, h| {
+                // The theme decision is made here rather than inside `draw_metric`,
+                // which keeps the drawing itself free of any GTK state - so it can be
+                // rendered to an image surface and looked at without a display.
+                let palette = Palette::for_theme(adw::StyleManager::default().is_dark());
+                draw_metric(cr, w, h, metric, &for_draw.borrow(), palette);
+            });
+
+            let card = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .css_classes(["card", "chart-card"])
+                .build();
+            card.append(&area);
+            widget.append(&card);
+            cards.push(card.upcast::<gtk::Widget>());
+            areas.push(area);
+        }
+
+        // The axis sits outside the cards but inside the same horizontal padding, so
+        // its ticks line up with the plots above rather than with the window.
+        let axis = gtk::DrawingArea::builder()
+            .content_height(axis_height())
+            .hexpand(true)
+            .build();
+        let for_axis = Rc::clone(&data);
+        axis.set_draw_func(move |_area, cr, w, h| {
+            let palette = Palette::for_theme(adw::StyleManager::default().is_dark());
+            draw_axis(cr, w, h, &for_axis.borrow(), palette);
+        });
+        let axis_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["chart-axis"])
+            .build();
+        axis_holder.append(&axis);
+        widget.append(&axis_holder);
+
+        let stack = Rc::new(Self {
+            widget,
+            data,
+            cards,
+            areas,
+            axis,
+            axis_holder: axis_holder.upcast(),
+            empty,
+        });
+        stack.show_cards(false);
+        stack
     }
 
     pub fn set_samples(&self, samples: Vec<Sample>) {
-        {
-            let mut d = self.data.borrow_mut();
-            d.samples = samples;
+        let any = !samples.is_empty();
+        self.data.borrow_mut().samples = samples;
+        self.show_cards(any);
+        for area in &self.areas {
+            area.queue_draw();
         }
-        self.widget.queue_draw();
+        self.axis.queue_draw();
     }
 
     pub fn set_placeholder(&self, text: &str) {
         self.data.borrow_mut().placeholder = text.to_string();
-        self.widget.queue_draw();
+        self.empty.set_label(text);
+    }
+
+    fn show_cards(&self, any: bool) {
+        for card in &self.cards {
+            card.set_visible(any);
+        }
+        self.axis_holder.set_visible(any);
+        self.empty.set_visible(!any);
+        if !any {
+            self.empty.set_label(&self.data.borrow().placeholder);
+        }
     }
 }
 
+/// Draw one card: its header and its plot, with no time axis of its own.
+pub fn draw_metric(
+    cr: &gtk::cairo::Context,
+    w: i32,
+    h: i32,
+    metric: Metric,
+    d: &ChartData,
+    p: Palette,
+) {
+    let (w, _h) = (f64::from(w), f64::from(h));
+    if d.samples.is_empty() {
+        return;
+    }
+    prepare(cr);
+    let Geometry {
+        t_min,
+        t_span,
+        plot_w,
+        ..
+    } = geometry(w, d);
+    let x_of = x_mapper(w, d);
+    let strip = strip(metric, &p, &d.samples);
+    draw_strip(cr, &p, &strip, d, 0.0, w, &x_of, t_min, t_span, plot_w);
+}
+
+/// Draw the time axis the cards share.
+pub fn draw_axis(cr: &gtk::cairo::Context, w: i32, _h: i32, d: &ChartData, p: Palette) {
+    let w = f64::from(w);
+    if d.samples.is_empty() {
+        return;
+    }
+    prepare(cr);
+    let g = geometry(w, d);
+    let x_of = x_mapper(w, d);
+    draw_time_axis(cr, &p, 0.0, w, g.t_min, g.t_max, &x_of);
+}
+
+/// The whole column onto one surface: every card, its background included, and the
+/// axis. Not used by the window — this is what renders the chart to a PNG so it can be
+/// looked at without a display (`cargo run --example render-chart`).
+// The window draws one card per metric, so what follows - the whole column onto a
+// single surface - has no caller inside this binary. It is not dead: `examples/
+// render-chart.rs` includes this file with `#[path]` and renders it to a PNG, which is
+// how the chart gets looked at without a display. Marked rather than deleted, and
+// marked here rather than on the example's `mod`, where it would also silence genuinely
+// unused code.
+#[allow(dead_code)]
 pub fn draw(cr: &gtk::cairo::Context, w: i32, h: i32, d: &ChartData, p: Palette) {
     let (w, h) = (f64::from(w), f64::from(h));
     let (r, g, b) = p.ink;
 
-    cr.select_font_face(
-        "sans-serif",
-        gtk::cairo::FontSlant::Normal,
-        gtk::cairo::FontWeight::Normal,
-    );
-    cr.set_font_size(10.0);
-    cr.set_line_width(1.0);
+    prepare(cr);
 
     if d.samples.is_empty() {
         cr.set_source_rgba(r, g, b, 0.45);
@@ -410,19 +575,73 @@ pub fn draw(cr: &gtk::cairo::Context, w: i32, h: i32, d: &ChartData, p: Palette)
         return;
     }
 
-    let t_min = d.samples.first().map(|s| s.t).unwrap_or(0.0);
-    let t_max = d.samples.last().map(|s| s.t).unwrap_or(1.0);
-    let t_span = (t_max - t_min).max(1.0);
-    let plot_w = (w - PAD_L - PAD_R).max(1.0);
-    let x_of = move |t: f64| PAD_L + ((t - t_min) / t_span).clamp(0.0, 1.0) * plot_w;
+    let geo = geometry(w, d);
+    let x_of = x_mapper(w, d);
 
-    let all = strips(&p, &d.samples);
     let mut top = 0.0;
-    for strip in &all {
-        draw_strip(cr, &p, strip, d, top, w, &x_of, t_min, t_span, plot_w);
+    for metric in METRICS {
+        // The card behind the strip, so the rendered image matches the window rather
+        // than a continuous surface the window has not drawn since the strips became
+        // cards.
+        rounded_rect(cr, 0.0, top - 6.0, w, HEADER_H + PLOT_H + 12.0, 10.0);
+        cr.set_source_rgb(p.surface.0, p.surface.1, p.surface.2);
+        let _ = cr.fill();
+
+        let strip = strip(metric, &p, &d.samples);
+        draw_strip(
+            cr, &p, &strip, d, top, w, &x_of, geo.t_min, geo.t_span, geo.plot_w,
+        );
         top += HEADER_H + PLOT_H + STRIP_GAP;
     }
-    draw_time_axis(cr, &p, top, w, t_min, t_max, &x_of);
+    draw_time_axis(cr, &p, top, w, geo.t_min, geo.t_max, &x_of);
+}
+
+/// Font and line width, identical for every entry point.
+fn prepare(cr: &gtk::cairo::Context) {
+    cr.select_font_face(
+        "sans-serif",
+        gtk::cairo::FontSlant::Normal,
+        gtk::cairo::FontWeight::Normal,
+    );
+    cr.set_font_size(10.0);
+    cr.set_line_width(1.0);
+}
+
+/// The time window on screen, shared by every card so they stay in step.
+struct Geometry {
+    t_min: f64,
+    t_max: f64,
+    t_span: f64,
+    plot_w: f64,
+}
+
+fn geometry(w: f64, d: &ChartData) -> Geometry {
+    let t_min = d.samples.first().map(|s| s.t).unwrap_or(0.0);
+    let t_max = d.samples.last().map(|s| s.t).unwrap_or(1.0);
+    Geometry {
+        t_min,
+        t_max,
+        t_span: (t_max - t_min).max(1.0),
+        plot_w: (w - PAD_L - PAD_R).max(1.0),
+    }
+}
+
+fn x_mapper(w: f64, d: &ChartData) -> impl Fn(f64) -> f64 {
+    let g = geometry(w, d);
+    move |t: f64| PAD_L + ((t - g.t_min) / g.t_span).clamp(0.0, 1.0) * g.plot_w
+}
+
+/// A rounded rectangle path, for the card backgrounds in the rendered-to-image case.
+#[allow(dead_code)]
+fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
+    use std::f64::consts::PI;
+    let r = radius.min(w / 2.0).min(h / 2.0);
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -PI / 2.0, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, PI / 2.0);
+    cr.arc(x + r, y + h - r, r, PI / 2.0, PI);
+    cr.arc(x + r, y + r, r, PI, 1.5 * PI);
+    cr.close_path();
 }
 
 #[allow(clippy::too_many_arguments)]

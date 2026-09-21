@@ -52,18 +52,19 @@ findings were invisible from inside the code:
    August, and `check` now takes 2m0s rather than 17s - which is what a job that actually
    compiles the workspace looks like.
 
-**Immediately after the reboot that followed** (the machine was rebooted at the end of the
-session, so this is unverified and worth ten seconds):
+**The reboot that followed - all three checks PASSED** (2026-09-20, read three minutes
+into the boot):
 
-- `systemctl is-active fw-helperd` - the cyclic `After=` trap reads as `enabled` /
-  `inactive (dead)`, never `failed`, so absence is the symptom. `journalctl -b | grep
-  'ordering cycle'` should be empty.
-- `fw-helperctl status` - the charge limit must read **85%**. The EC does not persist it
-  across a reboot; only the daemon's startup re-apply from `/var/lib/fw-helper/state`
-  restores it, so a boot without the daemon is a boot that charges to 100%.
-- `cat /run/fw-helper/hud` - **should carry a `GPU N%` field.** This is the cold-boot
-  confirmation that the capability grant survives a reboot rather than a `systemctl
-  restart`; the unit is installed, so it should, and it has never been observed.
+- `systemctl is-active fw-helperd` reads **active**. The cyclic `After=` trap shows as
+  `enabled` / `inactive (dead)`, never `failed`, so the unit being up is the evidence;
+  nothing about an ordering cycle in the boot.
+- The charge limit reads **85%**, so the startup re-apply from `/var/lib/fw-helper/state`
+  ran. The EC does not persist it, and a boot without the daemon is a boot that charges
+  to 100%.
+- `cat /run/fw-helper/hud` reads
+  `GPU 7% | PL1 35W | fan 2723rpm 29% fw | max | pack 33C`, and `CapEff`/`CapAmb` are both
+  `0000000000080000`. **This is the one that had never been observed** - see the verified
+  list below.
 
 **The one thing M8 cannot do in development mode, and why.** Recording is gated by a
 polkit action, and polkit is a **system-bus** service. `FW_HELPERD_SESSION_BUS=1` puts the
@@ -171,6 +172,11 @@ moves. The other two causes were verified 2026-09-02.
   reads `GPU 13% | PL1 20W | ...` where it had no GPU field at all an hour earlier. Idle
   desktop 12-15%, attributed (`code` at 5.8%). This is the deployed path, which the
   2026-09-04 measurement was not.
+- **The `CAP_SYS_PTRACE` grant survives a cold boot** (2026-09-20, the reboot that ended
+  that session). Three minutes in, `CapEff` and `CapAmb` both read
+  `0000000000080000` and the HUD line carried `GPU 7%`. Every earlier confirmation had
+  followed a `systemctl restart` in a running session; the unit being started by PID 1 in
+  early boot, with the ambient set applied there, had never been exercised. It is now.
 - **MangoHud loads and parses the shipped config**, confirmed by running `vkcube` under
   it: `parsing config: .../fw-helper.conf`. The same run is what revealed MangoHud
   disables `gpu_stats` entirely on this board.
@@ -392,11 +398,15 @@ All of these cost real time once. Do not rediscover them.
 | Floor observations are **monotone or wrong** | Firmware's ascending-branch duty cannot fall as temperature rises, so `40:51` sitting between `38:0` and `52:0` is not a curiosity — it is proof that one of the two is bad, and the isolated one loses. This internal contradiction is the only outlier detector available; repetition is not one, because whatever produced the bad sample held it for seconds and would corroborate itself |
 | `min_perf_pct` **accepts a value it never applies** | Written 75, reads back 75 — and `scaling_min_freq` stays at 400000 on all 16 cores while APERF/MPERF says the P-cores are running at 1738 MHz. Under `intel_pstate` in **active** mode with HWP, the per-core policy is what maps to HWP.MIN, so write `cpu*/cpufreq/scaling_min_freq` instead. Same family as `max_power_uw` and the sysfs charge limit: the knob Linux offers is not the one holding the value |
 | `governor=performance` is **nearly a no-op under HWP** | With `intel_pstate` active and HWP enabled it only forces EPP to 0, so if EPP already reads `performance` nothing changes at all. Measured across two Horizon Zero Dawn runs: P-cores 1808 → 1858 MHz, package 18.5 → 18.6 W, average fps 34 → 34. Frequency selection stays with the hardware, which scales on **per-core** utilisation — a workload spread thin across 16 cores never looks busy enough to boost, however much it needs single-thread speed |
-| The GPU reports a **continuous `pl4` clamp** | `xe`'s `tile0/gt0/freq0/throttle/reasons` read `pl4` on every sample across five runs, holding the GPU at 1850 of 2500 MHz, while `reason_thermal` and `reason_pl1` stayed 0 at 63 °C. PL4 is a microsecond current ceiling, so it clips transients without moving a 1 Hz power average — the package read 18.6 W of a 35 W budget the whole time. Never read "power headroom" off an averaged figure and conclude nothing is limiting; ask the driver what it thinks is limiting it |
-| **PL1 binds only below the PL4 ceiling** | Measured with Cyberpunk 2077, which unlike HZD actually asks for the watts: **15 -> 25 W gave +31% fps** (36.65 -> 48.01), **25 -> 35 W gave +0.3%** (48.16). At 15 W the driver reports `pl1` on every sample and the package sits exactly at 15.0 W; at 25 W and 35 W it reports `pl4` on every sample and the package stops at **21.0 / 21.1 W** with the limit unreached. So PL1 is a real lever up to ~21 W and inert above it. Five HZD runs at 30/35 W showed a 2.1 W spread and 33 -> 34 fps only because that title never reached the ceiling at all — do not generalise a null result from a workload that was not asking |
-| The GPU never exceeds **~1850 MHz of a declared 2500** | `rp0_freq`, `rpa_freq` and `max_freq` all read 2500 on `gt0`, constant across all three platform profiles. Actual, across two titles, four PL1 settings and 500+ samples: **1850 MHz x148**, 1900 x4, and **zero samples above 2000**. Highest ever seen anywhere: 1950 MHz. The gap is not power — with the game closed, `min_freq` forced to 2500 and only `vkcube` running, the package drew **4.3-6.3 W** (30 W of unused budget), `throttle/reasons` read `none`, and it still delivered 1950. Treat 1850 MHz as this board's real GPU ceiling |
+| `pl4` in `throttle/reasons` means **"GPU busy"**, not "GPU clamped" | It reads `pl4` on essentially every sample whenever the GPU is loaded and `none` whenever it is idle — measured 2026-09-21 at 25/25 samples in both a GPU-only and a GPU+CPU phase, `none` in the idle and CPU-only phases. **This corrects an earlier reading of the same data**: five runs showing `pl4` while the GPU sat at 1850 MHz were recorded as PL4 *holding* it there, which was correlation. A forum report on identical hardware sees `pl4` asserted while the GPU runs at its full 2500 MHz. PL4 is still a microsecond current ceiling that cannot be seen in a 1 Hz power average — just don't infer a frequency limit from it |
+| **PL1 binds only below the PL4 ceiling** | Measured with Cyberpunk 2077, which unlike HZD actually asks for the watts: **15 -> 25 W gave +31% fps** (36.65 -> 48.01), **25 -> 35 W gave +0.3%** (48.16). At 15 W the driver reports `pl1` on every sample and the package sits exactly at 15.0 W; at 25 W and 35 W it reports `pl4` on every sample and the package stops at **21.0 / 21.1 W** with the limit unreached. So PL1 is a real lever up to ~21 W and inert above it. **Revisit that 21 W**: the combined CPU+GPU clamp above is a competing explanation for the wall, and a better-supported one than PL4. Five HZD runs at 30/35 W showed a 2.1 W spread and 33 -> 34 fps only because that title never reached the ceiling at all — do not generalise a null result from a workload that was not asking |
+| The GPU stalls at ~1900 MHz here, but **that is not the hardware's ceiling** | `rp0_freq`, `rpa_freq` and `max_freq` all read 2500 on `gt0`, constant across all three platform profiles, and nothing measured on this machine has ever exceeded **1950**. But two independent reports on the *same* Framework 13 / Core Ultra X7 358H, same BIOS 03.02, same EC sakura-3.0.2, same kisak Mesa, reach a genuine **2500** — both on kernel **7.2.6**, where this machine runs **7.0**. Neither has tried 7.0, so "7.2.6 and 7.3-rc behave the same" (a claim about the power inversion below) says nothing about the ceiling. **Kernel 7.0's `xe` is the leading suspect**; SR-IOV PF mode and PL4 are both eliminated. Open confound: the 2026-09-21 `vkmark` run was on **battery**, though nothing in sysfs is lowered on DC |
+| On **battery** a heavy GPU load hits `pl2`, and it is a real limit | FurMark at 1920x1080 asserts `pl2` on **every** sample on DC and the GPU runs **1300-1500 MHz**; on mains, same benchmark and the same 92-94% busy, `pl2` never appears and it runs **1850-1950** (2026-09-21). So a GPU measurement taken on battery is taken under a power limit that does not show up in any sysfs *limit* field — PL1 still reads 35 W, PL2 60 W, `platform_profile` still `performance`. Unlike `pl4`, which merely means "GPU busy", `pl2` appearing is worth acting on: it says the reading is power-bound. Check `AC online` before trusting any GPU figure |
+| The CPU **does** publish a throttle reason — in an MSR, not sysfs | `MSR_CORE_PERF_LIMIT_REASONS` at **`0x64f`** works on this part (`0x690` is not implemented); graphics is `0x6b0`, ring `0x6b1`. Low 16 bits are live status, high 16 a sticky log that `wrmsr 0 0` clears. **Bit 8 is what `xe` calls `pl4`** — calibrated on-machine, not from a summary: on the same rows, gfx bit 8 set <-> sysfs `pl4`, gfx bits clear <-> sysfs `none`. So bit 8 is the electrical/current category (EDP/ICCmax), and it is the **only** live reason on the cores under load — PL1, PL2, thermal and PROCHOT appear in the sticky history and never live. Needs `msr-tools` and the `msr` module, both present. This corrects the standing claim that the package publishes no throttle reason, which is true only of sysfs |
+| An active GPU **caps the cores at ~11 W**, whatever the GPU is actually doing | The cores drop from **29.27 W / 3831-3951 MHz** to **~11 W / ~2100 MHz** the moment the GPU is non-idle, and **the clamp is the same size whether the GPU then draws 4 W or 22 W**. It is a fixed reservation, not a mis-estimate of demand. **Do not read the package total as the effect** — an earlier note here did, and invented a phenomenon: package = clamped CPU + whatever the GPU asks for, so it *falls* under a light GPU load and *rises* under a heavy one purely as arithmetic. One effect, not two. Quantified on this machine, mains, PL1 35 W (2026-09-21), all with `stress-ng --cpu 12`: **alone** 30.83 W / cores 3831-3951 MHz; **+ vkmark** (partial GPU) **18.48 W** / cores 2029-2700; **+ FurMark** (saturating GPU) **34.48 W at PL1** / cores 2004-2162, uncore taking 21.74 W. Note the core column is flat at 10-12 W across both GPU cases: only the GPU's own consumption differs. Corroborated on kernel 7.3-rc3 by a correspondent: FurMark + `stress-ng` 32 W at PL1, `vkmark` + `stress-ng` 30 -> 17 W, real games 20-23 W against a 33 W PL1. Measured 2026-09-21 on battery — `stress-ng --cpu 12` alone **25.31 W** with a top core at **3508 MHz**; add `vkmark` and the package falls to **19.39 W** with the top core at **2056 MHz**, while the GPU barely moves (1850 median). `vkmark` by itself is 11.33 W. Corroborated on identical hardware on AC and kernel 7.2.6 at a larger amplitude: 40 W / 3800 MHz alone, **15-17 W / 1970 MHz** combined. The CPU absorbs the entire reduction. Not PL1 (35 W, never approached), not thermal, not PROCHOT (EC `0x3E22` reads 0000 under load). Mechanism still unknown. **What has been eliminated**, all measured rather than argued: PL1 and PL2 (not live in `MSR_CORE_PERF_LIMIT_REASONS`, and the package sits at half the limit), thermal (not live, temps far below), PROCHOT (not live; EC `0x3E22` reads 0000), the ring interconnect (`0x6b1` live bits zero), `psys` (disabled, limits 0), DPTF (`INT3400` bound but `current_uuid` and `available_uuids` both **empty**, so no policy loaded), and HWP (`IA32_HWP_REQUEST` is `0x3505`, max 53 of a highest-performance 53, **unchanged across every phase** — nothing asks for less, so the silicon is refusing). The only live reason on the cores is **bit 8, the electrical/current category**, and it is set in the healthy configurations too, so it does not discriminate. Best remaining hypothesis, unproven: margin held back against combined CPU+GPU current peaks, which a steady load does not produce and a duty-cycling one does. **Consequence for measurement**: any CPU figure taken while the GPU is partly busy is taken under this clamp, so a "CPU-bound" verdict from a game may be this and not the workload. **Consequence for fw-helper**: it is why PL1 above ~21 W is inert for games, and why a GPU-bound game is **not** being starved. CP2077 runs at 96-97% GPU occupancy drawing 21 W while FurMark reaches 21.7 W on the graphics rail alone — because `busy%` measures occupancy, not intensity, and a game's shaders are far less dense than a power virus's. The GPU is at its 1950 MHz ceiling and fully occupied, so there is no withheld budget for a higher PL1 to release. `cpu_w`/`gpu_w` are the instrument for chasing this: they say which rail the missing watts were not spent on |
 | GPU `min_freq` is **not** a frequency peg | The SteamOS-style "pin the GPU to max" trick does not work here. Writing 2500 to `gt0/freq0/min_freq` is accepted and `cur_freq` duly reads 2500 — the driver is genuinely requesting maximum — while `act_freq` stays at 1850. A DVFS floor is a request; whatever holds this GPU sits below it. `xe` exposes no SLPC or GuC frequency state in debugfs on kernel 7.0, so GuC's enforced limits cannot be read at all |
-| `sriov_numvfs = 0` does **not** mean SR-IOV is off | `sriov_info` reads `enabled: yes, mode: SR-IOV PF` on this machine while `sriov_numvfs` is 0. Zero VFs means nothing to arbitrate *between*, so per-VF power budgeting cannot be a mechanism — but PF mode itself is active, and GuC manages power differently under it. Read `sriov_info`, not the VF count, before concluding SR-IOV is irrelevant. Untested: `xe.max_vfs=0` on the kernel cmdline |
+| `sriov_numvfs = 0` does **not** mean SR-IOV is off | `sriov_info` reads `enabled: yes, mode: SR-IOV PF` on this machine while `sriov_numvfs` is 0. Zero VFs means nothing to arbitrate *between*, so per-VF power budgeting cannot be a mechanism — but PF mode itself is active, and GuC manages power differently under it. Read `sriov_info`, not the VF count, before concluding SR-IOV is irrelevant — and note it lives in **restricted debugfs** (`/sys/kernel/debug/dri/*/sriov_info`), not next to the `sriov_*` attributes in sysfs. `xe.max_vfs=0` on the kernel cmdline **does** switch it off (2026-09-20: `enabled: no, mode: none`, `totalvfs` 0) and the 1850 MHz ceiling did **not** move — see the GPU ceiling note for how strong that is |
+| GPU `act_freq` is an **instantaneous** sample, and a synthetic load never reaches the ceiling | `act_freq` reads **0** whenever the GT is in RC6 at the moment of the read, so a 1 Hz poll of a bursty load reports mostly zeros and cannot be averaged or turned into a duty cycle. Worse, the obvious load is the wrong one: sampled at 50 Hz under `stress-ng --gpu`, `act_freq` spread across **950-1850 MHz with only 2 of 400 samples at 1850** and 70 genuine zeros — it is light and bursty and never asks for maximum clocks, so a peak read off it says nothing about a ceiling. `vkcube` is worse still: occlude its window and Mutter stops sending frame callbacks, so it renders **nothing** while still looking alive (package 3.5 W against 7.2 W for `stress-ng`, and 4.3-6.3 W when it was genuinely visible). Only a title that saturates the GPU — CP2077 reaches 96-97% busy — can probe the frequency ceiling |
 | A game can be **title-limited, not machine-limited** | Cyberpunk 2077 at PL1 **15 W** scores 36.65 fps; Horizon Zero Dawn Remastered at **35 W** scores 34 — same machine, both 1080p Medium with a balanced upscaler. CP2077 reaches 96-97% GPU busy and responds properly to power; HZD never exceeded 72% GPU busy or 50% on any core while reporting itself CPU-bound. Before attributing a frame rate to firmware, check the number against a second title |
 | A game's **own instrumentation outranks `top`** | Horizon Zero Dawn reports CPU FPS 34 against GPU FPS 45 — CPU-bound — while no thread exceeded 50% and the busiest core sat at 47%. Both are true: the engine measures CPU *frame time* along the critical path, which counts blocking, and utilisation measures execution. A latency-bound CPU limit is invisible to per-core or per-thread load. The tell is arithmetic — ~190 ms of CPU time per frame across 16 cores producing a 29 ms frame is ~40% parallel efficiency, the signature of vkd3d-proton translation overhead rather than slow silicon |
 
@@ -470,8 +480,45 @@ Measured on the target machine, not estimated:
   **Run gaming at PL1 25 W**: identical fps to 35 W for 10 W less and ~156 rpm less fan.
   The apparent CPU bottleneck at 15 W was the cap starving the cores, not a CPU limit —
   it vanishes entirely at 25 W
-- **The GPU's usable ceiling is 1850 MHz, not the 2500 MHz it declares.** 148 samples at
-  1850 across two titles; nothing above 2000 ever observed; demonstrated not to be power
-  (4.3-6.3 W with a 2500 MHz floor requested still gave 1950). `gt0` is 12 Xe cores x 8 EU
-  = 96 EUs. Suspects, both below Linux: a GuC operating point, or a VR/IccMax firmware
-  limit. Open question: user documentation suggests 2800-2900 MHz, source unidentified
+- **This machine's GPU stalls at ~1900 MHz of a declared 2500 — but the hardware does 2500.**
+  Nothing measured here has ever exceeded 1950: 148 samples at 1850 across two titles, and
+  `vkmark` — the first load that genuinely saturates the GPU, 500/500 awake samples at
+  11.33 W — peaked at **1900** (2026-09-21, on battery). `gt0` is 12 Xe cores x 8 EU = 96 EUs.
+  Four forum/Reddit reports on identical hardware claim a real 2500 — **but every one of them
+  is reading `cur_freq`, not `act_freq`** (2026-09-21). Settled by the matched run: FurMark on
+  **mains** at **92-94% GPU busy**, the same tool and the same saturation as the screenshot
+  claiming 2.50 GHz, gives `act_freq` **1850-1950** while `cur_freq` reads **exactly 2500 on
+  every sample** — which is the figure their tool displays. Under FurMark on this machine
+  `cur_freq` reads a constant **2500** while `act_freq` reads **1100-1650**; `cur_freq` is the
+  DVFS *request*, not the achieved clock. The tell was **frame rate, not sysfs**: their FurMark
+  run does 1383 frames in 33 s = 42 fps at 1646x1069, and on mains ours beats it at the larger
+  1920x1080 — so *we are faster* while allegedly clocked 550-1100 MHz lower. Two GPUs at the
+  same performance are at the same speed. **Treat the whole "everyone else reaches 2500" thread
+  as unverified** until someone posts `act_freq`. Eliminated: **power** (4.3-6.3 W with a 2500 MHz floor
+  requested still gave only 1950), **PL4** (asserted on a machine reaching 2500),
+  **SR-IOV PF mode** (`xe.max_vfs=0` disabled it with no change, 2026-09-20; and a
+  correspondent runs a live VF at 2500), and — decisively — **insufficient GPU demand**: the
+  clock does not track saturation here. `vkmark` at **72% busy** gave **1900 MHz**, while
+  CP2077 at **96-97% busy**, on AC and drawing 21 W of a 25 W limit, gave **1852**. The *more*
+  saturated load clocked *lower*, which no demand-driven DVFS story explains, and it clears
+  the battery confound too since the CP2077 runs were on mains. **The cleanest external
+  comparison** (2026-09-21, screenshot): another Arc B390 (PTL) running FurMark 2.10.2 GL at
+  **93% GPU utilisation reads 2.50/2.50 GHz** — *less* saturated than our CP2077 and 650 MHz
+  higher, on **older** Mesa (26.2.2 vs our 26.2.3) and a different API (OpenGL, not Vulkan).
+  So Mesa version, Mesa vendor and graphics API are all eliminated as well — though see above:
+  that screenshot's 2.50 GHz is most likely `cur_freq`, in which case it is not a comparison at
+  all. **Mission Center displays "Clock Speed: 2.50 GHz / 2.50 GHz" as current/max**; confirm
+  what it sources before citing any screenshot of it as a frequency measurement. **SETTLED: ~1950 MHz under a saturating load on mains is simply
+  what this GPU does. There is no ceiling and there never was.** Independently replicated by
+  a correspondent on kernel **7.3-rc3** posting `cur=2500 act=1900-2000 pl4` — identical to
+  this machine on 7.0, which kills the kernel theory outright — and they caught `nvtop`
+  reporting 2500 as a third tool showing the request. **Do not reopen this** without an
+  `act_freq` figure above 2000 from a saturating load on mains. **Why 2500 was never reachable**: Intel
+  specifies it as *Graphics Max Dynamic Frequency* at an **80 W Maximum Turbo Power**. This
+  is a ~35-38 W part, so ~1950 is what the silicon does in this envelope — that number was a
+  spec for a different power class, not a target. It also explains why 25 W and 35 W give
+  identical fps in CP2077: past ~21-25 W, more package budget does not buy GPU clock. A
+  correspondent PL1-limited at ~25 W (`reasons` reads `pl1`, package 24.7 W) reaches the same
+  ~1950 as this machine unlimited at 35 W (`reasons` reads `pl4`). Also unexplained, and now
+  probably irrelevant: `gt0/freq0/power_profile` reads `[base] power_saving`.
+  Open question: user documentation suggests 2800-2900 MHz, source unidentified

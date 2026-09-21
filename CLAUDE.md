@@ -24,93 +24,123 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M5 — profiles | complete: PPD delegation, user profiles, save/delete, AC/battery switching |
 | M6 — GUI | **complete**: profile, save/delete, power limit, charge limit, fan release, auto-switching, and the fan curve editor in a two-column adaptive window |
 | M7 — packaging | **complete**: install, GNOME app-grid launch and `apt remove` (fan back to the EC, `pwm1_enable=2`) all verified on hardware |
-| M8 — recording & monitoring | **complete and verified on hardware** (2026-09-20): a session recorded against the packaged daemon, 48 rows with GPU load and attribution on every one. Two defects found doing it, both fixed — GPU load was **published by no packaged daemon** at all (uid 0 with an empty capability set cannot read another user's `fdinfo`; see traps), and `t_s` was truncated rather than rounded. The Monitor page now draws one card per measurement |
+| M8 — recording & monitoring | **complete and verified on hardware** (2026-09-20): a session recorded against the packaged daemon, 48 rows with GPU load and attribution on every one. Two defects found doing it, both fixed — GPU load was **published by no packaged daemon** at all (uid 0 with an empty capability set cannot read another user's `fdinfo`; see traps), and `t_s` was truncated rather than rounded. The Monitor page now draws one card per measurement. Extended 2026-09-21 (0.6.3/0.6.4): CPU and GPU each report utilisation, power and **achieved** clock — per-rail watts from RAPL `core`/`uncore`, a busy-weighted CPU clock, and a `clock (achieved)` strip drawing the GPU's requested clock beside its real one. Only `gpu_watts` is confirmed on hardware so far |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
 ### Resume here
 
-Last session ended 2026-09-20. **M0-M8 are complete, and M8's central claim is now
-verified**: a session has been recorded against the packaged daemon, with GPU load in it.
+Last session ended 2026-09-21. **M0-M8 complete. Shipped 0.6.3 and 0.6.4.** The session
+was mostly a hardware investigation conducted in public on the Framework forum and
+Reddit, and it ended by **retiring a "finding" this file had recorded as fact**.
 
-**What the 2026-09-20 session did**, in the order it happened, because two of the three
-findings were invisible from inside the code:
+**The GPU had no ceiling. The number everyone was comparing was the wrong sysfs node.**
 
-1. **GPU load had never worked outside development.** The packaged daemon published
-   `gpu_percent` not once, in any release. Root with `CapabilityBoundingSet=` empty holds
-   no capabilities, and reading another uid's `/proc/<pid>/fdinfo` needs
-   `CAP_SYS_PTRACE`. ADR 0013; fixed in the unit; verified `CapEff 0000000000080000`.
-2. **The Monitor page became one card per measurement**, each with its own y-axis and the
-   limit it is read against. Reviewed on hardware: *"MUCH cleaner"*.
-3. **A session was recorded against the packaged daemon** - M8's open item - and writing
-   it exposed the `t_s` truncation bug.
-4. **CI had been red for a month and nobody knew.** Since 2026-08-18, the day the GTK4
-   crate landed: the runner has no `libgtk-4-dev`, so clippy died in a build script in 17
-   seconds and every step after it never ran. `cargo-deny` was separately rejecting this
-   repository's own crates. Both fixed; run 35509964241 is the first green one since
-   August, and `check` now takes 2m0s rather than 17s - which is what a job that actually
-   compiles the workspace looks like.
+`cur_freq` is the DVFS *request* and reads a constant **2500** on this board; `act_freq`
+is what happened and reads **1850-1950** under a saturating load on mains. Four people on
+identical hardware reported "2.5 GHz" from tools reading the former - Mission Center,
+nvtop, and **turbostat's `GFXMHz`**, so Intel's own tool does it too. Confirmed
+independently by a correspondent on kernel **7.3-rc3** posting `cur=2500 act=1900-2000`,
+which also killed the kernel theory: 7.0 and 7.3-rc3 give the same clock, so **do not
+spend a Secure Boot detour on a mainline kernel**. Intel specifies 2500 as *Graphics Max
+Dynamic Frequency* at an **80 W** Maximum Turbo Power; this is a ~35-38 W part.
 
-**The reboot that followed - all three checks PASSED** (2026-09-20, read three minutes
-into the boot):
+**What actually caught it was frame rate, not sysfs** - their FurMark did 1383 frames in
+33 s at 1646x1069 and ours beat it at 1920x1080, so two GPUs supposedly 550 MHz apart were
+performing identically. Physical cross-checks outrank instrument readings; that is the
+transferable lesson, and it was the **user** who spotted it after this file had already
+been updated twice with the wrong conclusion.
 
-- `systemctl is-active fw-helperd` reads **active**. The cyclic `After=` trap shows as
-  `enabled` / `inactive (dead)`, never `failed`, so the unit being up is the evidence;
-  nothing about an ordering cycle in the boot.
-- The charge limit reads **85%**, so the startup re-apply from `/var/lib/fw-helper/state`
-  ran. The EC does not persist it, and a boot without the daemon is a boot that charges
-  to 100%.
-- `cat /run/fw-helper/hud` reads
-  `GPU 7% | PL1 35W | fan 2723rpm 29% fw | max | pack 33C`, and `CapEff`/`CapAmb` are both
-  `0000000000080000`. **This is the one that had never been observed** - see the verified
-  list below.
+Eliminated along the way, each measured: SR-IOV PF mode (`xe.max_vfs=0` genuinely
+disables it - `mode: none` - no change), PL4 (it means "GPU busy"), GPU demand, Mesa
+version and vendor, graphics API, and the kernel.
 
-**The one thing M8 cannot do in development mode, and why.** Recording is gated by a
-polkit action, and polkit is a **system-bus** service. `FW_HELPERD_SESSION_BUS=1` puts the
-daemon on the session bus, where `org.freedesktop.PolicyKit1` does not exist, so every
-write method fails closed with `ServiceUnknown`. That is correct behaviour and applies to
-every knob, not just recording - it is simply the first feature whose *whole point* is a
-write. Everything else in M8 was exercised: GPU load, memory, the HUD line, the session
-list, the CLI and both GUI windows all work against a session-bus daemon.
+**The one thing still unexplained, and it is worth picking up first.**
 
-**Do these in order.**
+An active GPU **caps the cores at ~11 W / ~2100 MHz**, down from 29.27 W and
+3831-3951 MHz, and **the clamp is the same size whether the GPU then draws 4 W or 22 W**.
+It is a fixed reservation, not a mis-allocation.
 
-**1 - DONE (2026-09-20). Recording works against the packaged daemon.** 48 rows to
-`/var/lib/fw-helper/sessions/`, one per second by `unix_time`, through the polkit gate
-with no prompt (`allow_active` is `yes` for `org.fwhelper.record`) and with `stress-ng
---cpu 4` on the wire: peak 37.1% cpu, 18.10 W, 61.9 C peci, 3963 rpm. `gpu_pct` and
-`gpu_top` are populated on every row - which they could not have been before the same
-day's `CAP_SYS_PTRACE` fix. The polkit gate, the `/var/lib` path and
-`RuntimeDirectory=fw-helper` are all exercised and none of them needed anything.
+Do **not** reason from the package total - an earlier version of this section did and
+invented a second phenomenon out of it. Package = clamped CPU + whatever the GPU asks
+for, so it falls under a light GPU load (18.48 W) and rises under a heavy one (34.48 W,
+at PL1) purely as arithmetic. One effect, not two.
 
-One defect in what it wrote, fixed: `t_s` was truncated from a monotonic `Instant`, so a
-few milliseconds of tick jitter around a whole second became a whole second of error -
-recorded `0 1 1 3 3 5 5 6 8 8 ...` while `unix_time` advanced by exactly 1 every row. It
-rounds now. **Not in the installed 0.6.1**, which was built before it.
+Measured out, all of them: PL1, PL2, thermal, PROCHOT (EC `0x3E22` reads 0000), the ring
+interconnect, `psys` (disabled, limits 0), DPTF (`INT3400` bound but `current_uuid` and
+`available_uuids` both **empty**, so no policy loaded), and HWP (`IA32_HWP_REQUEST` is
+`0x3505`, max 53 of a highest-performance 53, **unchanged in every phase** - nothing asks
+for less, so the silicon is refusing).
 
-**2 - Cross-check the new instrument against the trusted one.** Record a session while
+**New instrument for this**: the CPU *does* publish a throttle reason, in
+**`MSR_CORE_PERF_LIMIT_REASONS` at `0x64f`** - `0x690` is not implemented on this part.
+Needs `msr-tools` and the `msr` module, both present. **Bit 8 is what `xe` calls `pl4`**,
+calibrated on-machine against the driver's own text rather than taken from a summary. It
+is the only live reason on the cores under load - but it is set in the *healthy*
+configurations too, so it does not by itself explain the clamp.
+
+Best remaining hypothesis, unproven: margin held against combined CPU+GPU current peaks.
+The next test is whether the clamp is **binary or graduated** - does one trivial GPU
+client (`vkcube`, ~1 W) trigger the full clamp, or does it scale with GPU activity?
+Binary points at a policy triggered by "graphics active"; graduated points at budget
+arithmetic. Script written: `scratchpad/gpu-sweep.sh` (close FurMark first - it aborts if
+running, because a stray instance silently invalidated one run's baseline).
+
+**What shipped, and what has NOT been verified.**
+
+0.6.3 added per-rail power (`cpu_w`/`gpu_w`, from RAPL `core` and `uncore`, resolved by
+name not index) and fixed the GPU clock vanishing at idle - `act_freq` reads 0 in RC6, so
+a once-per-second read dropped it at random. It now bursts and keeps the highest, and a
+parked GT renders as `parked`. 0.6.4 added a **"clock (achieved)"** Monitor strip and a
+true CPU clock: `cpu_mhz` was the flat mean over all sixteen cores, which reads **1528
+MHz with one core pegged at 4288**. `cpu_mhz_busy` weights by time executed
+(turbostat `Bzy_MHz`) and is `None` for an idle interval.
+
+**`gpu_watts` is confirmed live** - the packaged 0.6.3 HUD read `GPU 2% 0.1W`. Everything
+else is fixture-tested only. **Run `scratchpad/turbostat-crosscheck.sh` with
+`vkmark --run-forever` up**: `CorWatt`, `GFXWatt` and `Bzy_MHz` are exactly our three new
+numbers, from Intel's own tool reading the same counters by a different route. That is
+one command away and is the only thing between "passes 277 tests" and "verified".
+
+Also never done: **Mission Center** was going to be installed to watch it report 2.50 GHz
+beside an `act_freq` of 1950 (the flatpak download timed out on mobile data; `flathub` is
+a *system* remote, so `--user` needs the remote adding first). Cosmetic now.
+
+**Measurement traps this session cost time on** - all in the harness, not the hardware:
+
+- **An occluded `vkcube`/`vkmark` window renders nothing.** Mutter stops sending frame
+  callbacks. It looks alive and draws 3.5 W instead of 7.2.
+- **`vkmark` defaults to an 800x600 window** and only reaches ~72% GPU occupancy, so it
+  is a light load, not a saturating one. `--fullscreen -p immediate --run-forever`.
+- **`sudo` strips `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`**, so a GUI load launched from a
+  root script never starts. Use `runuser -u $SUDO_USER -- env ...`, and never send its
+  stderr to `/dev/null`.
+- **mawk has no `and()`** - that is gawk. A bit-decoding column came back silently blank
+  for a whole run. Decode in python.
+- **A leftover FurMark invalidated a "cpu only" baseline**, because the script only
+  *started* it for the last phase and never checked whether it was already running.
+
+**Still open from previous sessions** (2, 4 and 5 below are unchanged and still worth
+doing; 1 and 3 are now closed or moot):
+
+**Cross-check the recorder against the trusted instrument.** Record a session while
 `sudo ./scripts/sustained-perf-test.sh --monitor` runs over the same window. They must
-agree on watts and temperatures. This is the check that matters: everything else in M8
-is a new instrument agreeing with itself.
+agree on watts and temperatures.
 
-**3 - Replicate Q7 through the new path.** Record at PL1 25/30/35/40 W under `stress-ng`,
-cooling between runs, and read the sustained plateau off each graph. Should reproduce
-24.95 / 30.06 / 35.08 / 35.07 W. This is the question M8 exists to make repeatable, and
-passing it retires `sustained-perf-test.sh` as the only way to ask it.
+**The descent test - still the highest-value unproven claim.** Draw a curve reaching duty
+0 by 55 C, heat with `stress-ng`, and listen on the way **down** - firmware holds duty
+50-90 to 44.9 C, so ours should be silent where firmware would not be (ADR 0011).
 
-**4 - The descent test. Still the highest-value unproven claim, and now easier.** Draw a
-curve reaching duty 0 by 55 C, heat with `stress-ng`, and listen on the way **down** -
-firmware holds duty 50-90 to 44.9 C, so ours should be silent where firmware would not be
-(ADR 0011). M8 makes this a recording rather than a listening exercise: the fan strip
-shows exactly where each branch sits.
+**The fan pulse from the third cause, still unverified.** *Charging, pack warm.* Needs the
+pack near 41.9 C, which so far has only happened while charging. **A long FurMark run on
+mains while charging is the closest thing yet to a way to force it** - the pack reached
+36.9 C during this session's runs. Record it, and log `battery_temp@b` against time for
+the guard's margin.
 
-**5 - The fan pulse from the third cause, still unverified.** *Charging, pack warm.* It
-cannot be provoked at will: it needs the pack near 41.9 C, which so far has only happened
-while charging. Put it on mains below the charge limit and watch for a battery-sourced
-correction repeating. **Record it** - that same run is the chance to log `battery_temp@b`
-against time for the guard's margin, which needs a real charge cycle before any constant
-moves. The other two causes were verified 2026-09-02.
+Q7 replication through the recorder (PL1 25/30/35/40 W) is now **moot for GPU work** -
+25 W and 35 W are indistinguishable because the GPU is at its 1950 MHz ceiling and fully
+occupied. Still meaningful for CPU-bound loads.
 
 **Open defects, in severity order:**
 
@@ -177,6 +207,11 @@ moves. The other two causes were verified 2026-09-02.
   `0000000000080000` and the HUD line carried `GPU 7%`. Every earlier confirmation had
   followed a `systemctl restart` in a running session; the unit being started by PID 1 in
   early boot, with the ambient set applied there, had never been exercised. It is now.
+- **`gpu_watts` reaches the HUD from the packaged daemon** (2026-09-21). `GPU 2% 0.1W` from
+  installed 0.6.3, so the RAPL `uncore` rail is readable through the unit's sandbox with no
+  change to it. The other new figures — `cpu_watts`, `cpu_mhz_busy` — are fixture-tested
+  only; `scripts`-adjacent `scratchpad/turbostat-crosscheck.sh` checks all three against
+  turbostat's `CorWatt`/`GFXWatt`/`Bzy_MHz` in one run.
 - **MangoHud loads and parses the shipped config**, confirmed by running `vkcube` under
   it: `parsing config: .../fw-helper.conf`. The same run is what revealed MangoHud
   disables `gpu_stats` entirely on this board.

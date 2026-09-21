@@ -46,7 +46,7 @@ const FLUSH_EVERY: u32 = 10;
 pub const HEADER: &str = "t_s,unix_time,cpu_pct,cpu_mhz,gpu_pct,gpu_mhz,gpu_top,\
 mem_used_mb,mem_total_mb,package_w,system_w,pl1_w,peci_c,coretemp_c,battery_c,board_c,\
 fan_rpm,fan_duty,fan_mode,throttle_events,throttle_ms,gpu_throttle,profile,on_ac,\
-battery_pct,cpu_w,gpu_w";
+battery_pct,cpu_w,gpu_w,cpu_mhz_busy,gpu_mhz_req";
 
 /// One sample. Every field is optional because every source can be absent — a machine
 /// with no battery, a GPU we cannot read, a power figure discarded as untrustworthy.
@@ -92,6 +92,12 @@ pub struct Row {
     pub battery_pct: Option<u64>,
     /// RAPL `core` rail: the CPU cores alone.
     pub cpu_w: Option<f64>,
+    /// The clock the executing cores ran at, busy-weighted. `cpu_mhz` beside it is the
+    /// flat mean over all cores, which is a different and much lower number on a mostly
+    /// idle machine.
+    pub cpu_mhz_busy: Option<u64>,
+    /// The GPU clock that was *asked* for, against `gpu_mhz` which is what happened.
+    pub gpu_mhz_req: Option<u64>,
     /// RAPL `uncore` rail: the iGPU alone. A subset of [`Self::package_w`], and
     /// `cpu_w + gpu_w` is less than it — the package also carries fabric and the
     /// memory controller, which neither rail covers.
@@ -122,7 +128,7 @@ impl Row {
     pub fn to_csv(&self) -> String {
         format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
-             {},{}",
+             {},{},{},{}",
             self.t_s,
             self.unix_time,
             num(&self.cpu_pct, 1),
@@ -153,6 +159,8 @@ impl Row {
             cell(&self.battery_pct),
             num(&self.cpu_w, 2),
             num(&self.gpu_w, 2),
+            cell(&self.cpu_mhz_busy),
+            cell(&self.gpu_mhz_req),
         )
     }
 
@@ -197,6 +205,8 @@ impl Row {
             battery_pct: u("battery_pct"),
             cpu_w: f("cpu_w"),
             gpu_w: f("gpu_w"),
+            cpu_mhz_busy: u("cpu_mhz_busy"),
+            gpu_mhz_req: u("gpu_mhz_req"),
         })
     }
 }
@@ -583,6 +593,10 @@ mod tests {
             // arithmetic relationship the hardware does not have.
             cpu_w: Some(21.40),
             gpu_w: Some(9.65),
+            // Deliberately unequal to their achieved counterparts above: the whole
+            // point of carrying both is that the request and the result differ.
+            cpu_mhz_busy: Some(4100),
+            gpu_mhz_req: Some(2500),
         }
     }
 

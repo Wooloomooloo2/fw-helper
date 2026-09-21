@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.4 — 2026-09-21
+
+### Added
+
+- **A "clock (achieved)" strip on the Monitor page, and a true CPU clock to go on it.**
+  The GPU half was already honest — `act_freq`, what the GPU ran at. The CPU half was
+  not: `cpu_mhz` is the flat mean of every core's `scaling_cur_freq`, so fifteen parked
+  cores drag it down. Measured on the reference machine with one core pegged: the mean
+  reads **1528 MHz** while the work is running at **3569** and the busiest core is at
+  **4288**. A 2.3x understatement, and exactly the error a GPU's requested clock makes.
+
+  `cpu_mhz_busy` weights each core's clock by the time that core spent executing, which
+  is turbostat's `Bzy_MHz`. It is `None` when nothing executed — there is no "speed the
+  work ran at" in an idle interval, and reporting the mean there would quietly relabel
+  the diluted figure as the honest one. `cpu_mhz` is kept beside it, unchanged, as the
+  package-wide figure that sits next to a package-wide wattage.
+
+  The strip draws three series: `cpu busy`, `gpu`, and `gpu requested`. The request is
+  there on purpose. Every other tool on this machine reports it *as* the clock — Mission
+  Center, nvtop and turbostat's `GFXMHz` all show a flat 2500 while the GPU runs at 1950
+  — so drawing both is what makes the distinction visible rather than merely claimed.
+  The gap between the lines is the point. CPU and GPU share one axis here, unlike the
+  rest of the chart module's small multiples, because for once the quantities really are
+  the same.
+
+  The window's cpu load card now shows the busy-weighted figure, and recorded sessions
+  gain `cpu_mhz_busy` and `gpu_mhz_req`.
+
 ## 0.6.3 — 2026-09-21
 
 ### Added

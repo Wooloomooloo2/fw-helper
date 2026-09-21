@@ -90,8 +90,20 @@ pub type GpuClient = (String, f64);
 pub struct Usage {
     /// Aggregate across all cores, 0-100.
     pub cpu_percent: Option<f64>,
-    /// Mean of every core's `scaling_cur_freq`.
+    /// Mean of every core's `scaling_cur_freq`, idle cores included.
+    ///
+    /// Useful as a package-wide figure next to a package-wide wattage, but it is not
+    /// the speed anything ran at — see [`Self::cpu_mhz_busy`].
     pub cpu_mhz: Option<u64>,
+    /// The clock the cores that were **executing** actually ran at, weighted by how
+    /// busy each was over the interval. turbostat calls this `Bzy_MHz`.
+    ///
+    /// This is the CPU's answer to the GPU's `act_freq`, and the distinction is the
+    /// same one: [`Self::cpu_mhz`] averages in fifteen parked cores and reports 1.8 GHz
+    /// for a machine whose working core is at 4.5, exactly as `cur_freq` reports 2500
+    /// for a GPU running at 1950. `None` when nothing executed — a figure for "the
+    /// speed work ran at" has no meaning when no work ran, and zero would be a lie.
+    pub cpu_mhz_busy: Option<u64>,
     /// The RAPL `core` rail: what the CPU cores alone are drawing.
     ///
     /// Not the package — see [`crate::Telemetry::package_watts`] for that. Package
@@ -108,6 +120,13 @@ pub struct Usage {
     /// `vcs`/`vecs` media.
     pub gpu_engines: EngineLoad,
     pub gpu_mhz: Option<u64>,
+    /// What the driver *asked* for (`cur_freq`), as against [`Self::gpu_mhz`], which is
+    /// what happened (`act_freq`).
+    ///
+    /// Carried so the gap can be shown rather than asserted. It reads a constant 2500 on
+    /// the reference board while the GPU runs at 1950, and it is the number Mission
+    /// Center, nvtop and turbostat's `GFXMHz` all display as "the clock".
+    pub gpu_mhz_requested: Option<u64>,
     /// The RAPL `uncore` rail: the iGPU's own draw.
     ///
     /// The iGPU sits inside the CPU package, so this is a *subset* of
@@ -211,6 +230,9 @@ pub struct UsageSampler {
     gpu_scan: bool,
     last: Option<Instant>,
     cpu: Option<CpuTimes>,
+    /// Per-core counters, indexed by the number in `cpuN`. Kept alongside the aggregate
+    /// because a busy-weighted clock needs to know which cores did the work.
+    cpu_cores: Option<Vec<CpuTimes>>,
     gpu: Option<GpuCounters>,
     /// Descriptors last seen carrying a client of our device, one per client.
     gpu_clients: Vec<KnownClient>,
@@ -234,6 +256,7 @@ impl UsageSampler {
             gpu_scan: false,
             last: None,
             cpu: None,
+            cpu_cores: None,
             gpu: None,
             gpu_clients: Vec::new(),
             gpu_swept: None,
@@ -273,6 +296,7 @@ impl UsageSampler {
     pub fn invalidate(&mut self) {
         self.last = None;
         self.cpu = None;
+        self.cpu_cores = None;
         self.gpu = None;
         self.gpu_swept = None;
         self.gpu_clients.clear();
@@ -333,7 +357,25 @@ impl UsageSampler {
     }
 
     fn sample_cpu(&mut self, u: &mut Usage, usable: bool) {
-        u.cpu_mhz = self.read_cpu_mhz();
+        // Per-core busy first: the weights the clock is averaged with come from the
+        // same interval as the clock itself.
+        let cores_now = read_cpu_times_per_core(&self.fs);
+        let cores_prev = match cores_now.clone() {
+            Some(now) => self.cpu_cores.replace(now),
+            None => self.cpu_cores.take(),
+        };
+        let weights = match (usable, &cores_now, &cores_prev) {
+            (true, Some(now), Some(prev)) if now.len() == prev.len() => Some(
+                now.iter()
+                    .zip(prev)
+                    .map(|(n, p)| n.busy.saturating_sub(p.busy) as f64)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        let (mean, busy) = self.read_cpu_clocks(weights.as_deref());
+        u.cpu_mhz = mean;
+        u.cpu_mhz_busy = busy;
 
         let Some(now) = read_cpu_times(&self.fs) else {
             self.cpu = None;
@@ -351,15 +393,26 @@ impl UsageSampler {
         }
     }
 
-    /// Mean current frequency across cores.
+    /// Both CPU clocks: the flat mean across cores, and the busy-weighted one.
     ///
-    /// A mean, not a maximum: one core boosting says little about what the package is
-    /// doing, and this sits next to a package-wide power figure.
-    fn read_cpu_mhz(&self) -> Option<u64> {
+    /// `weights[i]` is the jiffies core `i` spent executing this interval. With no
+    /// weights — first sample, or a gap long enough to be a suspend — only the mean is
+    /// returned, because a weighted average of an unknown interval is not a measurement.
+    ///
+    /// Under `intel_pstate` in active mode `scaling_cur_freq` is derived from APERF and
+    /// MPERF, so it is already an achieved figure per core rather than a requested one.
+    /// What it is not is *aggregated* honestly: averaging a boosting core with fifteen
+    /// parked ones answers a question nobody asked.
+    fn read_cpu_clocks(&self, weights: Option<&[f64]>) -> (Option<u64>, Option<u64>) {
         let dir = self.fs.path("sys/devices/system/cpu");
         let mut sum = 0u64;
         let mut n = 0u64;
-        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let mut wsum = 0.0f64;
+        let mut wtotal = 0.0f64;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return (None, None);
+        };
+        for entry in entries.flatten() {
             let Some(base) = entry.file_name().to_str().map(String::from) else {
                 continue;
             };
@@ -370,9 +423,20 @@ impl UsageSampler {
             if let Ok(khz) = self.fs.read_u64(&rel) {
                 sum += khz;
                 n += 1;
+                if let Some(w) =
+                    weights.and_then(|w| base[3..].parse::<usize>().ok().and_then(|i| w.get(i)))
+                {
+                    wsum += khz as f64 * w;
+                    wtotal += w;
+                }
             }
         }
-        (n > 0).then(|| sum / n / 1000)
+        let mean = (n > 0).then(|| sum / n / 1000);
+        // wtotal of zero means every core was idle all interval. There is no "speed the
+        // work ran at" in that case, and reporting the mean here would quietly relabel
+        // the diluted figure as the honest one.
+        let busy = (wtotal > 0.0).then(|| (wsum / wtotal / 1000.0).round() as u64);
+        (mean, busy)
     }
 
     fn sample_memory(&mut self, u: &mut Usage) {
@@ -464,6 +528,7 @@ impl UsageSampler {
         // Frequency and throttle reasons are instantaneous reads, not deltas, and cost
         // two file reads — worth having even when the client scan is switched off.
         u.gpu_mhz = self.read_gpu_mhz(&dev.gt);
+        u.gpu_mhz_requested = self.fs.read_u64(&format!("{}/freq0/cur_freq", dev.gt)).ok();
         u.gpu_throttle = read_throttle_reasons(&self.fs, &dev.gt);
 
         if !self.gpu_scan {
@@ -594,6 +659,36 @@ fn claims_device(text: &str, pdev: &str) -> bool {
 }
 
 /// The aggregate `cpu` line of `/proc/stat`, as (busy, total) jiffies.
+/// `/proc/stat`'s per-core lines, indexed by the number in `cpuN`.
+///
+/// Returns `None` rather than a short vector if the lines are not contiguous from
+/// `cpu0`: the index is used to look up a core's frequency, so a gap would silently
+/// weight the wrong core.
+fn read_cpu_times_per_core(fs: &Sysfs) -> Option<Vec<CpuTimes>> {
+    let text = fs.read_string("proc/stat").ok()?;
+    let mut out: Vec<CpuTimes> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        let Some(idx) = name.strip_prefix("cpu").filter(|d| !d.is_empty()) else {
+            continue;
+        };
+        if idx.parse::<usize>().ok()? != out.len() {
+            return None;
+        }
+        let values: Vec<u64> = fields.filter_map(|v| v.parse().ok()).collect();
+        if values.len() < 5 {
+            return None;
+        }
+        let total: u64 = values.iter().sum();
+        out.push(CpuTimes {
+            busy: total.checked_sub(values[3] + values[4])?,
+            total,
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn read_cpu_times(fs: &Sysfs) -> Option<CpuTimes> {
     let text = fs.read_string("proc/stat").ok()?;
     let line = text.lines().next()?;
@@ -1375,5 +1470,121 @@ mod rail_tests {
         t.write(&format!("{gt}/freq0/act_freq"), "1850\n");
         let s = UsageSampler::new(t.sysfs());
         assert_eq!(s.read_gpu_mhz(gt), Some(1850));
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("fw-helper-clock-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp tree");
+            Self(dir)
+        }
+        fn write(&self, rel: &str, contents: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, contents).expect("write");
+        }
+        fn cpu(&self, n: usize, khz: u64) {
+            self.write(
+                &format!("sys/devices/system/cpu/cpu{n}/cpufreq/scaling_cur_freq"),
+                &format!("{khz}\n"),
+            );
+        }
+        fn sysfs(&self) -> Sysfs {
+            Sysfs::new(&self.0)
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The reason this exists. One core at 4.5 GHz doing all the work, three parked at
+    /// 800 MHz: the flat mean says 1.7 GHz, which is a speed nothing ran at.
+    #[test]
+    fn the_busy_clock_ignores_parked_cores() {
+        let t = Tree::new("weighted");
+        t.cpu(0, 4_500_000);
+        for n in 1..4 {
+            t.cpu(n, 800_000);
+        }
+        let s = UsageSampler::new(t.sysfs());
+        let (mean, busy) = s.read_cpu_clocks(Some(&[100.0, 0.0, 0.0, 0.0]));
+        assert_eq!(mean, Some(1725)); // (4500+800*3)/4
+        assert_eq!(busy, Some(4500));
+    }
+
+    /// Weighted by how much each core ran, not merely by whether it did.
+    #[test]
+    fn the_busy_clock_weights_by_time_executed() {
+        let t = Tree::new("proportional");
+        t.cpu(0, 4_000_000);
+        t.cpu(1, 2_000_000);
+        let s = UsageSampler::new(t.sysfs());
+        // Three quarters of the work at 4 GHz, one quarter at 2: 3500, not 3000.
+        assert_eq!(s.read_cpu_clocks(Some(&[75.0, 25.0])).1, Some(3500));
+    }
+
+    /// An idle interval has no "speed the work ran at". Reporting the diluted mean here
+    /// would relabel it as the honest figure, which is the whole error being avoided.
+    #[test]
+    fn an_idle_interval_has_no_busy_clock() {
+        let t = Tree::new("idle");
+        t.cpu(0, 900_000);
+        t.cpu(1, 900_000);
+        let s = UsageSampler::new(t.sysfs());
+        let (mean, busy) = s.read_cpu_clocks(Some(&[0.0, 0.0]));
+        assert_eq!(mean, Some(900));
+        assert_eq!(busy, None);
+    }
+
+    /// No weights — first sample, or a gap long enough to be a suspend.
+    #[test]
+    fn without_weights_only_the_mean_is_reported() {
+        let t = Tree::new("noweights");
+        t.cpu(0, 3_000_000);
+        let s = UsageSampler::new(t.sysfs());
+        assert_eq!(s.read_cpu_clocks(None), (Some(3000), None));
+    }
+
+    #[test]
+    fn per_core_times_are_indexed_by_core_number() {
+        let t = Tree::new("percore");
+        t.write(
+            "proc/stat",
+            "cpu  100 0 100 800 0 0 0 0 0 0\n\
+             cpu0 50 0 50 400 0 0 0 0 0 0\n\
+             cpu1 50 0 50 400 0 0 0 0 0 0\n\
+             intr 12345\n",
+        );
+        let v = read_cpu_times_per_core(&t.sysfs()).expect("per-core times");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].busy, 100);
+        assert_eq!(v[0].total, 500);
+    }
+
+    /// A gap would mean index N is not core N, so the weights would be applied to the
+    /// wrong core's frequency. Refuse rather than mis-attribute.
+    #[test]
+    fn non_contiguous_cores_are_refused() {
+        let t = Tree::new("gappy");
+        t.write(
+            "proc/stat",
+            "cpu  100 0 100 800 0 0 0 0 0 0\n\
+             cpu0 50 0 50 400 0 0 0 0 0 0\n\
+             cpu2 50 0 50 400 0 0 0 0 0 0\n",
+        );
+        assert_eq!(read_cpu_times_per_core(&t.sysfs()), None);
     }
 }

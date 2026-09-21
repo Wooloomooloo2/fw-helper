@@ -241,6 +241,8 @@ pub fn row(elapsed_secs: u64, t: &Telemetry, u: &Usage, ctx: &Context) -> Row {
         cpu_mhz: u.cpu_mhz,
         cpu_w: u.cpu_watts,
         gpu_w: u.gpu_watts,
+        cpu_mhz_busy: u.cpu_mhz_busy,
+        gpu_mhz_req: u.gpu_mhz_requested,
         gpu_pct: u.gpu_percent,
         gpu_mhz: u.gpu_mhz,
         gpu_top: u.top_gpu_client.as_ref().map(|(comm, _)| comm.clone()),

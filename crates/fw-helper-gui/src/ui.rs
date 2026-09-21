@@ -850,9 +850,13 @@ fn set_load_cards(w: &Widgets, s: &Snapshot) {
         Some(pct) => w.cpu_load.set_label(&format!("{pct:.0}%")),
         None => w.cpu_load.set_label("—"),
     }
+    // The busy-weighted clock, not the all-core mean. On a mostly idle machine the mean
+    // averages in fifteen parked cores and reports ~1.8 GHz while the core doing the
+    // work is at 4.5 — the same category of error as showing a GPU's requested clock.
+    // Falls back to the mean only when nothing executed and there is no busy figure.
     w.cpu_load_caption.set_label(&caption(
         "cpu load",
-        clock(s.load.cpu_mhz),
+        clock(s.load.cpu_mhz_busy.or(s.load.cpu_mhz)),
         watts(s.load.cpu_watts),
     ));
 

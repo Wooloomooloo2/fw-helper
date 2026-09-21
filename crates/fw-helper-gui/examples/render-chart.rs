@@ -42,6 +42,11 @@ fn session() -> Vec<chart::Sample> {
                 t,
                 cpu_pct: Some(load.clamp(0.0, 100.0)),
                 gpu_pct: Some(gpu.clamp(0.0, 100.0)),
+                cpu_mhz: Some(1400.0 + load.clamp(0.0, 100.0) * 24.0),
+                // Achieved tracks demand and tops out well short of the request, as on
+                // the real board.
+                gpu_mhz: Some(900.0 + gpu.clamp(0.0, 100.0) * 10.5),
+                gpu_mhz_req: Some(2500.0),
                 mem_pct: Some(41.0 + phase * 22.0),
                 package_w: Some(power),
                 // Rails as a plausible share of the package: cores take the bulk under

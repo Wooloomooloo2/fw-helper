@@ -41,6 +41,10 @@ pub struct Sample {
     pub t: f64,
     pub cpu_pct: Option<f64>,
     pub gpu_pct: Option<f64>,
+    /// Achieved clocks, and the GPU's requested one for contrast. See the clock strip.
+    pub cpu_mhz: Option<f64>,
+    pub gpu_mhz: Option<f64>,
+    pub gpu_mhz_req: Option<f64>,
     pub mem_pct: Option<f64>,
     pub package_w: Option<f64>,
     /// The `core` and `uncore` RAPL rails, drawn under the package trace so the
@@ -83,6 +87,11 @@ impl Sample {
             t,
             cpu_pct: s.load.cpu_percent,
             gpu_pct: s.load.gpu_percent,
+            // The busy-weighted figure, not the all-core mean: this strip is about the
+            // speed work ran at.
+            cpu_mhz: s.load.cpu_mhz_busy.map(|v| v as f64),
+            gpu_mhz: s.load.gpu_mhz.map(|v| v as f64),
+            gpu_mhz_req: s.load.gpu_mhz_requested.map(|v| v as f64),
             mem_pct: s.load.mem_percent(),
             package_w: s.package_watts,
             cpu_w: s.load.cpu_watts,
@@ -112,6 +121,9 @@ impl Sample {
             t: r.t_s as f64,
             cpu_pct: r.cpu_pct,
             gpu_pct: r.gpu_pct,
+            cpu_mhz: r.cpu_mhz_busy.map(|v| v as f64),
+            gpu_mhz: r.gpu_mhz.map(|v| v as f64),
+            gpu_mhz_req: r.gpu_mhz_req.map(|v| v as f64),
             mem_pct: match (r.mem_used_mb, r.mem_total_mb) {
                 (Some(u), Some(t)) if t > 0 => Some(u as f64 * 100.0 / t as f64),
                 _ => None,
@@ -219,14 +231,16 @@ const PAD_R: f64 = 10.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     Load,
+    Clock,
     Power,
     Temperature,
     Fan,
     Memory,
 }
 
-pub const METRICS: [Metric; 5] = [
+pub const METRICS: [Metric; 6] = [
     Metric::Load,
+    Metric::Clock,
     Metric::Power,
     Metric::Temperature,
     Metric::Fan,
@@ -281,6 +295,29 @@ fn strip(metric: Metric, p: &Palette, samples: &[Sample]) -> Strip {
             y_min: 0.0,
             y_floor_max: 100.0,
             unit: "%",
+            thresholds: Vec::new(),
+            mark_throttle: false,
+        },
+        // Achieved clocks, with the GPU's requested one drawn beside them.
+        //
+        // The request is on the strip deliberately. Every other tool on this machine
+        // reports it *as* the clock — Mission Center, nvtop and turbostat's GFXMHz all
+        // show a flat 2500 while the GPU runs at 1950 — so drawing the two together is
+        // what makes the distinction visible instead of merely claimed. The gap between
+        // the lines is the thing worth seeing.
+        //
+        // CPU and GPU share an axis here, unlike the rest of this module's small
+        // multiples, because for once the quantities really are the same: both are MHz.
+        Metric::Clock => Strip {
+            title: "clock (achieved)",
+            series: vec![
+                ("cpu busy", p.cpu, |s| s.cpu_mhz),
+                ("gpu", p.gpu, |s| s.gpu_mhz),
+                ("gpu requested", p.board, |s| s.gpu_mhz_req),
+            ],
+            y_min: 0.0,
+            y_floor_max: 2600.0,
+            unit: "MHz",
             thresholds: Vec::new(),
             mark_throttle: false,
         },

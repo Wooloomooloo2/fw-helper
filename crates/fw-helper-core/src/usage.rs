@@ -31,7 +31,7 @@
 //! The scan costs something — 7475 fdinfo files on a normal desktop — so it is gated by
 //! [`UsageSampler::set_gpu_scan`] and only runs when someone is actually watching.
 
-use crate::Sysfs;
+use crate::{EnergySampler, Sysfs};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,11 @@ const FULL_SWEEP: Duration = Duration::from_secs(10);
 /// as unavailable with the driver named, rather than shipping an unverified code path.
 const SUPPORTED_DRM_DRIVER: &str = "xe";
 
+/// How many times [`UsageSampler::read_gpu_mhz`] retries before accepting that the GT
+/// is parked. Each read is one small sysfs file, so the whole burst costs microseconds
+/// and stops early the moment it sees a non-zero.
+const GPU_FREQ_READS: u32 = 8;
+
 /// Per-engine busy percentages, busiest first.
 pub type EngineLoad = Vec<(String, f64)>;
 
@@ -87,6 +92,12 @@ pub struct Usage {
     pub cpu_percent: Option<f64>,
     /// Mean of every core's `scaling_cur_freq`.
     pub cpu_mhz: Option<u64>,
+    /// The RAPL `core` rail: what the CPU cores alone are drawing.
+    ///
+    /// Not the package — see [`crate::Telemetry::package_watts`] for that. Package
+    /// covers cores, iGPU and uncore together, so on a GPU-heavy workload the two
+    /// diverge sharply, and it is the pair that says where the watts went.
+    pub cpu_watts: Option<f64>,
     pub mem_used_kb: Option<u64>,
     pub mem_total_kb: Option<u64>,
     pub swap_used_kb: Option<u64>,
@@ -97,6 +108,13 @@ pub struct Usage {
     /// `vcs`/`vecs` media.
     pub gpu_engines: EngineLoad,
     pub gpu_mhz: Option<u64>,
+    /// The RAPL `uncore` rail: the iGPU's own draw.
+    ///
+    /// The iGPU sits inside the CPU package, so this is a *subset* of
+    /// [`crate::Telemetry::package_watts`], never an addition to it. `core + uncore`
+    /// does not equal package either — the package figure also carries fabric, memory
+    /// controller and other uncore blocks this zone excludes.
+    pub gpu_watts: Option<f64>,
     /// Throttle reasons the GPU is asserting right now, e.g. `pl1`, `thermal`.
     ///
     /// The CPU has no equivalent readable flag, which is why a power-limit graph draws
@@ -172,6 +190,17 @@ struct GpuCounters {
     total: HashMap<String, u64>,
 }
 
+/// Resolve one RAPL rail by name and pair it with a sampler sized to its counter.
+///
+/// Both halves must come from the same zone: `max_energy_range_uj` differs between
+/// zones, and a sampler given the wrong width mis-corrects a wrap into a large wrong
+/// number rather than failing.
+fn rail(fs: &Sysfs, name: &str) -> Option<(String, EnergySampler)> {
+    let zone = fs.find_powercap(name)?;
+    let range = fs.read_u64(&format!("{zone}/max_energy_range_uj")).ok()?;
+    Some((zone, EnergySampler::new(range)))
+}
+
 /// Polls `/proc` and the DRM node for machine load.
 ///
 /// Holds the previous counters, so it must be the same instance tick after tick.
@@ -187,11 +216,16 @@ pub struct UsageSampler {
     gpu_clients: Vec<KnownClient>,
     gpu_swept: Option<Instant>,
     throttle: Option<(u64, u64)>,
+    /// `(zone path, sampler)` for the `core` and `uncore` RAPL rails. Resolved once by
+    /// name at construction; `None` when the zone is absent on this machine.
+    cpu_rail: Option<(String, EnergySampler)>,
+    gpu_rail: Option<(String, EnergySampler)>,
 }
 
 impl UsageSampler {
     pub fn new(fs: Sysfs) -> Self {
         let drm = find_drm(&fs);
+        let fs2 = fs.clone();
         Self {
             fs,
             drm,
@@ -204,6 +238,8 @@ impl UsageSampler {
             gpu_clients: Vec::new(),
             gpu_swept: None,
             throttle: None,
+            cpu_rail: rail(&fs2, "core"),
+            gpu_rail: rail(&fs2, "uncore"),
         }
     }
 
@@ -241,6 +277,12 @@ impl UsageSampler {
         self.gpu_swept = None;
         self.gpu_clients.clear();
         self.throttle = None;
+        for rail in [self.cpu_rail.as_mut(), self.gpu_rail.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            rail.1.invalidate();
+        }
     }
 
     pub fn sample(&mut self, now: Instant) -> Usage {
@@ -257,7 +299,37 @@ impl UsageSampler {
         self.sample_memory(&mut u);
         self.sample_throttle(&mut u, usable);
         self.sample_gpu(&mut u, usable, now);
+        self.sample_rails(&mut u, now);
         u
+    }
+
+    /// Per-rail power, from the `core` and `uncore` RAPL zones.
+    ///
+    /// Deliberately **not** gated on `usable`: [`EnergySampler`] keeps its own
+    /// reference point and applies its own gap rule, so handing it every reading lets
+    /// it recover on the sample after a stall rather than the one after that. It is
+    /// also the component that knows about counter wrap, which the `usable` flag does
+    /// not model.
+    ///
+    /// These zones are MSR-backed `intel-rapl`, not the `intel-rapl-mmio` zone used for
+    /// the package figure. That split is deliberate: mmio exposes only package and
+    /// dram, so it cannot answer "how much of this is the GPU", while the *limit*
+    /// fields under `intel-rapl` are the ones known to be meaningless here (see the
+    /// 200 W `long_term` trap). Energy counters and limit fields are different claims
+    /// from the same tree, and only the latter is untrustworthy.
+    fn sample_rails(&mut self, u: &mut Usage, now: Instant) {
+        u.cpu_watts = Self::sample_rail(self.fs.clone(), self.cpu_rail.as_mut(), now);
+        u.gpu_watts = Self::sample_rail(self.fs.clone(), self.gpu_rail.as_mut(), now);
+    }
+
+    fn sample_rail(
+        fs: Sysfs,
+        rail: Option<&mut (String, EnergySampler)>,
+        now: Instant,
+    ) -> Option<f64> {
+        let (zone, sampler) = rail?;
+        let uj = fs.read_u64(&format!("{zone}/energy_uj")).ok()?;
+        sampler.sample(uj, now).map(EnergySampler::quantize)
     }
 
     fn sample_cpu(&mut self, u: &mut Usage, usable: bool) {
@@ -352,12 +424,46 @@ impl UsageSampler {
         u.cpu_throttle_ms = ms.saturating_sub(prev_ms);
     }
 
+    /// The GPU's **achieved** clock, as the highest of a short burst of reads.
+    ///
+    /// Three things make the naive single read wrong, and all of them were measured
+    /// on the reference machine rather than guessed:
+    ///
+    /// 1. `act_freq` reads **0** whenever the GT is in RC6 at that instant. Under a
+    ///    genuinely bursty load it is zero most of the time — sampled at 50 Hz under
+    ///    `stress-ng --gpu`, 70 of 400 reads were zero while the GPU was plainly busy.
+    ///    A once-per-second read therefore drops the clock from the UI at random.
+    /// 2. So a burst is taken and the **maximum** kept. A mean over reads that include
+    ///    RC6 zeros would report a frequency the GPU never ran at; the maximum is a
+    ///    clock it actually reached.
+    /// 3. `cur_freq` is **not** an acceptable fallback, however tempting. It is the
+    ///    DVFS *request* and reads a constant 2500 on this board while `act_freq` sits
+    ///    at 1400 — four separate people reported "my GPU runs at 2.5 GHz" from tools
+    ///    showing that node. Never publish the request as the achieved clock.
+    ///
+    /// Returns `Some(0)` when every read was zero — the GT is parked, which is a fact
+    /// worth displaying — and `None` only when the node could not be read at all.
+    fn read_gpu_mhz(&self, gt: &str) -> Option<u64> {
+        let path = format!("{gt}/freq0/act_freq");
+        let mut best: Option<u64> = None;
+        for _ in 0..GPU_FREQ_READS {
+            let Ok(mhz) = self.fs.read_u64(&path) else {
+                break;
+            };
+            best = Some(best.map_or(mhz, |b: u64| b.max(mhz)));
+            if mhz > 0 {
+                break; // caught it awake; no reason to keep looking
+            }
+        }
+        best
+    }
+
     fn sample_gpu(&mut self, u: &mut Usage, usable: bool, now: Instant) {
         let Some(dev) = self.drm.clone() else { return };
 
         // Frequency and throttle reasons are instantaneous reads, not deltas, and cost
         // two file reads — worth having even when the client scan is switched off.
-        u.gpu_mhz = self.fs.read_u64(&format!("{}/freq0/act_freq", dev.gt)).ok();
+        u.gpu_mhz = self.read_gpu_mhz(&dev.gt);
         u.gpu_throttle = read_throttle_reasons(&self.fs, &dev.gt);
 
         if !self.gpu_scan {
@@ -1148,5 +1254,126 @@ mod tests {
         assert!(!s.gpu_scan_enabled());
         s.set_gpu_scan(true);
         assert!(s.gpu_scan_enabled());
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("fw-helper-rail-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp tree");
+            Self(dir)
+        }
+        fn write(&self, rel: &str, contents: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, contents).expect("write");
+        }
+        fn sysfs(&self) -> Sysfs {
+            Sysfs::new(&self.0)
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The whole reason [`Sysfs::find_powercap`] exists: the zone that measures the
+    /// GPU is not at a fixed index, so a machine that orders them differently must
+    /// still resolve `uncore` to the right directory.
+    #[test]
+    fn rails_are_found_by_name_not_by_zone_index() {
+        let t = Tree::new("byname");
+        let base = "sys/class/powercap";
+        t.write(&format!("{base}/intel-rapl:0/name"), "package-0\n");
+        // Reversed against the reference machine, where core is :0:0.
+        t.write(
+            &format!("{base}/intel-rapl:0/intel-rapl:0:0/name"),
+            "uncore\n",
+        );
+        t.write(
+            &format!("{base}/intel-rapl:0/intel-rapl:0:1/name"),
+            "core\n",
+        );
+
+        let fs = t.sysfs();
+        assert_eq!(
+            fs.find_powercap("core").as_deref(),
+            Some("sys/class/powercap/intel-rapl:0/intel-rapl:0:1")
+        );
+        assert_eq!(
+            fs.find_powercap("uncore").as_deref(),
+            Some("sys/class/powercap/intel-rapl:0/intel-rapl:0:0")
+        );
+        assert_eq!(fs.find_powercap("dram"), None);
+    }
+
+    /// A machine with no `uncore` zone reports no GPU wattage rather than zero.
+    #[test]
+    fn a_missing_rail_is_absent_not_zero() {
+        let t = Tree::new("missing");
+        let fs = t.sysfs();
+        assert!(rail(&fs, "uncore").is_none());
+    }
+
+    /// Watts need two readings; the first can only establish the reference point.
+    #[test]
+    fn a_rail_needs_two_samples_before_it_reports_watts() {
+        let t = Tree::new("twosamples");
+        let zone = "sys/class/powercap/intel-rapl:0/intel-rapl:0:1";
+        t.write(&format!("{zone}/name"), "uncore\n");
+        t.write(&format!("{zone}/max_energy_range_uj"), "262143328850\n");
+        t.write(&format!("{zone}/energy_uj"), "1000000\n");
+
+        let fs = t.sysfs();
+        let mut r = rail(&fs, "uncore");
+        let t0 = Instant::now();
+        assert_eq!(UsageSampler::sample_rail(fs.clone(), r.as_mut(), t0), None);
+
+        // 5 J over 1 s is 5 W.
+        t.write(&format!("{zone}/energy_uj"), "6000000\n");
+        let w = UsageSampler::sample_rail(fs, r.as_mut(), t0 + Duration::from_secs(1))
+            .expect("second sample yields watts");
+        assert!((w - 5.0).abs() < 0.05, "expected ~5 W, got {w}");
+    }
+
+    /// `act_freq` reads 0 while the GT is in RC6. That is a fact about the GPU, not a
+    /// failed read, and the two must stay distinguishable: the UI says "parked" for
+    /// one and drops the field for the other.
+    #[test]
+    fn a_parked_gt_reads_zero_rather_than_unknown() {
+        let t = Tree::new("parked");
+        let gt = "sys/class/drm/card1/device/tile0/gt0";
+        t.write(&format!("{gt}/freq0/act_freq"), "0\n");
+        let s = UsageSampler::new(t.sysfs());
+        assert_eq!(s.read_gpu_mhz(gt), Some(0));
+
+        let t2 = Tree::new("unreadable");
+        let s2 = UsageSampler::new(t2.sysfs());
+        assert_eq!(
+            s2.read_gpu_mhz("sys/class/drm/card1/device/tile0/gt0"),
+            None
+        );
+    }
+
+    /// The burst exists to catch a GT that is awake but duty-cycling. A single read
+    /// landing on an RC6 instant is why the clock vanished from the window.
+    #[test]
+    fn a_nonzero_reading_wins_over_a_parked_one() {
+        let t = Tree::new("awake");
+        let gt = "sys/class/drm/card1/device/tile0/gt0";
+        t.write(&format!("{gt}/freq0/act_freq"), "1850\n");
+        let s = UsageSampler::new(t.sysfs());
+        assert_eq!(s.read_gpu_mhz(gt), Some(1850));
     }
 }

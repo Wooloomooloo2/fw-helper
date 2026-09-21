@@ -258,8 +258,12 @@ pub struct Snapshot {
 pub struct Load {
     pub cpu_percent: Option<f64>,
     pub cpu_mhz: Option<u64>,
+    /// RAPL `core` rail — the cores alone, not the package.
+    pub cpu_watts: Option<f64>,
     pub gpu_percent: Option<f64>,
     pub gpu_mhz: Option<u64>,
+    /// RAPL `uncore` rail — the iGPU's own draw, a subset of the package figure.
+    pub gpu_watts: Option<f64>,
     pub mem_used_kb: Option<u64>,
     pub mem_total_kb: Option<u64>,
     pub swap_used_kb: Option<u64>,
@@ -418,8 +422,10 @@ fn decode_load(u: &HashMap<String, OwnedValue>) -> Load {
     Load {
         cpu_percent: u.get("cpu_percent").and_then(as_f64),
         cpu_mhz: u.get("cpu_mhz").and_then(as_u64),
+        cpu_watts: u.get("cpu_watts").and_then(as_f64),
         gpu_percent: u.get("gpu_percent").and_then(as_f64),
         gpu_mhz: u.get("gpu_mhz").and_then(as_u64),
+        gpu_watts: u.get("gpu_watts").and_then(as_f64),
         mem_used_kb: u.get("mem_used_kb").and_then(as_u64),
         mem_total_kb: u.get("mem_total_kb").and_then(as_u64),
         swap_used_kb: u.get("swap_used_kb").and_then(as_u64),

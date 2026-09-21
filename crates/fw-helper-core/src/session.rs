@@ -46,7 +46,7 @@ const FLUSH_EVERY: u32 = 10;
 pub const HEADER: &str = "t_s,unix_time,cpu_pct,cpu_mhz,gpu_pct,gpu_mhz,gpu_top,\
 mem_used_mb,mem_total_mb,package_w,system_w,pl1_w,peci_c,coretemp_c,battery_c,board_c,\
 fan_rpm,fan_duty,fan_mode,throttle_events,throttle_ms,gpu_throttle,profile,on_ac,\
-battery_pct";
+battery_pct,cpu_w,gpu_w";
 
 /// One sample. Every field is optional because every source can be absent — a machine
 /// with no battery, a GPU we cannot read, a power figure discarded as untrustworthy.
@@ -65,8 +65,8 @@ pub struct Row {
     pub gpu_top: Option<String>,
     pub mem_used_mb: Option<u64>,
     pub mem_total_mb: Option<u64>,
-    /// CPU package draw. On this board the iGPU is inside the package, so this covers
-    /// both — there is no separate GPU power figure to record.
+    /// CPU package draw. The iGPU is inside the package, so this covers cores and
+    /// graphics together; [`Self::cpu_w`] and [`Self::gpu_w`] split it.
     pub package_w: Option<f64>,
     /// Whole-machine draw, measurable only on battery.
     pub system_w: Option<f64>,
@@ -90,6 +90,12 @@ pub struct Row {
     pub profile: Option<String>,
     pub on_ac: Option<bool>,
     pub battery_pct: Option<u64>,
+    /// RAPL `core` rail: the CPU cores alone.
+    pub cpu_w: Option<f64>,
+    /// RAPL `uncore` rail: the iGPU alone. A subset of [`Self::package_w`], and
+    /// `cpu_w + gpu_w` is less than it — the package also carries fabric and the
+    /// memory controller, which neither rail covers.
+    pub gpu_w: Option<f64>,
 }
 
 /// Render a value, or an empty cell when it is not known.
@@ -115,7 +121,8 @@ fn safe(text: &str) -> String {
 impl Row {
     pub fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
+             {},{}",
             self.t_s,
             self.unix_time,
             num(&self.cpu_pct, 1),
@@ -144,6 +151,8 @@ impl Row {
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             cell(&self.battery_pct),
+            num(&self.cpu_w, 2),
+            num(&self.gpu_w, 2),
         )
     }
 
@@ -186,6 +195,8 @@ impl Row {
             profile: s("profile"),
             on_ac: u("on_ac").map(|v| v == 1),
             battery_pct: u("battery_pct"),
+            cpu_w: f("cpu_w"),
+            gpu_w: f("gpu_w"),
         })
     }
 }
@@ -567,6 +578,11 @@ mod tests {
             profile: Some("max".into()),
             on_ac: Some(true),
             battery_pct: Some(80),
+            // Deliberately not summing to package_w: the rails exclude fabric and the
+            // memory controller, so a test that made them add up would enshrine an
+            // arithmetic relationship the hardware does not have.
+            cpu_w: Some(21.40),
+            gpu_w: Some(9.65),
         }
     }
 

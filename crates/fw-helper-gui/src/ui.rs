@@ -850,23 +850,55 @@ fn set_load_cards(w: &Widgets, s: &Snapshot) {
         Some(pct) => w.cpu_load.set_label(&format!("{pct:.0}%")),
         None => w.cpu_load.set_label("—"),
     }
-    w.cpu_load_caption.set_label(&match s.load.cpu_mhz {
-        Some(mhz) if mhz > 0 => format!("cpu load · {:.1} GHz", mhz as f64 / 1000.0),
-        _ => "cpu load".to_string(),
-    });
+    w.cpu_load_caption.set_label(&caption(
+        "cpu load",
+        clock(s.load.cpu_mhz),
+        watts(s.load.cpu_watts),
+    ));
 
     match s.load.gpu_percent {
         Some(pct) => w.gpu_load.set_label(&format!("{pct:.0}%")),
         None => w.gpu_load.set_label("—"),
     }
     // A throttle reason displaces the clock: when the GPU is being held back, that is
-    // the more useful of the two.
+    // the more useful of the two. It does not displace the wattage, which stays
+    // comparable with the CPU card beside it.
+    let gpu_first = match &s.load.gpu_throttle {
+        Some(reason) if !reason.is_empty() => Some(reason.clone()),
+        _ => clock(s.load.gpu_mhz),
+    };
     w.gpu_load_caption
-        .set_label(&match (&s.load.gpu_throttle, s.load.gpu_mhz) {
-            (Some(reason), _) if !reason.is_empty() => format!("gpu load · {reason}"),
-            (_, Some(mhz)) if mhz > 0 => format!("gpu load · {:.1} GHz", mhz as f64 / 1000.0),
-            _ => "gpu load".to_string(),
-        });
+        .set_label(&caption("gpu load", gpu_first, watts(s.load.gpu_watts)));
+}
+
+/// `"<name> · <part> · <part>"`, skipping parts that are not known.
+///
+/// Built by joining rather than by formatting a fixed shape, because any of the three
+/// can be missing independently — a machine with no readable `uncore` rail still has a
+/// clock to show, and a parked GT still has a wattage.
+fn caption(name: &str, a: Option<String>, b: Option<String>) -> String {
+    std::iter::once(name.to_string())
+        .chain(a)
+        .chain(b)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// GHz, or `parked` for a GT sitting in RC6.
+///
+/// Zero is a real reading here rather than a missing one: the GPU genuinely is not
+/// clocking. Showing "parked" says that, where dropping the field entirely reads as a
+/// broken sensor — which is exactly how it looked before, since `act_freq` is zero
+/// most of the time on an idle desktop.
+fn clock(mhz: Option<u64>) -> Option<String> {
+    match mhz? {
+        0 => Some("parked".to_string()),
+        mhz => Some(format!("{:.1} GHz", mhz as f64 / 1000.0)),
+    }
+}
+
+fn watts(w: Option<f64>) -> Option<String> {
+    Some(format!("{:.1} W", w?))
 }
 
 fn stat_label() -> gtk::Label {

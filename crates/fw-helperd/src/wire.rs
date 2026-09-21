@@ -104,11 +104,17 @@ pub fn usage_dict(u: &Usage) -> HashMap<String, OwnedValue> {
     if let Some(v) = u.cpu_mhz {
         put("cpu_mhz", Value::U64(v));
     }
+    if let Some(v) = u.cpu_watts {
+        put("cpu_watts", Value::F64(v));
+    }
     if let Some(v) = u.gpu_percent {
         put("gpu_percent", Value::F64(v));
     }
     if let Some(v) = u.gpu_mhz {
         put("gpu_mhz", Value::U64(v));
+    }
+    if let Some(v) = u.gpu_watts {
+        put("gpu_watts", Value::F64(v));
     }
     if let Some(v) = u.mem_used_kb {
         put("mem_used_kb", Value::U64(v));

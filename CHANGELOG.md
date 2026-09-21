@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.6.3 — 2026-09-21
+
+### Added
+
+- **CPU and GPU now each report utilisation, power and clock.** Power comes from the
+  RAPL `core` and `uncore` zones — `uncore` is the iGPU — published as `cpu_watts` and
+  `gpu_watts`. The zones are resolved by their `name` rather than by index, for the same
+  reason hwmon is: `intel-rapl:0:1` describes where a zone sits in the tree, not what it
+  measures.
+  - The window's load cards read `cpu load · 1.8 GHz · 3.2 W` and
+    `gpu load · 1.9 GHz · 4.2 W`. A GPU throttle reason still displaces the clock, but no
+    longer the wattage, so the two cards stay comparable.
+  - The Monitor page's power strip draws `package`, `cpu` and `gpu` as three lines.
+    Deliberately not stacked: cores plus iGPU is *less* than the package, which also
+    carries fabric and the memory controller, and a stacked area would assert an equality
+    the hardware does not have.
+  - Recorded sessions gain `cpu_w` and `gpu_w` columns. Appended to the header, and rows
+    are parsed by name, so older recordings still load.
+  - The HUD line carries the figure too: `GPU 93% 1850MHz 9.7W`.
+
+### Fixed
+
+- **The GPU clock vanished from the window at idle.** `act_freq` reads 0 whenever the GT
+  is in RC6 at the instant of the read, and on an idle desktop that is most of the time,
+  so a once-per-second read dropped the clock at random while the CPU — whose
+  `scaling_cur_freq` always answers — kept showing one. The read now takes a short burst
+  and keeps the highest, stopping as soon as it catches the GT awake, and a genuinely
+  parked GPU renders as `parked` rather than as a missing field.
+
+  `cur_freq` is **not** used as a fallback, though it always answers. It is the DVFS
+  *request*: it reads a constant 2500 on this board while `act_freq` sits at 1950 under
+  a saturating load. Four separate people on identical hardware reported "my GPU runs at
+  2.5 GHz" from tools showing that node — Mission Center, nvtop and turbostat's `GFXMHz`
+  among them. Publishing the request as the achieved clock would have made fw-helper the
+  fifth.
+
 ## 0.6.2 — 2026-09-20
 
 ### Fixed

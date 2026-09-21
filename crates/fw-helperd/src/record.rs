@@ -239,6 +239,8 @@ pub fn row(elapsed_secs: u64, t: &Telemetry, u: &Usage, ctx: &Context) -> Row {
             .unwrap_or_default(),
         cpu_pct: u.cpu_percent,
         cpu_mhz: u.cpu_mhz,
+        cpu_w: u.cpu_watts,
+        gpu_w: u.gpu_watts,
         gpu_pct: u.gpu_percent,
         gpu_mhz: u.gpu_mhz,
         gpu_top: u.top_gpu_client.as_ref().map(|(comm, _)| comm.clone()),
@@ -302,10 +304,17 @@ pub fn hud_line(t: &Telemetry, u: &Usage, ctx: &Context, recording: Option<&Stat
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(pct) = u.gpu_percent {
-        match u.gpu_mhz.filter(|m| *m > 0) {
-            Some(mhz) => parts.push(format!("GPU {pct:.0}% {mhz}MHz")),
-            None => parts.push(format!("GPU {pct:.0}%")),
+        let mut gpu = format!("GPU {pct:.0}%");
+        // Zero is filtered rather than printed: in a HUD line "0MHz" reads as a broken
+        // sensor, where the window has room to say "parked". Both come from the same
+        // RC6 reading (see `UsageSampler::read_gpu_mhz`).
+        if let Some(mhz) = u.gpu_mhz.filter(|m| *m > 0) {
+            gpu.push_str(&format!(" {mhz}MHz"));
         }
+        if let Some(w) = u.gpu_watts {
+            gpu.push_str(&format!(" {w:.1}W"));
+        }
+        parts.push(gpu);
     }
 
     if let Some(w) = ctx.pl1_watts {

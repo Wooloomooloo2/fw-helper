@@ -78,4 +78,42 @@ impl Sysfs {
         }
         None
     }
+
+    /// Resolve a RAPL zone by its `name`, e.g. `core`, `uncore`, `package-0`.
+    ///
+    /// Same reasoning as [`Self::find_hwmon`]: the numbering is positional
+    /// (`intel-rapl:0:1`) and describes where a zone sits in the tree, not what it
+    /// measures. On the reference board `intel-rapl:0:1` is `uncore` — the iGPU rail —
+    /// but nothing guarantees that ordering on another part, and reading the wrong
+    /// subzone yields a plausible number for the wrong thing.
+    ///
+    /// Searches subzones as well as top-level zones, since `core` and `uncore` are
+    /// always children of a package zone.
+    pub fn find_powercap(&self, name: &str) -> Option<String> {
+        let base = "sys/class/powercap";
+        for entry in fs::read_dir(self.path(base)).ok()?.flatten() {
+            let zone = entry.file_name().to_str()?.to_string();
+            let rel = format!("{base}/{zone}");
+            if self.read_string(&format!("{rel}/name")).ok().as_deref() == Some(name) {
+                return Some(rel);
+            }
+            // Subzones live inside their parent and are named with the parent's prefix.
+            let Ok(children) = fs::read_dir(self.path(&rel)) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let Some(sub) = child.file_name().to_str().map(String::from) else {
+                    continue;
+                };
+                if !sub.starts_with(&zone) {
+                    continue;
+                }
+                let sub_rel = format!("{rel}/{sub}");
+                if self.read_string(&format!("{sub_rel}/name")).ok().as_deref() == Some(name) {
+                    return Some(sub_rel);
+                }
+            }
+        }
+        None
+    }
 }

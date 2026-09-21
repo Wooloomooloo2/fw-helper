@@ -43,6 +43,12 @@ pub struct Sample {
     pub gpu_pct: Option<f64>,
     pub mem_pct: Option<f64>,
     pub package_w: Option<f64>,
+    /// The `core` and `uncore` RAPL rails, drawn under the package trace so the
+    /// package figure can be read as "where did the watts go" rather than a single
+    /// number. They do not sum to it — the package also carries fabric and the memory
+    /// controller — so they are drawn as components, never as a stack.
+    pub cpu_w: Option<f64>,
+    pub gpu_w: Option<f64>,
     /// The limit in force at this moment, drawn as the threshold the trace is read
     /// against. Per sample rather than per session because it can change mid-run.
     pub pl1_w: Option<f64>,
@@ -79,6 +85,8 @@ impl Sample {
             gpu_pct: s.load.gpu_percent,
             mem_pct: s.load.mem_percent(),
             package_w: s.package_watts,
+            cpu_w: s.load.cpu_watts,
+            gpu_w: s.load.gpu_watts,
             pl1_w: s.power_limit.map(f64::from),
             // Prefer the coretemp package sensor, whose critical point really is Tjmax;
             // fall back to whatever the daemon nominates as the control sensor.
@@ -109,6 +117,8 @@ impl Sample {
                 _ => None,
             },
             package_w: r.package_w,
+            cpu_w: r.cpu_w,
+            gpu_w: r.gpu_w,
             pl1_w: r.pl1_w.map(f64::from),
             // The recorded file keeps both; coretemp is the one with a usable limit.
             cpu_c: r.coretemp_c.or(r.peci_c),
@@ -275,8 +285,15 @@ fn strip(metric: Metric, p: &Palette, samples: &[Sample]) -> Strip {
             mark_throttle: false,
         },
         Metric::Power => Strip {
-            title: "cpu package power",
-            series: vec![("draw", p.power, |s| s.package_w)],
+            title: "package power",
+            // Package first so it reads as the total, with the two rails beneath it.
+            // Deliberately not stacked: cores + iGPU is less than the package, and a
+            // stacked area would assert an equality that does not hold.
+            series: vec![
+                ("package", p.power, |s| s.package_w),
+                ("cpu", p.cpu, |s| s.cpu_w),
+                ("gpu", p.gpu, |s| s.gpu_w),
+            ],
             y_min: 0.0,
             y_floor_max: 40.0,
             unit: "W",

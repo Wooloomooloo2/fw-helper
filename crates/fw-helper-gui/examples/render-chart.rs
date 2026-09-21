@@ -44,6 +44,11 @@ fn session() -> Vec<chart::Sample> {
                 gpu_pct: Some(gpu.clamp(0.0, 100.0)),
                 mem_pct: Some(41.0 + phase * 22.0),
                 package_w: Some(power),
+                // Rails as a plausible share of the package: cores take the bulk under
+                // CPU load, the iGPU tracks its own curve, and the two leave a
+                // remainder, as on the real machine.
+                cpu_w: Some(power * 0.62),
+                gpu_w: Some(power * 0.22 * (0.4 + gpu.clamp(0.0, 100.0) / 140.0)),
                 pl1_w: Some(35.0),
                 cpu_c: Some(cpu_c),
                 battery_c: Some(33.0 + heat * 9.0),

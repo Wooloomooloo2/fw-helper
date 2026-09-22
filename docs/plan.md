@@ -794,7 +794,7 @@ whole Advanced page. Build controls insensitive, gate on connection plus capabil
 the `Cap::No` reason. A disconnected GUI whose controls accept input and discard it reads
 as "the app does nothing".
 
-#### Phase 5 — the benchmark loop  ⬜  *the point of the milestone*
+#### Phase 5 — the benchmark loop  🟡 harness built, not yet run  *the point of the milestone*
 
 **Shadow of the Tomb Raider is the instrument.** Built-in benchmark, repeatable, and it
 **reports CPU and GPU frame rates separately** — so a parking change shows up as the CPU
@@ -811,6 +811,33 @@ milestone's own workflow before optimising anything.
 a value, reported it faithfully and bound nothing — the sysfs charge limit, `max_power_uw`,
 `min_perf_pct`. The GPU clock question was settled by arithmetic on frame rates, not by
 sysfs.
+
+**Harness**, built 2026-09-22: `scripts/phase5-bench.sh none|lpe|p-only` then
+`scripts/phase5-report.sh`. Results land in `scratchpad/phase5/`, which is untracked.
+
+The experiment varies **exactly one thing**. `retro` against `balanced` would vary PL1,
+the PPD position, the fan curve *and* parking at once, and a win would be
+unattributable — so every arm applies `retro` to fix the rest, then overrides only the
+park level. Note the ordering: applying a profile *sets* a park level, so the override
+must come after it, the same trap as `fan auto` versus a profile.
+
+**SOTTR's summary file gives only Min/Max/Average FPS** — the CPU-versus-GPU split is on
+the in-game result screen and in no file, so it has to be read off the screen. The
+better instrument is the per-frame `frametimes` file written alongside, from which the
+report computes **1% and 0.1% lows**. Those matter more than the average: a thread
+stranded on a slow core produces frame-time spikes before it produces a lower mean.
+Validated against the run of 2026-09-22 — avg **55.03** where SOTTR's own summary says
+55.1, 1% low **23.50**, 0.1% low **14.26**. That spread is wide enough to show an effect.
+
+**Check `gpu_pct` in the recorded session before believing any of it.** If the title is
+GPU-bound at these settings, parking has nothing to win and the benchmark cannot answer
+the question — lower the resolution or preset until the CPU is the limiter, then hold
+that fixed across all three arms.
+
+**One run per arm cannot distinguish +2% from noise**, and the report says so in its own
+output. Phase 0 measured the budget mechanism at about that size, so a null result is a
+real possibility and a real answer: it would mean `retro` is a hypothesis that did not
+pay off, and should then say so rather than ship as advice.
 
 ---
 

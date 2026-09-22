@@ -658,122 +658,148 @@ process and it paints into the frame before presentation. fw-helper feeds MangoH
 than competing with it, and supplies the GPU figure MangoHud cannot produce here at all
 (its Intel path is i915-only; this board is `xe`).
 
-### M9 — Workload-shaped tuning (game profiles)  ⬜ not started, gated on a measurement
+### M9 — Two game profiles, and a way to benchmark them  ⬜ not started
 
-**Read [framework_gaming_profile.md](framework_gaming_profile.md) first.** It carries the
-corrected lever set, the measured CPU topology, and the reasoning for everything below.
-Short version: a circulating "Linux gaming profile" blueprint for this exact laptop was
-checked path by path on 2026-09-22; three of its four mechanisms do not exist on this
-board and two of its hardware premises contradict our own measurements. The *strategy*
-survives and our data supports it — **CP2077 at PL1 25 W and 35 W score 48.01 and 48.16
-fps**, so ten watts are being spent on nothing — but the implementation has to be rebuilt
-from the real node set.
+**Read [framework_gaming_profile.md](framework_gaming_profile.md) first** for the corrected
+lever set and the measured CPU topology.
 
-Goal: an **Advanced** view where a profile can budget the two tiles separately —
-park cores, cap CPU and GPU independently, and set the overall package envelope.
+Two named profiles, `game` and `retro`, plus the benchmark loop that decides whether either
+of them is worth having. Scope was cut on 2026-09-22 from a general "advanced tuning" page:
+the RAPL core/uncore rails are disabled domains that neither profile needs, and the
+PSYSPL2/adapter investigation needs power supplies we do not have.
+
+#### The honest framing, which shapes the whole milestone
+
+**There is very little withheld GPU performance to unlock.** Measured: Cyberpunk 2077 at
+PL1 **25 W scores 48.01 fps and at 35 W scores 48.16**. The GPU is already at its clock
+ceiling and 96–97% occupied. A "Game Mode" sold as forcing maximum GPU would be selling
+something we have measured as absent, and this project does not ship dead controls.
+
+**The single-thread case is where the headroom is.** Horizon Zero Dawn reports **CPU FPS 34
+against GPU FPS 45 — CPU-bound — while no thread exceeded 50% and the busiest core sat at
+47%.** That is a hot thread on a slow core, not a busy machine. Moving it from a 3.3 GHz
+LP-E core to a 4.8 GHz P-core is a lever with real room in it.
+
+So `game` is about **not wasting budget**, and `retro` is about **placement**. Naming them
+honestly is part of the deliverable.
 
 ---
 
-#### Phase 0 — measure, before writing any Rust  ⬜ **THE GATE**
+#### Phase 0 — measure  ⬜ **THE GATE**
 
-`scratchpad/tune-levers-probe.sh`, written and syntax-checked 2026-09-22. Restores every
-node on exit and on signal; refuses to run on battery, with FurMark already up, or against
-a live `fw-helperd`. Four questions:
+`scratchpad/tune-levers-probe.sh`, trimmed 2026-09-22 to three questions. One command,
+~10 minutes, on mains, no special hardware.
 
-| | Question | Why it matters |
+| | Question | Decides |
 |---|---|---|
-| **A** | Does `intel-rapl:0:0` (core) bind when written and enabled? | It is `enabled=0, limit=0` today. This is the blueprint's CPU-starvation lever, and PP0/PP1 have been deprecated on client parts for years. Runs per-core `scaling_max_freq` alongside as a positive control |
-| **B** | Does `intel-rapl:0:1` (uncore) bind? | Same, for the GPU rail |
-| **C** | Does `gt0/freq0/max_freq` actually lower `act_freq` and uncore watts? | Capping *down* is a different proposition from the `min_freq` peg we proved inert |
-| **D** | **With the GPU loaded, does capping or parking the CPU give the GPU anything?** | The thesis. If uncore watts and GPU MHz are flat across uncapped / CPU-capped / E-cores-parked, the ~11 W core clamp is a fixed reservation and **Profile A is dead however well it is implemented** |
-
-D also answers the standing *binary vs graduated* question that `gpu-sweep.sh` was written
-for, so it closes an open item from the 2026-09-21 session at the same time.
+| **C** | Does `gt0/freq0/max_freq` genuinely cap the GPU? | Whether `retro` can get the GPU out of the way at all. Capping *down* is a different proposition from the `min_freq` peg we proved inert — but it could equally be another request nothing honours |
+| **D** | Does capping the GPU give the CPU anything? | **`retro`'s premise.** We know an active GPU clamps the cores to ~11 W and that the clamp is the same size whether the GPU draws 4 W or 22 W. If throttling the GPU frees nothing, `gpu_max_mhz` is theatre |
+| **E** | Parking the Atom clusters — placement, or power? | E1 asks where one hot thread *already* runs; if the scheduler puts it on a P-core unaided, parking buys nothing for that workload. E2 measures single-thread `Bzy_MHz` and bogo-ops at three park levels. Flat means placement-only, which shows up in a real title and not in a microbenchmark |
 
 ```bash
 sudo systemctl stop fw-helperd && sudo ./scratchpad/tune-levers-probe.sh 2>&1 | tee ~/tune-probe.log
 ```
 
-Must be on **mains** — a heavy GPU load asserts `pl2` on DC and every figure comes back
-power-bound. The script checks, but the reason is worth knowing.
-
-**Decision rule.** Whatever Phase 0 reports, record it in the hardware baseline and let it
-cut scope. A lever that does not bind becomes `Cap::No(reason)` with the reason naming the
-firmware, not a slider that does nothing. Phases 1 and 4 for core parking and
-`scaling_max_freq` proceed regardless — Phase 0 cannot invalidate those.
+**Decision rule.** A lever that does not bind ships as `Cap::No(reason)` naming the
+firmware, never as a slider that does nothing. Core parking and `scaling_max_freq` proceed
+regardless — Phase 0 cannot invalidate those.
 
 #### Phase 1 — `fw-helper-core/src/tune.rs`  ⬜
 
-Zero-dependency, `Sysfs`-rooted, fixture-tested, per ADR 0004 and ADR 0010.
+Zero-dependency, `Sysfs`-rooted, fixture-tested (ADR 0004, ADR 0010).
 
-- `CoreSet` — runtime topology discovery. P/E/LP-E from `core_id`, `cpu_capacity` and the
-  `cpu_core`/`cpu_atom` PMU masks; **never from hardcoded CPU numbers**, same discipline as
+- `CoreSet` — runtime topology discovery from `core_id`, `cpu_capacity` and the
+  `cpu_core`/`cpu_atom` PMU masks. **Never hardcoded CPU numbers**, same discipline as
   resolving hwmon by `name`. `cpu0` has no `online` file and is modelled as permanently on.
-- `FreqCap` — per-core `scaling_max_freq`, clamped to each core's own `cpuinfo_max_freq`
-  (the clusters differ: 4700/4800, 3700, 3300).
-- `GpuCap` — `gt0/freq0/max_freq`, and `min_freq` with it. Clamp to `rpn_freq..rp0_freq`.
-- `RailLimit` — core/uncore RAPL, **only if Phase 0 A/B say yes**; otherwise it ships as a
-  capability that explains itself.
+- `ParkLevel` — `None` / `Lpe` / `PCoresOnly`, resolved to CPU numbers by `CoreSet`.
+- `GpuCap` — `gt0/freq0/max_freq` **and `min_freq` together**, clamped to `rpn_freq..rp0_freq`.
+- `FreqCap` — per-core `scaling_max_freq`, clamped per cluster (4700/4800, 3700, 3300).
 
-Per the hard rule, each capability probes **the whole path it promises**, sandbox included.
-`gpu usage available` was logged at every startup for weeks while nothing was ever measured,
-because the probe stopped at "which driver is loaded". Do not repeat that.
+Each capability probes **the whole path it promises**. `gpu usage available` was logged at
+every startup for weeks while nothing was ever measured, because the probe stopped at
+"which driver is loaded".
 
-#### Phase 2 — `Profile` gains an optional tune section  ⬜
+#### Phase 2 — the two profiles  ⬜
 
-Optional, so the five built-ins and every existing `profiles.d/*.conf` parse unchanged.
-New keys in `data/example-profile.conf`: `park_cores`, `cpu_max_mhz`, `gpu_max_mhz`,
-`cpu_watts`, `gpu_watts`, `pl2_watts`. `validate()` extends to cover them.
+An optional tune section on `Profile`, so the five built-ins and every existing
+`profiles.d/*.conf` parse unchanged. Keys: `park_cores`, `gpu_max_mhz`, `cpu_max_mhz`.
+
+**`game`** — stop wasting budget, do not chase a ceiling that is not there.
+
+| Field | Value | Why |
+|---|---|---|
+| `ppd` | performance | |
+| `pl1_watts` | **25** | measured optimum: same fps as 35 W, 10 W cooler, ~156 rpm quieter |
+| `park_cores` | none | a GPU-bound title is not helped by fewer cores |
+| `gpu_max_mhz` | unrestricted | it is already at its ceiling |
+| curve | early, aggressive | our curves beat firmware by 13–36 duty counts through 50–60 °C |
+
+Expected: parity on fps, meaningfully quieter and cooler. Say that in the UI.
+
+**`retro`** — single-thread optimised, for older titles and emulation.
+
+| Field | Value | Why |
+|---|---|---|
+| `ppd` | performance | |
+| `pl1_watts` | **35** | full envelope, now shared by fewer cores |
+| `park_cores` | **`lpe`** default, `p-only` offered | see the table below |
+| `gpu_max_mhz` | 1200 | **conditional on Phase 0 C and D** |
+
+| Level | Parked | Leaves | For |
+|---|---|---|---|
+| `none` | — | 4P + 8E + 4LP-E | default |
+| `lpe` | 12–15 | 4P + 8E | removes only the 3.3 GHz cluster; safe, keeps 12 cores |
+| `p-only` | 4–15 | 4 P-cores at 4.7–4.8 GHz | maximum single-thread |
+
+**Counterexample to carry in the docs:** RPCS3 is heavily multithreaded for SPU emulation
+and would likely *lose* at `p-only`. That is precisely why this is three levels and a
+benchmark rather than one switch.
 
 #### Phase 3 — daemon, and **ADR 0014**  ⬜
 
-Writes follow the M2 five-step pattern without exception: polkit per action failing closed,
-validate range before checking support, write then **read back and verify**, persist to
-`/var/lib/fw-helper/state`, re-apply on resume. Write methods take `&self`.
+The M2 five-step pattern without exception: polkit per action failing closed, validate
+range before checking support, write then **read back and verify**, persist, re-apply on
+resume. Write methods take `&self`.
 
-**ADR 0014 — parked cores and frequency caps are fail-safe state.** They carry the same
-restore obligation as the fan (ADR 0006): exit, signal, panic, suspend. And they are worse
-than the fan in one specific way — a stuck fan is fixed by a reboot or by the EC taking
-over, whereas **nothing re-onlines a CPU except something that knows it parked it**, so the
-state survives a daemon restart and presents as a machine that has quietly lost twelve
-cores. The logind delay inhibitor already in place is the hook for the suspend leg.
+**ADR 0014 — parked cores are fail-safe state.** Same restore obligation as the fan
+(ADR 0006): exit, signal, panic, suspend. Worse than the fan in one specific way — a stuck
+fan is fixed by a reboot or by the EC taking over, whereas **nothing re-onlines a CPU
+except something that knows it parked it**, so the state survives a daemon restart and
+presents as a machine that has quietly lost twelve cores. The logind delay inhibitor is
+the hook for the suspend leg.
 
-Also inherited, and worth stating in the ADR: applying a profile re-takes the fan, so a
-tune section rides along with that and with the AC/battery transition that re-applies it.
+Also inherited: applying a profile re-takes the fan, and an AC/battery transition
+re-applies the profile.
 
-#### Phase 4 — GUI: a third page  ⬜
+#### Phase 4 — GUI  ⬜
 
-An **Advanced** page in the existing `ViewStack`, beside Control and Monitor.
+Profile selection already exists; `game` and `retro` appear in it for free. What is new is
+a small **Tuning** group on the existing Control page — park level, GPU cap — rather than a
+whole Advanced page. Build controls insensitive, gate on connection plus capability, show
+the `Cap::No` reason. A disconnected GUI whose controls accept input and discard it reads
+as "the app does nothing".
 
-- **Cores** — a per-cluster grid (P 0–3, E 4–11, LP-E 12–15) with `cpu0` shown locked
-  rather than offered as a toggle that fails. Cluster-level park/unpark, not sixteen
-  switches.
-- **CPU** — max frequency, and a rail watt cap if Phase 0 allowed one.
-- **GPU** — max frequency, and a rail watt cap if Phase 0 allowed one.
-- **Package** — PL1 (already shipped) and PL2. **Do not clamp the PL2 slider to
-  `constraint_1_max_power_uw`**; it reads 0, meaning unset, and clamping to it silently
-  zeroes the limit.
+#### Phase 5 — the benchmark loop  ⬜  *the point of the milestone*
 
-Build every control **insensitive** and gate it on connection plus capability, with the
-`Cap::No` reason shown — a disconnected GUI whose controls accept input and discard it
-reads as "the app does nothing" rather than "nothing is installed".
+**Shadow of the Tomb Raider is the instrument.** Built-in benchmark, repeatable, and it
+**reports CPU and GPU frame rates separately** — so a parking change shows up as the CPU
+number moving while the GPU number does not, which is exactly the discrimination needed.
+Cyberpunk 2077 for the GPU-bound verdict, because it reaches 96–97% GPU busy and responds
+properly to power. Horizon Zero Dawn as the **negative control**: it never asks for the
+watts and should refuse to move. If HZD moves, suspect the measurement.
 
-#### Phase 5 — verify with frame rate, not sysfs  ⬜
+This is what M8's recorder was built for. `fw-helperctl record start "sottr-p-only"` around
+each run, then load both sessions on the Monitor page and compare. Wire that up as the
+milestone's own workflow before optimising anything.
 
-Two Cyberpunk 2077 runs at the same PL1, one plain and one tuned, compared on the game's
-own per-frame CSV. CP2077 because it reaches 96–97% GPU busy and **responds properly to
-power**; HZD is the negative control that never asks for the watts and will report 34 fps
-whatever you do to it.
-
-This is the acceptance test, and it outranks every counter. Three times now a knob on this
-machine has accepted a value, reported it faithfully and bound nothing — the sysfs charge
-limit, `max_power_uw`, `min_perf_pct`. The GPU clock question was settled by arithmetic on
-frame rates, not by sysfs, and that is the transferable lesson.
+**Frame rate outranks every counter.** Three times now a knob on this machine has accepted
+a value, reported it faithfully and bound nothing — the sysfs charge limit, `max_power_uw`,
+`min_perf_pct`. The GPU clock question was settled by arithmetic on frame rates, not by
+sysfs.
 
 ---
 
-**Resume next session at Phase 0.** Everything else is written down; nothing else needs to
-be re-derived.
+**Resume next session at Phase 0.**
 
 ---
 
@@ -787,9 +813,11 @@ be re-derived.
 | PPD D-Bus name changes | Profiles break | Support both known names, prefer newer |
 | Kernel/EC firmware drift | Silent breakage | Capability probing at startup; never assume |
 | Scope creep toward FW16/AMD | Never ships | v1 is FW13 Intel only; revisit after M7 |
-| M9: the core/uncore RAPL rails are disabled and never bind | Half of M9 cut | Phase 0 questions A and B answer this before any code is written |
-| M9: the CPU/GPU clamp is a fixed reservation | Profile A pointless | Phase 0 question D; if flat, ship the honest `Cap::No` instead of an inert slider |
-| M9: a crashed daemon leaves cores parked | Machine silently loses 12 cores, survives restart | ADR 0014 — the ADR 0006 restore obligation extended to `cpu*/online` and frequency caps |
+| M9: `gt0/freq0/max_freq` is another request nothing honours | `retro` loses its GPU lever | Phase 0 question C, before any code is written |
+| M9: the CPU/GPU clamp is a fixed reservation | `retro`'s `gpu_max_mhz` is theatre | Phase 0 question D; if flat, ship the honest `Cap::No` instead of an inert slider |
+| M9: parking is placement-only and invisible to microbenchmarks | `retro` looks like a no-op and gets cut wrongly | Phase 0 question E separates the two mechanisms; Phase 5 judges on a real title, not a counter |
+| M9: `game` is honestly worth ~0% fps | Users expect an unlock and get quiet | Name and describe it as budget-and-noise, not as an unlock. 25 W vs 35 W is measured at 48.01 vs 48.16 fps |
+| M9: a crashed daemon leaves cores parked | Machine silently loses 12 cores, survives restart | ADR 0014 — the ADR 0006 restore obligation extended to `cpu*/online` |
 
 ## Immediate next actions
 

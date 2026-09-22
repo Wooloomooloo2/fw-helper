@@ -133,32 +133,83 @@ keep the highest, as `usage.rs` already does.
 
 ---
 
-## 3. The open question that gates everything
+## 3. The open question, and what was cut
 
 **Does starving one domain give the other anything?**
 
-The measured facts do not yet answer this, and they point slightly against it. The core
-clamp is **the same size whether the GPU then draws 4 W or 22 W** — a fixed reservation,
-not a mis-allocation. If the reservation is symmetric and unconditional, then capping the
-CPU harder frees nothing for the GPU, and Profile A is dead however correctly it is
-implemented.
+The measured facts point slightly against it. The core clamp is **the same size whether the
+GPU then draws 4 W or 22 W** — a fixed reservation, not a mis-allocation. If it is
+unconditional, capping the GPU frees nothing for the CPU and `retro`'s `gpu_max_mhz` is
+theatre.
 
-Eliminated as mechanisms already, all by measurement: PL1, PL2, thermal, PROCHOT (EC
-`0x3E22` reads 0000), the ring interconnect, `psys`, DPTF (`INT3400` bound, both UUID
-lists empty), HWP (`IA32_HWP_REQUEST` unchanged in every phase), and SR-IOV PF mode. The
-only live reason on the cores is bit 8 of `MSR_CORE_PERF_LIMIT_REASONS` (`0x64f`), the
-electrical/current category — and it is set in the healthy configurations too.
+Eliminated as mechanisms already, by measurement: PL1, PL2, thermal, PROCHOT (EC `0x3E22`
+reads 0000), the ring interconnect, DPTF (`INT3400` bound, both UUID lists empty), HWP
+(`IA32_HWP_REQUEST` unchanged in every phase), and SR-IOV PF mode. The only live reason on
+the cores is bit 8 of `MSR_CORE_PERF_LIMIT_REASONS` (`0x64f`), the electrical/current
+category — set in the healthy configurations too, so it does not discriminate.
 
-Best remaining hypothesis, unproven: **margin held against combined CPU+GPU current
-peaks.** If that is right, the useful question is whether the clamp is *binary* (any
-graphics activity triggers the full reservation) or *graduated* (it scales with GPU
-demand). Binary points at a policy; graduated points at budget arithmetic — and only
-graduated leaves room for a profile to win anything.
+**One elimination is weaker than it reads.** `psys` was dismissed because the RAPL zone is
+`enabled=0` with limits `0`. That is true and was re-confirmed 2026-09-22 — but it is the
+wrong instrument. The EC programs `PSYSPL2` directly (see §3.1), so a disabled RAPL zone
+means Linux is not *exposing* the limit, not that the platform is not *enforcing* it. That
+is the fourth time on this machine that the knob Linux offers is not the one holding the
+value. Not reopened, but not settled either.
 
-`scratchpad/tune-levers-probe.sh` answers this and the three lever questions in one run.
-It is M9 Phase 0 and nothing should be built before it reports.
+### 3.1 What was cut from M9, and why
 
----
+Chasing the clamp properly needs a `PSYSPL2` sweep across power supplies of different
+wattages, which needs adapters we do not have. It was cut on 2026-09-22 along with the
+`intel-rapl:0:0`/`:0:1` rail questions, which are disabled domains that neither shipping
+profile depends on. M9 Phase 0 is now three questions serving `game` and `retro` directly.
+
+The clamp remains the most interesting unexplained thing about this machine. It is simply
+not on the critical path for either profile.
+
+### 3.2 Framework issue #263 — assessment
+
+[FrameworkComputer/SoftwareFirmwareIssueTracker#263](https://github.com/FrameworkComputer/SoftwareFirmwareIssueTracker/issues/263),
+opened 2026-09-17 by `bpavlo`: *"EC power table sets PL4 = 80 W in all modes, clamping the
+Arc B390 at 1900 MHz."* It reports `act_freq` 1850–1900 under Vulkan load with `pl4`
+asserted and package power 13–17 W, cites `zephyr/program/framework/sakura/src/cpu_power.c`,
+and asks Framework to scale PL4 dynamically the way Series 1 (marigold) does up to 120 W.
+
+**Verdict: a real observation with the wrong diagnosis. The requested fix would probably
+not move the GPU clock.**
+
+Its data is good — better than the forum thread, and unlike that thread `bpavlo` does
+appear to be reading `act_freq`, since 1850–1900 matches this machine exactly. The static
+PL4 table on sakura against marigold's dynamic one is a genuine difference worth reporting.
+
+Three reasons the attribution does not hold:
+
+1. **Frame rate.** If an 80 W PL4 were holding this GPU 24% below capability, a machine
+   without the clamp would be ~24% faster. The one cross-machine performance comparison we
+   have runs the other way — our FurMark beat theirs at a *higher* resolution.
+2. **When a power limit genuinely binds this GPU, the clock moves.** On battery `pl2`
+   asserts and the GPU drops to 1300–1500 MHz. On mains across a 10 W PL1 swing (25 vs
+   35 W) it reads 1852 and 1850. A ceiling that does not respond to 10 W is not what sets
+   the clock.
+3. **2500 MHz is Intel's *Graphics Max Dynamic Frequency* quoted at an 80 W Maximum Turbo
+   Power**, and this is a ~35–38 W part. The EC programming exactly 80 W suggests it is
+   implementing Intel's reference table, not under-provisioning it.
+
+Its central argument — "throttle reason is PL4 even though package power is far below
+80 W" — is void for a reason already in our traps table: **PL4 is a microsecond current
+ceiling and cannot be seen in a 1 Hz power average.** And its own logs show `PL4:75` on a
+79 W supply against `PL4:80` on a 96 W adapter, which contradicts "hardcoded in all modes".
+
+It also repeats the correlation error this project made and retracted on 2026-09-21:
+`pl4` asserted under load is not `pl4` causing the clock. We measured it on 25/25 samples
+whenever the GPU was loaded and `none` on every idle and CPU-only sample.
+
+**What would change this verdict:** a *sustained* `act_freq` above 2000 on mains. Their
+"peaked at 2050 MHz briefly" is the only hint, and a brief peak is not it.
+
+**What it contributes anyway:** the EC console (`ectool console | grep PL1`) publishes
+`PL1/PL2/PL4/PSYSPL2` as actually programmed, and they vary with the supply. Note that
+sysfs `peak_power` reads **175 W** on both RAPL zones while the EC reports 75–80 W — two
+numbers for the same limit, and worth knowing which one binds if the clamp is ever
+reopened. `ectool` is not installed here, but `ec.rs` already drives `/dev/cros_ec`.
 
 ## 4. The case for core parking, restated
 
@@ -192,6 +243,9 @@ This is why M9 carries a new ADR rather than being a straightforward feature.
 ---
 
 ## 6. Corrected reference scripts
+
+**Superseded by the `game` and `retro` profiles in M9** — kept because they show what the
+original's scripts should have said, and because the corrected paths are the useful part.
 
 **These are for reading, not running.** They exist to show what the original's scripts
 should have said. The daemon is the thing that should hold these values, because every

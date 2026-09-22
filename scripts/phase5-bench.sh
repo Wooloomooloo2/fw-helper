@@ -64,7 +64,13 @@ fi
 
 mkdir -p "$OUT"
 
-echo "== arm: $ARM"
+# Log everything this script says, to the results directory, from here on.
+# Terminal output does not reliably survive being pasted into a conversation, and this
+# harness has already cost two rounds of reconstructing a failure from leftover files.
+# `exec > >(tee)` keeps the output on screen and in the file at the same time.
+LOG="$OUT/bench.log"
+exec > >(tee "$LOG") 2>&1
+echo "== arm: $ARM   $(date -Is)"
 # `retro` first, every time: it fixes PL1 35 W, PPD performance and the curve. Applying
 # it also SETS a park level (lpe), so the explicit override below has to come after it,
 # not before -- the same ordering trap as `fan auto` versus a profile.
@@ -106,8 +112,9 @@ done < <(find "$SOTTR" -maxdepth 1 -name 'SOTTR_*.txt' -newer "$MARK" 2>/dev/nul
 
 if [ "$found" = 0 ]; then
   echo "!! SOTTR wrote no new result files. Did the benchmark actually run to the end?"
+  echo "!! (this log: $LOG)"
   exit 1
 fi
 echo "$SESSION" > "$OUT/session"
 echo
-echo "-- arm $ARM done. Results in scratchpad/phase5/$ARM/"
+echo "-- arm $ARM done. Results and this log are in scratchpad/phase5/$ARM/"

@@ -809,35 +809,75 @@ where
 fn tune_show() {
     let fs = Sysfs::new("/");
 
+    // Prefer the daemon's topology. It probes once, while the machine is whole, and
+    // caches it — whereas probing here reads a machine that may already be parked, and
+    // an offline core has no `cpufreq/` or `topology/` left to classify it by. Measured
+    // 2026-09-22: parking 12-15 made a fresh probe report one Atom tier of twelve, so
+    // `lpe` displayed as "parks 0" while it was the level actually in effect.
+    let daemon_clusters = connect()
+        .ok()
+        .and_then(|(d, _)| d.cpu_clusters().ok())
+        .filter(|c| !c.is_empty());
+
     let park = CoreParking::new(&fs);
     let set = park.core_set();
     println!("CPU topology                                     (discovered, not assumed)");
     if set.cpus().is_empty() {
         println!("  none found under /sys/devices/system/cpu");
     }
-    for cluster in set.clusters() {
-        let cpus = set.in_cluster(cluster);
+    // (name, cpus, max_mhz) from whichever source we trust more.
+    let rows: Vec<(String, Vec<u32>, u32)> = match &daemon_clusters {
+        Some(cl) => cl
+            .iter()
+            .map(|(name, cpus, mhz, _)| (name.clone(), cpus.clone(), *mhz))
+            .collect(),
+        None => set
+            .clusters()
+            .into_iter()
+            .map(|c| {
+                let cpus = set.in_cluster(c);
+                (
+                    c.as_str().to_string(),
+                    cpus.iter().map(|x| x.num).collect(),
+                    // The cluster max, not the first core's: cpu1 boosts to 4800 where
+                    // 0/2/3 reach 4700.
+                    cpus.iter().map(|x| x.max_khz / 1000).max().unwrap_or(0),
+                )
+            })
+            .collect(),
+    };
+    let unparkable: Vec<u32> = set
+        .cpus()
+        .iter()
+        .filter(|c| !c.parkable)
+        .map(|c| c.num)
+        .collect();
+    for (name, cpus, mhz) in &rows {
         let nums: Vec<String> = cpus
             .iter()
-            .map(|c| {
-                let mut s = c.num.to_string();
-                if !c.parkable {
+            .map(|n| {
+                let mut s = n.to_string();
+                if unparkable.contains(n) {
                     s.push('*');
                 }
-                if !park.is_online(c.num) {
+                if !park.is_online(*n) {
                     s.push_str(" (parked)");
                 }
                 s
             })
             .collect();
-        // The cluster max, not the first core's: cpu1 boosts to 4800 where 0/2/3 reach 4700.
-        let mhz = cpus.iter().map(|c| c.max_khz / 1000).max().unwrap_or(0);
         println!(
             "  {:<5} x{:<2} {:>5} MHz   {}",
-            cluster.as_str(),
+            name,
             cpus.len(),
             mhz,
             nums.join(" ")
+        );
+    }
+    if daemon_clusters.is_none() && !set.is_complete() {
+        println!(
+            "  note: cores are parked and fw-helperd is not answering, so the clusters\n\
+             \x20       above are a guess — an offline CPU exposes no topology to read"
         );
     }
     if set.cpus().iter().any(|c| !c.parkable) {

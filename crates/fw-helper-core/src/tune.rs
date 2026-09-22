@@ -186,6 +186,10 @@ impl From<std::io::Error> for TuneError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreSet {
     cpus: Vec<Cpu>,
+    /// False when the probe ran with cores already offline, so the classification
+    /// could not be trusted. A caller holding a level over time should re-probe once
+    /// the machine is whole rather than act on a degraded set.
+    complete: bool,
 }
 
 impl CoreSet {
@@ -200,7 +204,10 @@ impl CoreSet {
         let p_mask = read_cpu_list(fs, "sys/devices/cpu_core/cpus");
 
         let Ok(entries) = std::fs::read_dir(fs.path(CPU_BASE)) else {
-            return Self { cpus };
+            return Self {
+                cpus,
+                complete: false,
+            };
         };
         let mut nums: Vec<u32> = entries
             .flatten()
@@ -217,6 +224,9 @@ impl CoreSet {
         let raw: Vec<(u32, Option<u32>, u32)> = nums
             .iter()
             .map(|&n| {
+                // Both of these vanish while a CPU is offline, which is why a probe
+                // taken on a parked machine is degraded. Recorded rather than worked
+                // around: there is nothing left in sysfs to classify such a core by.
                 let core_id = fs
                     .read_u64(&format!("{CPU_BASE}/cpu{n}/topology/core_id"))
                     .ok()
@@ -252,7 +262,16 @@ impl CoreSet {
                 parkable: fs.exists(&format!("{CPU_BASE}/cpu{n}/online")),
             });
         }
-        Self { cpus }
+        // A core with no `cpuinfo_max_freq` is one the kernel has taken down, and its
+        // cluster is a guess. Say so rather than publish a shape that will change when
+        // it comes back.
+        let complete = cpus.iter().all(|c| c.max_khz > 0);
+        Self { cpus, complete }
+    }
+
+    /// Whether every core was online when this was probed.
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     pub fn cpus(&self) -> &[Cpu] {
@@ -370,8 +389,22 @@ pub struct CoreParking<'a> {
 }
 
 impl<'a> CoreParking<'a> {
+    /// Probe the topology now.
+    ///
+    /// **Do not use this on a machine that may already have cores parked.** An offline
+    /// CPU loses its `cpufreq/` and `topology/` directories, so it cannot be classified
+    /// — measured 2026-09-22, parking 12-15 made the next probe report a single Atom
+    /// tier of twelve, at which point `to_park(Lpe)` returns nothing and the level that
+    /// is *currently in effect* reports as parking no cores at all. Anything holding a
+    /// level across time wants [`Self::with_set`] and a topology read while the machine
+    /// was whole.
     pub fn new(fs: &'a Sysfs) -> Self {
         let set = CoreSet::probe(fs);
+        Self { fs, set }
+    }
+
+    /// Use a topology captured earlier, when every core was online.
+    pub fn with_set(fs: &'a Sysfs, set: CoreSet) -> Self {
         Self { fs, set }
     }
 
@@ -516,6 +549,13 @@ impl<'a> GpuFreq<'a> {
 
     pub fn max(&self) -> Option<u32> {
         self.read_mhz("max_freq")
+    }
+
+    /// The driver's preferred floor. `reset` returns `min_freq` here rather than to
+    /// `rpn_freq`, because `rpn` is the absolute hardware minimum and not where the
+    /// driver idles.
+    pub fn rpe(&self) -> Option<u32> {
+        self.read_mhz("rpe_freq")
     }
 
     pub fn min(&self) -> Option<u32> {

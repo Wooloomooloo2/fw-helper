@@ -533,3 +533,78 @@ fn no_gpu_is_a_reason_not_a_panic() {
         TuneError::Unsupported(_)
     ));
 }
+
+/// Parking a cluster must not make that cluster unreachable.
+///
+/// Regression for 2026-09-22: an offline CPU loses `cpufreq/` and `topology/`, so a
+/// fresh probe on a parked machine merged LP-E into E. `to_park(Lpe)` then returned
+/// nothing and `read()` said `mixed` — the level that was *actually in effect*
+/// reported as parking no cores at all, so it could neither be recognised nor undone
+/// by name.
+#[test]
+fn a_probe_taken_while_parked_is_marked_incomplete() {
+    let f = Fixture::framework_13("degraded");
+    with_hybrid_cpus(&f);
+    let fs = f.sysfs();
+
+    let whole = CoreSet::probe(&fs);
+    assert!(whole.is_complete());
+    assert_eq!(whole.clusters().len(), 3);
+
+    // Take LP-E offline the way the kernel does: the online file stays, the rest goes.
+    for n in 12..=15 {
+        fs.write_string(&format!("sys/devices/system/cpu/cpu{n}/online"), "0")
+            .unwrap();
+        std::fs::remove_dir_all(fs.path(&format!("sys/devices/system/cpu/cpu{n}/cpufreq")))
+            .unwrap();
+        std::fs::remove_dir_all(fs.path(&format!("sys/devices/system/cpu/cpu{n}/topology")))
+            .unwrap();
+    }
+
+    let degraded = CoreSet::probe(&fs);
+    assert!(
+        !degraded.is_complete(),
+        "a probe that cannot see four of the cores must say so"
+    );
+    // It genuinely cannot classify them — that is the point of the flag.
+    assert_eq!(degraded.clusters().len(), 2);
+
+    // Carrying the whole-machine topology keeps the level usable.
+    let park = CoreParking::with_set(&fs, whole);
+    assert_eq!(
+        park.core_set().to_park(ParkLevel::Lpe),
+        vec![12, 13, 14, 15]
+    );
+    assert_eq!(park.read(), Some(ParkLevel::Lpe));
+    park.restore_all().unwrap();
+    assert_eq!(park.read(), Some(ParkLevel::None));
+}
+
+/// The GPU cap must be liftable by a process that never applied it.
+///
+/// Regression for 2026-09-22: the daemon's restore was gated on an in-memory flag, so
+/// a fresh process cleaning up after a `SIGKILL` skipped the GPU entirely. The cores
+/// came back and the GT stayed pinned at 1200 MHz. `rp0_freq` is the authority for
+/// what uncapped means, not anything this process remembers.
+#[test]
+fn a_gpu_cap_is_liftable_with_no_prior_knowledge_of_it() {
+    let f = Fixture::framework_13("gpuorphan");
+    with_xe_gpu(&f);
+    let fs = f.sysfs();
+
+    // Somebody else capped it and went away.
+    fs.write_string(&gt("max_freq"), "1200").unwrap();
+    fs.write_string(&gt("min_freq"), "1200").unwrap();
+
+    let gpu = GpuFreq::new(&fs);
+    let (_, rp0) = gpu.range().unwrap();
+    assert!(gpu.max().unwrap() < rp0, "precondition: it is capped");
+
+    gpu.reset().unwrap();
+    assert_eq!(gpu.max(), Some(2500));
+    assert_eq!(gpu.min(), Some(900), "back to rpe, not rpn");
+}
+
+fn gt(attr: &str) -> String {
+    format!("sys/class/drm/card1/device/tile0/gt0/freq0/{attr}")
+}

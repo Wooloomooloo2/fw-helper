@@ -95,6 +95,12 @@ PrivateNetwork=yes
 # only path under it we need. The leading `-` means a missing directory is not a
 # startup failure, so uninstalling the profile directory cannot stop the daemon.
 ReadWritePaths=/sys/class/hwmon /sys/class/powercap /sys/class/power_supply /sys/firmware/acpi
+# M9 (ADR 0014): cpu*/online for core parking, and the xe GT's freq0 window. Listed for
+# the same reason as the rest - ProtectSystem=full does not cover /sys, so these are not
+# what grants the access today, but tightening to ProtectSystem=strict later must not
+# silently break parking. ExecStopPost inherits this sandbox, which is how the crash-path
+# restore reaches them.
+ReadWritePaths=/sys/devices/system/cpu /sys/class/drm
 ReadWritePaths=-/etc/fw-helper
 
 # The crash-path fan restore (ADR 0006 point 1). systemd runs ExecStopPost on every

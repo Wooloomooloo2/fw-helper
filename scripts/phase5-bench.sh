@@ -33,7 +33,16 @@ CTL=${CTL:-fw-helperctl}
 [ "$(cat /sys/class/power_supply/AC*/online 2>/dev/null | head -1)" = 1 ] || {
   echo "!! ON BATTERY. The profile is re-applied on a power-source change, which would"
   echo "!! silently reset the park level mid-run. Plug in."; exit 1; }
-$CTL status >/dev/null 2>&1 || { echo "!! fw-helperd is not answering; recording needs it"; exit 1; }
+# NOT `status`: it falls back to reading sysfs directly when the daemon is absent and
+# exits 0, so it is useless as a liveness check. `profile` needs D-Bus and exits 1.
+# Phase 0's probe stops the daemon deliberately, so arriving here with it down is the
+# normal way to trip this.
+$CTL profile >/dev/null 2>&1 || {
+  echo "!! fw-helperd is not answering, and every step here needs it."
+  echo "!!   sudo systemctl start fw-helperd"
+  echo "!! (scratchpad/tune-levers-probe.sh stops it on purpose and does not restart it.)"
+  exit 1
+}
 [ -d "$SOTTR" ] || { echo "!! no SOTTR output directory at $SOTTR"; exit 1; }
 
 mkdir -p "$OUT"

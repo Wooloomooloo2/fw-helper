@@ -165,6 +165,15 @@ a *system* remote, so `--user` needs the remote adding first). Cosmetic now.
 
 **Measurement traps this session cost time on** - all in the harness, not the hardware:
 
+- **`vkmark -p immediate` exits on Wayland here.** The Wayland surface offers only
+  `MAILBOX` and `FIFO`; immediate exists on the X11 surfaces, which is where the usual
+  advice comes from. vkmark does not fall back, it prints `Selected present mode
+  Immediate is not supported` and quits. Use **`-p mailbox`** - unthrottled, where fifo
+  would vsync-cap the load. Its `apiVersion has value of 0` line is a harmless
+  validation-layer warning from vkmark 2017.08, not the failure; read past it.
+- **`vkmark`'s heaviest scene is `effect2d:kernel=edge`**, a full-screen convolution.
+  Windowed, `shading` gave act median **900 MHz** against effect2d's **1300** and
+  desktop's **1450**. The default scene list is mostly light.
 - **An occluded `vkcube`/`vkmark` window renders nothing.** Mutter stops sending frame
   callbacks. It looks alive and draws 3.5 W instead of 7.2.
 - **`vkmark` defaults to an 800x600 window** and only reaches ~72% GPU occupancy, so it

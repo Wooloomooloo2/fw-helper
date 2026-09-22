@@ -685,7 +685,7 @@ honestly is part of the deliverable.
 
 ---
 
-#### Phase 0 — measure  ⬜ **THE GATE**
+#### Phase 0 — measure  ✅ done 2026-09-22 — results in [framework_gaming_profile.md](framework_gaming_profile.md) §3.3
 
 `scratchpad/tune-levers-probe.sh`, trimmed 2026-09-22 to three questions. One command,
 ~10 minutes, on mains, no special hardware.

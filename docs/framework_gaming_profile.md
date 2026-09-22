@@ -211,6 +211,87 @@ sysfs `peak_power` reads **175 W** on both RAPL zones while the EC reports 75–
 numbers for the same limit, and worth knowing which one binds if the clamp is ever
 reopened. `ectool` is not installed here, but `ec.rs` already drives `/dev/cros_ec`.
 
+## 3.3 Phase 0 results (2026-09-22, mains, PL1 35 W)
+
+Run with `scratchpad/tune-levers-probe.sh`. GPU load is `vkmark --fullscreen -p mailbox
+-b effect2d:kernel=edge`, CPU load `stress-ng --cpu N --cpu-method matrixprod`, all
+figures from turbostat (`Busy%`, `Bzy_MHz`, `PkgWatt`, `CorWatt`, `GFXWatt`).
+
+### C — `max_freq` binds. Decisively.
+
+```
+uncapped      act median 1950   max 1950   cur_freq 2500
+capped 1200   act median 1200   max 1200   cur_freq 1200
+```
+
+Exact, with `awake 150/150` in both — effect2d fullscreen saturates and the GT never
+drops to RC6. **This settles the direction question**: lowering the DVFS ceiling is
+honoured where raising the floor is not. `min_freq` at 2500 is still inert; `max_freq`
+is a real control. The GUI row and `gpu_max_mhz` stay.
+
+### D — the clamp is graduated, but only slightly
+
+| | `Bzy_MHz` | `CorWatt` | `GFXWatt` | bogo-ops |
+|---|---|---|---|---|
+| GPU capped 1200 + 12 threads | 2453 | 28.59 | 3.51 | 319,625 |
+| GPU free + 12 threads | 2362 | 27.10 | 4.01 | 304,705 |
+| **GPU idle** + 12 threads | **2861** | **37.49** | 0.00 | **386,675** |
+
+Capping the GPU buys the CPU **+4.9% throughput**, +1.5 W and +91 MHz — three
+independent metrics moving together, so it is a real effect rather than noise. **This
+falsifies "fixed reservation" as an absolute.**
+
+But the recoverable share is small. An active GPU costs the CPU **-21%** against idle,
+and crushing the GT from 1950 to 1200 MHz — a 38% clock sacrifice — returns about a
+fifth of that. So `gpu_max_mhz` is a poor trade in most cases, and **worth exactly
+nothing when the GPU is idle**, which is the emulation case `retro` exists for. It stays
+a control, and stays out of the shipped profiles.
+
+### E — parking has both mechanisms, and the microbenchmark only saw the weaker one
+
+```
+E1: CPU residency: cpu10(E) 100%
+```
+
+**A single hot thread ran entirely on an E-core**, at a 3.7 GHz ceiling instead of 4.8.
+That is the pathology the whole `retro` argument rests on, observed directly rather than
+inferred from a game's frame counters.
+
+```
+E2  all 16 online   Bzy_MHz 3991   bogo 39,357
+    LP-E parked     Bzy_MHz 4000   bogo 39,903   +1.4%
+    P-cores only    Bzy_MHz 4177   bogo 40,218   +2.2%
+```
+
+**Read E2 carefully.** Its baseline ran at 3991 MHz — *above* the E-core ceiling — so
+that run landed on a P-core. E2 therefore measured the **budget** mechanism only, and
+never captured the placement one E1 had just demonstrated. The placement win is larger
+and intermittent, and a microbenchmark that happens to get lucky cannot see it. This is
+why Phase 5 judges on a real title and not on bogo-ops.
+
+So parking is worth ~2% reliably, plus an occasional ~23% on whichever thread would
+otherwise have been stranded on an E-core. `retro` keeping `lpe` as its default is
+unchanged by this: `p-only` measured better here (+2.2% against +1.4%) but the margin is
+inside what one run can distinguish, and the RPCS3 argument against it is untouched.
+
+### The contradiction this run opened
+
+**`CorWatt` reads 27.10 W with an active GPU. This file and CLAUDE.md record the core
+clamp as ~11 W**, and state that it is the same size whether the GPU draws 4 W or 22 W.
+Package here is 34.26 W against a recorded **18.48 W** for nominally the same
+`stress-ng --cpu 12` + vkmark at PL1 35 W on mains.
+
+Not resolved, and deliberately not overwritten. The likeliest explanation is GPU load
+*character* — effect2d draws only 3.5 W at 1950 MHz because it is bandwidth-bound, where
+FurMark's ALU-dense load took 21.74 W — but the recorded claim is precisely that load
+character does **not** matter, so that hypothesis contradicts the thing it would explain.
+One of the two runs is measuring something other than what it says.
+
+**Next step if this is picked up:** repeat D with FurMark in place of vkmark, on mains at
+PL1 35 W, and read `CorWatt` directly rather than inferring cores from the package total.
+The earlier figure came from a different instrument, and a package total was already
+responsible for one invented phenomenon in this project's history.
+
 ## 4. The case for core parking, restated
 
 The original's reason (idle leakage) is wrong. The real one is **scheduler placement**,

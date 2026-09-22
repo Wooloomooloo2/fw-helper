@@ -45,6 +45,23 @@ $CTL profile >/dev/null 2>&1 || {
 }
 [ -d "$SOTTR" ] || { echo "!! no SOTTR output directory at $SOTTR"; exit 1; }
 
+# The daemon can be live, answering, and still be a build that has never heard of the
+# profile this benchmark is built on. Check the thing we actually depend on, and check
+# the binary behind it -- `apt`/`install` both no-op silently on an unchanged version,
+# so the install log is not evidence.
+if ! $CTL profile 2>/dev/null | grep -qE '^\*?\s*retro$'; then
+  echo "!! the running fw-helperd does not know the \`retro\` profile, so this"
+  echo "!! benchmark cannot fix its baseline. It is serving an older binary:"
+  echo "!!   cargo build --release --all && sudo ./scripts/install-dev.sh --systemd"
+  exit 1
+fi
+if [ -r /usr/libexec/fw-helperd ] && [ -r "$REPO/target/release/fw-helperd" ]; then
+  a=$(md5sum /usr/libexec/fw-helperd | cut -d' ' -f1)
+  b=$(md5sum "$REPO/target/release/fw-helperd" | cut -d' ' -f1)
+  [ "$a" = "$b" ] || echo "   note: installed fw-helperd differs from target/release/ -- \
+you are benchmarking the installed one"
+fi
+
 mkdir -p "$OUT"
 
 echo "== arm: $ARM"

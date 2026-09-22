@@ -658,7 +658,7 @@ process and it paints into the frame before presentation. fw-helper feeds MangoH
 than competing with it, and supplies the GPU figure MangoHud cannot produce here at all
 (its Intel path is i915-only; this board is `xe`).
 
-### M9 — Two game profiles, and a way to benchmark them  ⬜ not started
+### M9 — Two game profiles, and a way to benchmark them  🟡 levers built and verified; profiles outstanding
 
 **Read [framework_gaming_profile.md](framework_gaming_profile.md) first** for the corrected
 lever set and the measured CPU topology.
@@ -704,7 +704,7 @@ sudo systemctl stop fw-helperd && sudo ./scratchpad/tune-levers-probe.sh 2>&1 | 
 firmware, never as a slider that does nothing. Core parking and `scaling_max_freq` proceed
 regardless — Phase 0 cannot invalidate those.
 
-#### Phase 1 — `fw-helper-core/src/tune.rs`  ⬜
+#### Phase 1 — `fw-helper-core/src/tune.rs`  ✅
 
 Zero-dependency, `Sysfs`-rooted, fixture-tested (ADR 0004, ADR 0010).
 
@@ -755,7 +755,7 @@ Expected: parity on fps, meaningfully quieter and cooler. Say that in the UI.
 and would likely *lose* at `p-only`. That is precisely why this is three levels and a
 benchmark rather than one switch.
 
-#### Phase 3 — daemon, and **ADR 0014**  ⬜
+#### Phase 3 — daemon, and **ADR 0014**  ✅ verified on hardware
 
 The M2 five-step pattern without exception: polkit per action failing closed, validate
 range before checking support, write then **read back and verify**, persist, re-apply on
@@ -771,7 +771,7 @@ the hook for the suspend leg.
 Also inherited: applying a profile re-takes the fan, and an AC/battery transition
 re-applies the profile.
 
-#### Phase 4 — GUI  ⬜
+#### Phase 4 — GUI  ✅
 
 Profile selection already exists; `game` and `retro` appear in it for free. What is new is
 a small **Tuning** group on the existing Control page — park level, GPU cap — rather than a
@@ -799,7 +799,14 @@ sysfs.
 
 ---
 
-**Resume next session at Phase 0.**
+**Verified on hardware 2026-09-22**, through the packaged daemon: topology discovered
+correctly (P 0-3 @4800, E 4-11 @3700, LP-E 12-15 @3300, `cpu0` unparkable), all three
+park levels applied, the GPU capped to 1200, and — the check that matters — after
+`pkill -9` while holding `p-only` and the cap, `ExecStopPost` re-onlined 12 cores and
+lifted the cap **in the same second as the kill**. Two defects found doing it, both
+fixed and both now regression-tested: see ADR 0014's "What this cost to learn".
+
+**Resume next session at Phase 0, then Phase 2.**
 
 ---
 

@@ -11,6 +11,12 @@ use zbus::zvariant::OwnedValue;
 
 /// A recorded session on the wire: `(name, label, path, started_unix, bytes)`.
 /// Decoded into [`SessionInfo`] the moment it arrives.
+/// One CPU cluster: `(name, cpus, max_mhz, parkable_count)`.
+///
+/// `parkable_count` is below `cpus.len()` wherever `cpu0` is in the cluster — the
+/// kernel exposes no `online` file for the boot CPU, so it can never be parked.
+pub type ClusterTuple = (String, Vec<u32>, u32, u32);
+
 pub type SessionTuple = (String, String, String, u64, u64);
 
 /// The recording in progress on the wire: `(label, name, path, started_unix, samples)`.
@@ -144,6 +150,32 @@ pub trait Daemon {
     /// Set the sustained CPU power limit. May prompt via polkit.
     fn set_power_limit(&self, watts: u32) -> zbus::Result<()>;
 
+    /// CPU clusters as `(name, cpus, max_mhz, parkable)`. Discovered by the daemon —
+    /// never hardcode "P is 0-3", the numbering is not a promise.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn cpu_clusters(&self) -> zbus::Result<Vec<ClusterTuple>>;
+
+    /// `(requested, observed)` park level. `observed` is `mixed` when cores were
+    /// offlined by hand.
+    #[zbus(property)]
+    fn park_level(&self) -> zbus::Result<(String, String)>;
+
+    /// Park CPU cores: `none`, `lpe`, `p-only`. May prompt via polkit.
+    fn set_park_level(&self, level: &str) -> zbus::Result<()>;
+
+    /// `(min, max, rpn, rp0)` MHz for the render GT.
+    #[zbus(property)]
+    fn gpu_freq_window(&self) -> zbus::Result<(u32, u32, u32, u32)>;
+
+    /// `(requested, achieved)` MHz — `cur_freq` and `act_freq`. **Different numbers**:
+    /// the first is the DVFS ask and reads a constant 2500 here, the second is what
+    /// happened. `act_freq` reads 0 in RC6.
+    #[zbus(property)]
+    fn gpu_clocks(&self) -> zbus::Result<(u32, u32)>;
+
+    /// Cap the GPU's maximum frequency in MHz, or 0 for the full range.
+    fn set_gpu_max_freq(&self, mhz: u32) -> zbus::Result<()>;
+
     /// The active curve as (temperature, duty) pairs; empty when none is running.
     #[zbus(property(emits_changed_signal = "false"))]
     fn fan_curve(&self) -> zbus::Result<Vec<(f64, u8)>>;
@@ -229,6 +261,16 @@ pub struct Snapshot {
     pub saved_profiles: Vec<String>,
     /// Profiles applied on each power source, empty when off.
     pub auto_profiles: (String, String),
+    /// CPU clusters as `(name, cpus, max_mhz, parkable)`, fastest first.
+    pub cpu_clusters: Vec<ClusterTuple>,
+    /// `(requested, observed)` park level; `observed` is `mixed` when someone offlined
+    /// cores by hand.
+    pub park_level: (String, String),
+    /// `(min, max, rpn, rp0)` MHz for the render GT; all zero when there is no GT.
+    pub gpu_freq_window: (u32, u32, u32, u32),
+    /// `(requested, achieved)` GPU MHz — `cur_freq` and `act_freq`. Showing the first
+    /// as "the GPU clock" is the error four separate tools make on this board.
+    pub gpu_clocks: (u32, u32),
     /// True on mains, false on battery, `None` when unknown.
     pub on_ac: Option<bool>,
     /// Whole-machine draw in watts, measurable only while on battery.
@@ -374,6 +416,10 @@ impl Snapshot {
             profiles: d.profiles().unwrap_or_default(),
             saved_profiles: d.saved_profiles().unwrap_or_default(),
             auto_profiles: d.auto_profiles().unwrap_or_default(),
+            cpu_clusters: d.cpu_clusters().unwrap_or_default(),
+            park_level: d.park_level().unwrap_or_default(),
+            gpu_freq_window: d.gpu_freq_window().unwrap_or_default(),
+            gpu_clocks: d.gpu_clocks().unwrap_or_default(),
             on_ac: t.get("on_ac").and_then(as_bool),
             system_watts: t.get("system_watts").and_then(as_f64),
             battery_wh: t.get("battery_wh").and_then(as_f64),

@@ -5,6 +5,7 @@
 //! in CI. The fixture mirrors the real values captured in docs/hardware-baseline.md.
 
 use fw_helper_core::fan::MIN_TAKEOVER_DUTY;
+use fw_helper_core::tune::{Cluster, CoreParking, CoreSet, GpuFreq, ParkLevel, TuneError};
 use fw_helper_core::{Capabilities, FanControl, FanError, FanMode, Monitor, Sysfs};
 use std::fs;
 use std::path::PathBuf;
@@ -335,4 +336,200 @@ fn prefers_the_energy_family_where_the_board_reports_it() {
 
     assert_eq!(t.system_watts, Some(9.0));
     assert_eq!(t.battery_minutes, Some(300), "45 Wh at 9 W is five hours");
+}
+
+// ---------------------------------------------------------------------------------
+// M9 — core parking and GPU frequency
+// ---------------------------------------------------------------------------------
+
+/// The reference machine's topology, as measured 2026-09-22: no SMT, P 0-3 (core_id
+/// 0/4/8/12 at 4.7-4.8 GHz), E 4-11 (16-23 at 3.7), LP-E 12-15 (32-35 at 3.3), and
+/// **cpu0 with no `online` file at all**.
+fn with_hybrid_cpus(f: &Fixture) {
+    f.write("sys/devices/cpu_core/cpus", "0-3\n");
+    f.write("sys/devices/cpu_atom/cpus", "4-15\n");
+    let spec: [(u32, u32, u32); 16] = [
+        (0, 0, 4700000),
+        (1, 4, 4800000),
+        (2, 8, 4700000),
+        (3, 12, 4700000),
+        (4, 16, 3700000),
+        (5, 17, 3700000),
+        (6, 18, 3700000),
+        (7, 19, 3700000),
+        (8, 20, 3700000),
+        (9, 21, 3700000),
+        (10, 22, 3700000),
+        (11, 23, 3700000),
+        (12, 32, 3300000),
+        (13, 33, 3300000),
+        (14, 34, 3300000),
+        (15, 35, 3300000),
+    ];
+    for (n, core_id, khz) in spec {
+        f.write(
+            &format!("sys/devices/system/cpu/cpu{n}/topology/core_id"),
+            &format!("{core_id}\n"),
+        );
+        f.write(
+            &format!("sys/devices/system/cpu/cpu{n}/cpufreq/cpuinfo_max_freq"),
+            &format!("{khz}\n"),
+        );
+        // cpu0 deliberately has none: the kernel pins the boot CPU.
+        if n != 0 {
+            f.write(&format!("sys/devices/system/cpu/cpu{n}/online"), "1\n");
+        }
+    }
+}
+
+/// The GPU is `card1`, not card0, and `xe` names its nodes nothing like i915.
+fn with_xe_gpu(f: &Fixture) {
+    f.write("sys/class/drm/card0/dev", "226:0\n"); // a display-only node, no GT
+    let gt = "sys/class/drm/card1/device/tile0/gt0/freq0";
+    f.write(&format!("{gt}/max_freq"), "2500\n");
+    f.write(&format!("{gt}/min_freq"), "900\n");
+    f.write(&format!("{gt}/cur_freq"), "2500\n");
+    f.write(&format!("{gt}/act_freq"), "1850\n");
+    f.write(&format!("{gt}/rp0_freq"), "2500\n");
+    f.write(&format!("{gt}/rpe_freq"), "900\n");
+    f.write(&format!("{gt}/rpn_freq"), "100\n");
+}
+
+#[test]
+fn discovers_three_clusters_without_trusting_cpu_numbers() {
+    let f = Fixture::framework_13("topology");
+    with_hybrid_cpus(&f);
+    let set = CoreSet::probe(&f.sysfs());
+
+    assert_eq!(set.cpus().len(), 16);
+    assert_eq!(set.clusters(), vec![Cluster::P, Cluster::E, Cluster::LpE]);
+    assert_eq!(set.in_cluster(Cluster::P).len(), 4);
+    assert_eq!(set.in_cluster(Cluster::E).len(), 8);
+    assert_eq!(set.in_cluster(Cluster::LpE).len(), 4);
+    assert_eq!(set.in_cluster(Cluster::LpE)[0].num, 12);
+}
+
+#[test]
+fn cpu0_is_never_parkable() {
+    let f = Fixture::framework_13("cpu0");
+    with_hybrid_cpus(&f);
+    let set = CoreSet::probe(&f.sysfs());
+
+    let cpu0 = set.cpus().iter().find(|c| c.num == 0).unwrap();
+    assert!(
+        !cpu0.parkable,
+        "cpu0 has no online file and must not be offered"
+    );
+    assert!(set.cpus().iter().filter(|c| c.num != 0).all(|c| c.parkable));
+}
+
+#[test]
+fn park_levels_select_the_right_clusters() {
+    let f = Fixture::framework_13("levels");
+    with_hybrid_cpus(&f);
+    let set = CoreSet::probe(&f.sysfs());
+
+    assert!(set.to_park(ParkLevel::None).is_empty());
+    assert_eq!(set.to_park(ParkLevel::Lpe), vec![12, 13, 14, 15]);
+    assert_eq!(
+        set.to_park(ParkLevel::PCoresOnly),
+        vec![4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    );
+}
+
+#[test]
+fn parking_round_trips_and_reads_back() {
+    let f = Fixture::framework_13("park");
+    with_hybrid_cpus(&f);
+    let fs = f.sysfs();
+    let park = CoreParking::new(&fs);
+    assert!(park.is_supported());
+    assert_eq!(park.read(), Some(ParkLevel::None));
+
+    park.apply(ParkLevel::PCoresOnly).unwrap();
+    assert_eq!(park.read(), Some(ParkLevel::PCoresOnly));
+    assert!(!park.is_online(4));
+    assert!(park.is_online(0), "cpu0 must survive every level");
+    assert!(park.is_online(3));
+
+    // Transitioning between two parked levels must not dip below either.
+    park.apply(ParkLevel::Lpe).unwrap();
+    assert_eq!(park.read(), Some(ParkLevel::Lpe));
+    assert!(park.is_online(4));
+    assert!(!park.is_online(12));
+
+    park.restore_all().unwrap();
+    assert_eq!(park.read(), Some(ParkLevel::None));
+}
+
+#[test]
+fn a_hand_offlined_core_reads_as_mixed_not_a_level() {
+    let f = Fixture::framework_13("mixed");
+    with_hybrid_cpus(&f);
+    let fs = f.sysfs();
+    fs.write_string("sys/devices/system/cpu/cpu7/online", "0")
+        .unwrap();
+
+    // Reported, not silently corrected — the user may have done it deliberately.
+    assert_eq!(CoreParking::new(&fs).read(), None);
+}
+
+#[test]
+fn gpu_freq_resolves_card1_and_not_card0() {
+    let f = Fixture::framework_13("gpu");
+    with_xe_gpu(&f);
+    let fs = f.sysfs();
+    let gpu = GpuFreq::new(&fs);
+
+    assert!(gpu.is_supported());
+    assert!(gpu.path().unwrap().contains("card1"), "{:?}", gpu.path());
+    assert_eq!(gpu.range(), Some((100, 2500)));
+    // The distinction four separate tools get wrong.
+    assert_eq!(gpu.requested(), Some(2500));
+    assert_eq!(gpu.achieved(), Some(1850));
+}
+
+#[test]
+fn gpu_cap_lowers_the_floor_with_the_ceiling() {
+    let f = Fixture::framework_13("gpucap");
+    with_xe_gpu(&f);
+    let fs = f.sysfs();
+    let gpu = GpuFreq::new(&fs);
+
+    // min_freq starts at 900; a 1200 cap leaves it alone.
+    gpu.set_max(1200).unwrap();
+    assert_eq!(gpu.max(), Some(1200));
+    assert_eq!(gpu.min(), Some(900));
+
+    // A cap below the floor must drag the floor down, or the kernel rejects it.
+    gpu.set_max(500).unwrap();
+    assert_eq!(gpu.max(), Some(500));
+    assert_eq!(gpu.min(), Some(500));
+
+    gpu.reset().unwrap();
+    assert_eq!(gpu.max(), Some(2500));
+    assert_eq!(gpu.min(), Some(900), "reset returns min to rpe, not rpn");
+}
+
+#[test]
+fn gpu_cap_refuses_a_frequency_the_hardware_has_no_word_for() {
+    let f = Fixture::framework_13("gpurange");
+    with_xe_gpu(&f);
+    let fs = f.sysfs();
+    let err = GpuFreq::new(&fs).set_max(4000).unwrap_err();
+    assert!(matches!(err, TuneError::OutOfRange { .. }), "{err}");
+    assert!(err.to_string().contains("2500"), "{err}");
+}
+
+#[test]
+fn no_gpu_is_a_reason_not_a_panic() {
+    let f = Fixture::framework_13("nogpu");
+    let fs = f.sysfs();
+    let gpu = GpuFreq::new(&fs);
+    assert!(!gpu.is_supported());
+    assert!(gpu.range().is_none());
+    assert!(matches!(
+        gpu.set_max(1200).unwrap_err(),
+        TuneError::Unsupported(_)
+    ));
 }

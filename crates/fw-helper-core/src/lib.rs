@@ -18,6 +18,7 @@ pub mod profile;
 pub mod session;
 pub mod sysfs;
 pub mod telemetry;
+pub mod tune;
 pub mod usage;
 
 pub use battery::BatteryGuard;
@@ -34,6 +35,7 @@ pub use profile::{Ppd, Profile};
 pub use session::{Recorder, Row, Session, SessionMeta};
 pub use sysfs::Sysfs;
 pub use telemetry::{Monitor, Telemetry, PACKAGE_TEMP_LABEL};
+pub use tune::{Cluster, CoreParking, CoreSet, Cpu, GpuFreq, ParkLevel, TuneError};
 pub use usage::{Usage, UsageSampler};
 
 /// Sysfs paths this crate knows about, relative to the [`Sysfs`] root.

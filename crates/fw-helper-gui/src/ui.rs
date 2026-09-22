@@ -79,6 +79,7 @@ struct Widgets {
     system_group: adw::PreferencesGroup,
     save_group: adw::PreferencesGroup,
     auto_group: adw::PreferencesGroup,
+    tuning_group: adw::PreferencesGroup,
     curve: Rc<crate::curve::CurveEditor>,
     monitor: Rc<crate::monitor::MonitorPage>,
     // Controls. Each is refreshed from telemetry, which means every update would
@@ -91,6 +92,14 @@ struct Widgets {
     fan_auto: gtk::Button,
     auto_ac: adw::ComboRow,
     auto_batt: adw::ComboRow,
+    park_row: adw::ComboRow,
+    /// Park levels in the order the combo lists them, so a selection maps back to a
+    /// name without the UI hardcoding an index.
+    park_levels: Vec<&'static str>,
+    gpu_freq_row: adw::SpinRow,
+    /// The GT's own ceiling (`rp0_freq`), kept so "no cap" can be recognised: the
+    /// daemon reports the window, not a flag, and max == rp0 is what uncapped means.
+    gpu_rp0: u32,
     save_entry: adw::EntryRow,
     delete_button: gtk::Button,
     saved_profiles: Vec<String>,
@@ -171,6 +180,41 @@ pub fn build(app: &adw::Application) {
         .build();
     let fan_row = adw::ActionRow::builder().title("Fan").build();
     fan_row.add_suffix(&fan_auto);
+
+    // M9. Both rows are honest about being unproven: the park level has a measured
+    // justification (a hot thread on a slow core) but no measured *result* yet, and the
+    // GPU cap has neither. See docs/framework_gaming_profile.md.
+    let park_levels = vec!["none", "lpe", "p-only"];
+    let park_row = adw::ComboRow::builder()
+        .title("CPU cores")
+        .subtitle("park the slower clusters so a hot thread lands on a P-core")
+        .model(&gtk::StringList::new(&[
+            "All cores",
+            "Park LP-E",
+            "P-cores only",
+        ]))
+        .build();
+
+    let gpu_freq_row = adw::SpinRow::builder()
+        .title("GPU clock ceiling")
+        .subtitle("cap the GT to free package budget; full range when at maximum")
+        .adjustment(&gtk::Adjustment::new(
+            2500.0, 100.0, 2500.0, 50.0, 100.0, 0.0,
+        ))
+        .build();
+
+    let tuning_group = adw::PreferencesGroup::builder()
+        .title("Tuning")
+        .description(
+            "Per-workload levers, for older games and emulation. Parking the Atom \
+             clusters forces a single hot thread onto a 4.8 GHz P-core instead of a \
+             3.3 GHz one — the case where a game reports itself CPU-bound while no \
+             core looks busy. Both settings are returned to normal whenever the \
+             daemon stops.",
+        )
+        .build();
+    tuning_group.add(&park_row);
+    tuning_group.add(&gpu_freq_row);
 
     // Automatic switching. Off unless asked for, and "leave alone" is a real choice on
     // each side rather than a disguised default.
@@ -257,6 +301,7 @@ pub fn build(app: &adw::Application) {
     let left = column();
     left.append(&stats);
     left.append(&system_group);
+    left.append(&tuning_group);
     left.append(&save_group);
     left.append(&auto_group);
 
@@ -367,7 +412,7 @@ pub fn build(app: &adw::Application) {
     // Nothing is operable until a snapshot says so. Building these live means the
     // window is briefly - or, with no daemon installed, permanently - a set of
     // controls that accept input and silently discard it.
-    for group in [&system_group, &save_group, &auto_group] {
+    for group in [&system_group, &tuning_group, &save_group, &auto_group] {
         group.set_sensitive(false);
     }
 
@@ -402,8 +447,13 @@ pub fn build(app: &adw::Application) {
         system_group,
         save_group,
         auto_group,
+        tuning_group,
         curve: Rc::clone(&curve_editor),
         monitor: Rc::clone(&monitor),
+        park_row: park_row.clone(),
+        park_levels,
+        gpu_freq_row: gpu_freq_row.clone(),
+        gpu_rp0: 0,
         cpu_load: cpu_load.clone(),
         cpu_load_caption: cpu_load_caption.clone(),
         gpu_load: gpu_load.clone(),
@@ -469,6 +519,43 @@ pub fn build(app: &adw::Application) {
         let tx = commands.clone();
         fan_auto.connect_clicked(move |_| {
             let _ = tx.send(Command::FanAuto);
+        });
+    }
+    {
+        let w = Rc::clone(&widgets);
+        let tx = commands.clone();
+        park_row.connect_selected_notify(move |row| {
+            trace(&format!("park selected_notify -> {}", row.selected()));
+            // Same borrow-as-guard reasoning as every other control here: a failed
+            // borrow means this is our own write from telemetry, not the user's click.
+            let Ok(w) = w.try_borrow() else {
+                trace("park: skipped, our own write");
+                return;
+            };
+            let Some(level) = w.park_levels.get(row.selected() as usize) else {
+                return;
+            };
+            // Not debounced: a combo produces one event per choice, and parking twelve
+            // cores is slow enough that coalescing would only hide it.
+            let _ = tx.send(Command::ParkLevel((*level).to_string()));
+        });
+    }
+    {
+        let w = Rc::clone(&widgets);
+        let tx = commands.clone();
+        gpu_freq_row.connect_value_notify(move |row| {
+            trace(&format!("gpu freq value_notify -> {}", row.value()));
+            if w.try_borrow().is_err() {
+                trace("gpu freq: skipped, our own write");
+                return;
+            }
+            let mhz = row.value() as u32;
+            // At the top of the range the user is asking for no cap, which the daemon
+            // spells 0. Sending rp0 instead would leave a cap in place that happens to
+            // equal the ceiling, and the restore path would then have something to undo.
+            let rp0 = w.borrow().gpu_rp0;
+            let value = if rp0 != 0 && mhz >= rp0 { 0 } else { mhz };
+            debounce(&w, &tx, "gpufreq", move || Command::GpuMaxFreq(value));
         });
     }
     for which in ["ac", "battery"] {
@@ -564,6 +651,10 @@ fn expected(cmd: &Command) -> String {
         Command::FanAuto => "auto".to_string(),
         Command::FanCurve(_) => "curve".to_string(),
         Command::AutoProfiles(ac, batt) => format!("{ac}/{batt}"),
+        Command::ParkLevel(level) => level.clone(),
+        // 0 means "no cap", which the daemon reports back as max == rp0 rather than as
+        // a zero, so the two have to be spelled the same way here.
+        Command::GpuMaxFreq(mhz) => mhz.to_string(),
         Command::SaveProfile(name) | Command::DeleteProfile(name) => name.clone(),
         // Nothing to wait for: the recording controls are driven directly by what the
         // daemon reports it is recording, so there is no widget to hold meanwhile.
@@ -656,6 +747,17 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
         (
             "charge",
             s.charge_limit.map(|v| v.to_string()).unwrap_or_default(),
+        ),
+        ("park", s.park_level.0.clone()),
+        (
+            "gpufreq",
+            // Uncapped is reported as max == rp0, and requested as 0. Normalise, or a
+            // "remove the cap" command would never be seen to land and the row would
+            // sit held until the timeout.
+            match (s.gpu_freq_window.1, s.gpu_freq_window.3) {
+                (max, rp0) if rp0 != 0 && max >= rp0 => "0".to_string(),
+                (max, _) => max.to_string(),
+            },
         ),
     ];
     for (key, now) in observed {
@@ -762,6 +864,62 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
         }
     }
 
+    // ------------------------------------------------------------------------------
+    // M9 — parking and the GPU ceiling
+    // ------------------------------------------------------------------------------
+    let park_busy = w.in_flight.contains_key("park");
+    let parkable: u32 = s.cpu_clusters.iter().map(|(_, _, _, n)| n).sum();
+    if s.cpu_clusters.len() > 1 && parkable > 0 {
+        w.park_row.set_sensitive(true);
+        // Name the clusters the daemon actually found rather than assuming this part's
+        // shape; a machine with two tiers should not be told about a third.
+        let shape: Vec<String> = s
+            .cpu_clusters
+            .iter()
+            .map(|(name, cpus, mhz, _)| format!("{}x{name} {mhz}MHz", cpus.len()))
+            .collect();
+        w.park_row.set_subtitle(&match s.park_level.1.as_str() {
+            // A state no level describes: someone offlined cores by hand. Say so
+            // rather than showing whichever entry happens to be selected.
+            "mixed" => format!("{} — some cores were offlined by hand", shape.join(", ")),
+            _ => shape.join(", "),
+        });
+        if !park_busy {
+            if let Some(i) = w.park_levels.iter().position(|l| *l == s.park_level.0) {
+                w.park_row.set_selected(i as u32);
+            }
+        }
+    } else {
+        w.park_row.set_sensitive(false);
+        w.park_row
+            .set_subtitle("no hybrid CPU topology here, so there is nothing useful to park");
+    }
+
+    let gpu_busy = w.pending.contains_key("gpufreq") || w.in_flight.contains_key("gpufreq");
+    let (_, gpu_max, gpu_rpn, gpu_rp0) = s.gpu_freq_window;
+    if gpu_rp0 > 0 {
+        w.gpu_rp0 = gpu_rp0;
+        w.gpu_freq_row.adjustment().set_lower(f64::from(gpu_rpn));
+        w.gpu_freq_row.adjustment().set_upper(f64::from(gpu_rp0));
+        if !gpu_busy {
+            w.gpu_freq_row.set_value(f64::from(gpu_max));
+        }
+        w.gpu_freq_row.set_sensitive(true);
+        // Show both clocks, because the difference is the whole point: cur_freq is the
+        // DVFS request and reads a constant 2500 here under load, act_freq is what
+        // happened, and act_freq reads 0 whenever the GT is parked in RC6.
+        let (req, act) = s.gpu_clocks;
+        w.gpu_freq_row.set_subtitle(&match (req, act) {
+            (0, _) => "cap the GT to free package budget".to_string(),
+            (r, 0) => format!("asking {r} MHz; GT parked"),
+            (r, a) => format!("asking {r} MHz, reaching {a} MHz"),
+        });
+    } else {
+        w.gpu_freq_row.set_sensitive(false);
+        w.gpu_freq_row
+            .set_subtitle("no xe GT frequency controls found under /sys/class/drm");
+    }
+
     // The auto-switch combos list "leave alone" first, then every profile.
     if names_changed {
         let mut entries: Vec<&str> = vec!["leave alone"];
@@ -799,7 +957,9 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
     if std::env::var_os("FW_HELPER_DEBUG_WIDGETS").is_some() {
         eprintln!(
             "widgets: profile sensitive={} model={} selected={} | auto_ac model={} \
-             | power sensitive={} | charge sensitive={} | fan_auto sensitive={}",
+             | power sensitive={} | charge sensitive={} | fan_auto sensitive={}\n\
+             widgets: park sensitive={} selected={} sub={:?} | gpu sensitive={} \
+             value={} range={}..{} sub={:?}",
             w.profile_row.is_sensitive(),
             w.profile_row.model().map(|m| m.n_items()).unwrap_or(0),
             w.profile_row.selected(),
@@ -807,6 +967,20 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
             w.power_row.is_sensitive(),
             w.charge_row.is_sensitive(),
             w.fan_auto.is_sensitive(),
+            w.park_row.is_sensitive(),
+            w.park_row.selected(),
+            w.park_row
+                .subtitle()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            w.gpu_freq_row.is_sensitive(),
+            w.gpu_freq_row.value(),
+            w.gpu_freq_row.adjustment().lower(),
+            w.gpu_freq_row.adjustment().upper(),
+            w.gpu_freq_row
+                .subtitle()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
         );
     }
 }
@@ -1002,6 +1176,7 @@ fn set_controls_live(w: &Widgets, live: bool) {
     w.system_group.set_sensitive(live);
     w.save_group.set_sensitive(live);
     w.auto_group.set_sensitive(live);
+    w.tuning_group.set_sensitive(live);
     w.curve.set_live(live);
 }
 

@@ -6,6 +6,7 @@
 //! 0400 (the PLATYPUS mitigation, ADR 0009).
 
 use fw_helper_client::{connect, DaemonProxyBlocking, SessionInfo, Snapshot, SUPPORTED_VERSION};
+use fw_helper_core::tune::{CoreParking, GpuFreq, ParkLevel};
 use fw_helper_core::{Monitor, Sysfs};
 use std::thread::sleep;
 use std::time::Duration;
@@ -34,6 +35,9 @@ USAGE:
     fw-helperctl record stop       stop recording
     fw-helperctl record rm NAME    delete a recorded session
     fw-helperctl hud               one status line, for an in-game overlay
+    fw-helperctl tune              CPU clusters and GPU frequency, as discovered
+    fw-helperctl tune park LEVEL   park cores: none | lpe | p-only
+    fw-helperctl tune gpu MHZ      cap the GPU clock; 0 for the full range
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -60,6 +64,10 @@ fn main() {
             args.get(2).map(String::as_str),
         ),
         Some("hud") => hud(),
+        Some("tune") => tune(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
         Some("-h") | Some("--help") => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -746,4 +754,138 @@ fn describe(e: impl std::fmt::Display) -> String {
         Some((_, rest)) if !rest.is_empty() => rest.to_string(),
         _ => text,
     }
+}
+
+/// Read-only view of the M9 levers, straight from sysfs.
+///
+/// Deliberately not routed through the daemon: its job is to show what
+/// [`CoreSet::probe`] actually found on *this* machine, which is the one thing the
+/// fixtures cannot prove. Needs no privileges.
+fn tune(sub: Option<&str>, arg: Option<&str>) {
+    match (sub, arg) {
+        (None, _) => tune_show(),
+        (Some("park"), Some(level)) => tune_write("park level", |d| {
+            d.set_park_level(level).map_err(Into::into)
+        }),
+        (Some("gpu"), Some(mhz)) => match mhz.parse::<u32>() {
+            Ok(v) => tune_write("gpu cap", |d| d.set_gpu_max_freq(v).map_err(Into::into)),
+            Err(_) => {
+                eprintln!("expected a frequency in MHz, or 0 for the full range");
+                std::process::exit(2);
+            }
+        },
+        (Some("park"), None) => {
+            eprintln!("usage: fw-helperctl tune park none|lpe|p-only");
+            std::process::exit(2);
+        }
+        (Some("gpu"), None) => {
+            eprintln!("usage: fw-helperctl tune gpu MHZ   (0 for the full range)");
+            std::process::exit(2);
+        }
+        (Some(other), _) => {
+            eprintln!("unknown tune subcommand: {other}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Both writes need the daemon: parking a core and moving a GT window are root-only,
+/// and going behind the daemon would leave it holding a level it no longer has.
+fn tune_write<F>(what: &str, apply: F)
+where
+    F: FnOnce(&DaemonProxyBlocking<'_>) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let Ok((d, _)) = connect() else {
+        eprintln!("fw-helperd is not running; {what} needs it (these writes are root-only)");
+        std::process::exit(1);
+    };
+    if let Err(e) = apply(&d) {
+        eprintln!("{what}: {e}");
+        std::process::exit(1);
+    }
+    tune_show();
+}
+
+fn tune_show() {
+    let fs = Sysfs::new("/");
+
+    let park = CoreParking::new(&fs);
+    let set = park.core_set();
+    println!("CPU topology                                     (discovered, not assumed)");
+    if set.cpus().is_empty() {
+        println!("  none found under /sys/devices/system/cpu");
+    }
+    for cluster in set.clusters() {
+        let cpus = set.in_cluster(cluster);
+        let nums: Vec<String> = cpus
+            .iter()
+            .map(|c| {
+                let mut s = c.num.to_string();
+                if !c.parkable {
+                    s.push('*');
+                }
+                if !park.is_online(c.num) {
+                    s.push_str(" (parked)");
+                }
+                s
+            })
+            .collect();
+        // The cluster max, not the first core's: cpu1 boosts to 4800 where 0/2/3 reach 4700.
+        let mhz = cpus.iter().map(|c| c.max_khz / 1000).max().unwrap_or(0);
+        println!(
+            "  {:<5} x{:<2} {:>5} MHz   {}",
+            cluster.as_str(),
+            cpus.len(),
+            mhz,
+            nums.join(" ")
+        );
+    }
+    if set.cpus().iter().any(|c| !c.parkable) {
+        println!("  * cannot be parked — the kernel exposes no `online` file for it");
+    }
+
+    println!("\nPark levels");
+    for level in [ParkLevel::None, ParkLevel::Lpe, ParkLevel::PCoresOnly] {
+        let parked = set.to_park(level);
+        let left = set.cpus().len() - parked.len();
+        println!(
+            "  {:<8} parks {:<2} leaves {:>2} online",
+            level.as_str(),
+            parked.len(),
+            left
+        );
+    }
+    match park.read() {
+        Some(l) => println!("  current  {l}"),
+        None => println!("  current  mixed — some cores were offlined by hand"),
+    }
+
+    println!("\nGPU frequency");
+    let gpu = GpuFreq::new(&fs);
+    match gpu.path() {
+        None => println!("  no xe GT found under /sys/class/drm"),
+        Some(p) => {
+            println!("  node     /{p}");
+            if let Some((rpn, rp0)) = gpu.range() {
+                println!("  range    {rpn}-{rp0} MHz  (rpn_freq..rp0_freq)");
+            }
+            println!(
+                "  window   min {} max {} MHz",
+                fmt_mhz(gpu.min()),
+                fmt_mhz(gpu.max())
+            );
+            // The distinction that settled the whole "2.5 GHz" question.
+            println!(
+                "  clock    requested {} / achieved {}",
+                fmt_mhz(gpu.requested()),
+                fmt_mhz(gpu.achieved())
+            );
+            println!("           requested is cur_freq, the DVFS ask — it reads a constant");
+            println!("           2500 here. achieved is act_freq, and reads 0 in RC6.");
+        }
+    }
+}
+
+fn fmt_mhz(v: Option<u32>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
 }

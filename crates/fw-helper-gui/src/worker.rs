@@ -38,6 +38,8 @@ pub enum Command {
     StartRecording(String),
     StopRecording,
     DeleteSession(String),
+    ParkLevel(String),
+    GpuMaxFreq(u32),
 }
 
 impl Command {
@@ -58,6 +60,10 @@ impl Command {
             // Recording has no control to hold: the button's state comes straight from
             // the daemon's own report of what it is recording.
             Self::StartRecording(_) | Self::StopRecording | Self::DeleteSession(_) => "record",
+            // Separate keys: parking and the GPU cap are independent rows and a prompt
+            // for one must not freeze the other.
+            Self::ParkLevel(_) => "park",
+            Self::GpuMaxFreq(_) => "gpufreq",
         }
     }
 }
@@ -124,6 +130,20 @@ fn spawn_commands(tx: async_channel::Sender<Update>) -> std::sync::mpsc::Sender<
                     Command::DeleteSession(name) => d
                         .delete_session(&name)
                         .map(|()| format!("deleted {name}"))
+                        .map_err(describe),
+                    Command::ParkLevel(level) => d
+                        .set_park_level(&level)
+                        .map(|()| match level.as_str() {
+                            "none" => "all cores online".to_string(),
+                            other => format!("cores parked to {other}"),
+                        })
+                        .map_err(describe),
+                    Command::GpuMaxFreq(mhz) => d
+                        .set_gpu_max_freq(mhz)
+                        .map(|()| match mhz {
+                            0 => "GPU returned to its full range".to_string(),
+                            v => format!("GPU capped at {v} MHz"),
+                        })
                         .map_err(describe),
                     Command::AutoProfiles(ac, batt) => d
                         .set_auto_profiles(&ac, &batt)

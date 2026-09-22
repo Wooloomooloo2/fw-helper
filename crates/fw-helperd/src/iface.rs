@@ -5,8 +5,10 @@
 
 use crate::fan::FanLease;
 use crate::state::State;
+use crate::tuning::TuningLease;
 use crate::watchdog::Watchdog;
 use crate::{polkit, wire};
+use fw_helper_core::tune::ParkLevel;
 use fw_helper_core::{Capabilities, PowerLimit, Sysfs, Telemetry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,6 +50,9 @@ pub struct Shared {
     /// Set when a client reads telemetry, so the poll loop knows the GPU scan is
     /// worth its cost.
     pub watchers: Arc<crate::record::Watchers>,
+    /// Core parking and GPU frequency. Shared with `main`, which restores it on every
+    /// exit path — ADR 0014.
+    pub tuning: Arc<TuningLease>,
 }
 
 pub struct Daemon {
@@ -87,6 +92,9 @@ pub struct Daemon {
     usage: Mutex<fw_helper_core::Usage>,
     recording: Arc<crate::record::Recording>,
     watchers: Arc<crate::record::Watchers>,
+    /// Lock-free for the same reason `fan` is: the panic hook restores through it and
+    /// must not block (ADR 0014).
+    tuning: Arc<TuningLease>,
 }
 
 impl Daemon {
@@ -105,6 +113,7 @@ impl Daemon {
             usage: Mutex::new(fw_helper_core::Usage::default()),
             recording: shared.recording,
             watchers: shared.watchers,
+            tuning: shared.tuning,
         }
     }
 
@@ -722,6 +731,136 @@ impl Daemon {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------------
+    // M9 — core parking and GPU frequency (ADR 0014)
+    // ------------------------------------------------------------------------------
+
+    /// The CPU clusters this machine has, as `(name, cpus, max_mhz, parkable_count)`.
+    ///
+    /// Published rather than left to the client to discover, for the same reason the
+    /// capability list is: a GUI must not hardcode "P is 0-3". The reference part has
+    /// three clusters and no SMT, but this crate's job is to say what *this* machine
+    /// has. `parkable_count` is below `cpus` wherever `cpu0` is in the cluster.
+    #[zbus(property(emits_changed_signal = "false"))]
+    async fn cpu_clusters(&self) -> Vec<(String, Vec<u32>, u32, u32)> {
+        let set = self.tuning.core_set();
+        set.clusters()
+            .into_iter()
+            .map(|c| {
+                let cpus = set.in_cluster(c);
+                (
+                    c.as_str().to_string(),
+                    cpus.iter().map(|x| x.num).collect(),
+                    cpus.iter().map(|x| x.max_khz / 1000).max().unwrap_or(0),
+                    cpus.iter().filter(|x| x.parkable).count() as u32,
+                )
+            })
+            .collect()
+    }
+
+    /// `(requested, observed)` park level. They differ when someone has offlined cores
+    /// by hand, in which case `observed` is `mixed` — reported, never silently fixed.
+    #[zbus(property)]
+    async fn park_level(&self) -> (String, String) {
+        (
+            self.tuning.requested_level().to_string(),
+            self.tuning
+                .observed_level()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "mixed".into()),
+        )
+    }
+
+    /// Park CPU cores by cluster: `none`, `lpe`, or `p-only`.
+    ///
+    /// Measured justification, and it is placement rather than power: Horizon Zero Dawn
+    /// reports CPU FPS 34 against GPU FPS 45 while no thread exceeds 50% — a hot thread
+    /// on a slow core. Whether it also concentrates the power budget is M9 Phase 0
+    /// question E and is not yet answered.
+    async fn set_park_level(
+        &self,
+        level: String,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        // Validate before checking support, so a typo reports as a typo rather than as
+        // an unsupported machine.
+        let parsed = ParkLevel::parse(&level).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!(
+                "unknown park level {level:?}; expected none, lpe or p-only"
+            ))
+        })?;
+        if !self.tuning.parking_supported() {
+            return Err(zbus::fdo::Error::NotSupported(
+                "no hybrid CPU topology found, so there is nothing useful to park".into(),
+            ));
+        }
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_TUNING).await?;
+
+        self.tuning
+            .set_level(parsed)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        eprintln!("park level set to {parsed} by {sender}");
+        Ok(())
+    }
+
+    /// `(min, max, rpn, rp0)` for the render GT, all MHz. Zeros when there is no GT.
+    #[zbus(property)]
+    async fn gpu_freq_window(&self) -> (u32, u32, u32, u32) {
+        let (min, max) = self.tuning.gpu_window().unwrap_or((0, 0));
+        let (rpn, rp0) = self.tuning.gpu_range().unwrap_or((0, 0));
+        (min, max, rpn, rp0)
+    }
+
+    /// `(requested, achieved)` GPU clock in MHz — `cur_freq` and `act_freq`.
+    ///
+    /// **These are different numbers and the difference matters.** `cur_freq` is the
+    /// DVFS request and reads a constant 2500 on this board under load; `act_freq` is
+    /// what happened and reads 1850-1950. Mission Center, nvtop and turbostat's
+    /// `GFXMHz` all display the former, which is why four separate reports claimed this
+    /// GPU reaches 2.5 GHz. `act_freq` also reads 0 in RC6, published here as 0.
+    #[zbus(property)]
+    async fn gpu_clocks(&self) -> (u32, u32) {
+        let (req, act) = self.tuning.gpu_clocks();
+        (req.unwrap_or(0), act.unwrap_or(0))
+    }
+
+    /// Cap the GPU's maximum frequency in MHz, or 0 to hand the full range back.
+    ///
+    /// **Unproven on this hardware.** Lowering `max_freq` is at least the right
+    /// direction — *raising* `min_freq` to 2500 is already known to be honoured by the
+    /// driver and ignored by the silicon — but whether a cap binds is M9 Phase 0
+    /// question C. The control exists so that question can be answered through the app.
+    async fn set_gpu_max_freq(
+        &self,
+        mhz: u32,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        if let Some((rpn, rp0)) = self.tuning.gpu_range() {
+            if mhz != 0 && (mhz < rpn || mhz > rp0) {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "{mhz} MHz is outside the GPU's {rpn}-{rp0} MHz range"
+                )));
+            }
+        }
+        if !self.tuning.gpu_supported() {
+            return Err(zbus::fdo::Error::NotSupported(
+                "no xe GT frequency controls found under /sys/class/drm".into(),
+            ));
+        }
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_TUNING).await?;
+
+        self.tuning
+            .set_gpu_max((mhz != 0).then_some(mhz))
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        match mhz {
+            0 => eprintln!("gpu frequency cap cleared by {sender}"),
+            v => eprintln!("gpu capped at {v} MHz by {sender}"),
+        }
+        Ok(())
+    }
+
     /// Sustained CPU power limit in watts, or 0 when unsupported.
     #[zbus(property)]
     async fn power_limit(&self) -> u32 {
@@ -1064,6 +1203,7 @@ mod tests {
                 ec,
                 recording: Arc::new(crate::record::Recording::new()),
                 watchers: Arc::new(crate::record::Watchers::default()),
+                tuning: Arc::new(TuningLease::new(fs_.clone())),
             },
         )
     }

@@ -20,6 +20,7 @@ mod ppd;
 mod profiles;
 mod record;
 mod state;
+mod tuning;
 mod watchdog;
 mod wire;
 
@@ -69,7 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // no-op, because the cost of asking is one read.
     let lease = Arc::new(fan::FanLease::new(fs.clone()));
     lease.reclaim_at_startup();
-    install_panic_hook(Arc::clone(&lease));
+
+    // Same reasoning one lever along (ADR 0014): a previous instance that died parked
+    // leaves cores offline, and *nothing else on the machine will put them back*. The
+    // fan at least reverts when the EC takes it; an offline CPU does not. So restore
+    // unconditionally at startup, before anything can ask for a different level.
+    let tuning = Arc::new(tuning::TuningLease::new(fs.clone()));
+    reclaim_tuning(&tuning);
+
+    install_panic_hook(Arc::clone(&lease), Arc::clone(&tuning));
 
     let state = state::State::load();
     let state_power_limit = state.power_limit;
@@ -119,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ec: Arc::clone(&cros_ec),
             recording: Arc::clone(&recording),
             watchers: Arc::clone(&watchers),
+            tuning: Arc::clone(&tuning),
         },
     );
     daemon.reapply_charge_limit();
@@ -204,6 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     shut_down_fan(&lease, &watchdog);
+    shut_down_tuning(&tuning);
     // Nothing should read numbers from a daemon that has stopped. systemd's
     // RuntimeDirectory= covers the packaged case; this covers a daemon run by hand.
     record::clear_hud();
@@ -659,6 +670,51 @@ fn maybe_wedge(started: &std::time::Instant) {
 /// Reads before writing for the same reason M2's charge re-apply does: "we were not
 /// holding it" and "we were, and gave it back" are different facts, and a log line
 /// that cannot tell them apart cannot show that the restore paths work.
+/// Put cores and GPU frequency back on the way out.
+///
+/// Announced only when something was actually held, for the same reason the fan's is:
+/// "we were not holding it" and "we were, and gave it back" are different facts, and a
+/// log that cannot tell them apart cannot demonstrate that the restore path works.
+fn shut_down_tuning(tuning: &tuning::TuningLease) {
+    let held = tuning.holding();
+    if tuning.restore_now() {
+        if held {
+            eprintln!("restored all CPU cores and the GPU frequency window");
+        }
+    } else {
+        eprintln!(
+            "WARNING: could not restore every CPU core or the GPU frequency window. \
+             Check `fw-helperctl tune`"
+        );
+    }
+}
+
+/// At startup, undo anything a previous instance left behind.
+///
+/// Reads first so the log names what happened. A machine that boots with cores parked
+/// by a crashed daemon has no other route back: unlike the fan, no firmware takes over.
+fn reclaim_tuning(tuning: &tuning::TuningLease) {
+    let observed = tuning.observed_level();
+    let capped = tuning
+        .gpu_window()
+        .zip(tuning.gpu_range())
+        .is_some_and(|((_, max), (_, rp0))| max < rp0);
+    let parked = observed != Some(fw_helper_core::tune::ParkLevel::None);
+    if !parked && !capped {
+        return;
+    }
+    eprintln!(
+        "startup: found cores at {} and the GPU window {}; restoring",
+        observed
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "mixed".into()),
+        if capped { "capped" } else { "unchanged" }
+    );
+    if !tuning.restore_now() {
+        eprintln!("startup: WARNING - could not restore every core");
+    }
+}
+
 fn shut_down_fan(lease: &fan::FanLease, watchdog: &watchdog::Watchdog) {
     // A trip means this daemon stopped working while holding the fan. The machine was
     // protected, but that is a bug and it should not vanish quietly at shutdown.
@@ -684,7 +740,7 @@ fn shut_down_fan(lease: &fan::FanLease, watchdog: &watchdog::Watchdog) {
 /// lock, and blocking here would leave the process alive with the fan held — the
 /// exact failure ADR 0006 is written against. [`fan::FanLease`] is lock-free for this
 /// reason.
-fn install_panic_hook(lease: Arc<fan::FanLease>) {
+fn install_panic_hook(lease: Arc<fan::FanLease>, tuning: Arc<tuning::TuningLease>) {
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let ok = lease.release_now();
@@ -696,6 +752,14 @@ fn install_panic_hook(lease: Arc<fan::FanLease>) {
                 "NOT returned to EC control - run fw-helper-restore-fan as root"
             }
         );
+        // Cores second: the fan is the thermal hazard and goes first. Both are
+        // lock-free, so neither can block the other or the hook (ADR 0014).
+        if tuning.holding() && !tuning.restore_now() {
+            eprintln!(
+                "fw-helperd panicked; cores or GPU frequency NOT restored - check \
+                 `fw-helperctl tune` and re-online by hand"
+            );
+        }
         previous(info);
     }));
 }

@@ -141,6 +141,7 @@ pub mod actions {
     pub const SET_CHARGE_LIMIT: &str = "org.fwhelper.set-charge-limit";
     pub const SET_FAN: &str = "org.fwhelper.set-fan";
     pub const SET_POWER_LIMIT: &str = "org.fwhelper.set-power-limit";
+    pub const SET_TUNING: &str = "org.fwhelper.set-tuning";
     /// Start, stop and delete monitoring sessions.
     ///
     /// Still an action rather than an unchecked method, because it makes the daemon

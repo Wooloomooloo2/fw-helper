@@ -25,13 +25,38 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M6 — GUI | **complete**: profile, save/delete, power limit, charge limit, fan release, auto-switching, and the fan curve editor in a two-column adaptive window |
 | M7 — packaging | **complete**: install, GNOME app-grid launch and `apt remove` (fan back to the EC, `pwm1_enable=2`) all verified on hardware |
 | M8 — recording & monitoring | **complete and verified on hardware** (2026-09-20): a session recorded against the packaged daemon, 48 rows with GPU load and attribution on every one. Two defects found doing it, both fixed — GPU load was **published by no packaged daemon** at all (uid 0 with an empty capability set cannot read another user's `fdinfo`; see traps), and `t_s` was truncated rather than rounded. The Monitor page now draws one card per measurement. Extended 2026-09-21 (0.6.3/0.6.4): CPU and GPU each report utilisation, power and **achieved** clock — per-rail watts from RAPL `core`/`uncore`, a busy-weighted CPU clock, and a `clock (achieved)` strip drawing the GPU's requested clock beside its real one. Only `gpu_watts` is confirmed on hardware so far |
+| M9 — workload-shaped tuning (game profiles) | **not started, gated on a measurement.** Advanced view to park cores and budget the CPU and GPU tiles separately. The circulating blueprint for this laptop was checked path by path (2026-09-22): three of its four mechanisms do not exist here. See `docs/framework_gaming_profile.md` and M9 in `docs/plan.md` |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
 ### Resume here
 
-Last session ended 2026-09-21. **M0-M8 complete. Shipped 0.6.3 and 0.6.4.** The session
+**Start with M9 Phase 0.** Session of 2026-09-22 planned "workload-shaped game profiles" —
+park useless cores, cap CPU and GPU independently, control the package budget. Nothing is
+implemented; the gate is a measurement. Read `docs/framework_gaming_profile.md` (corrected
+lever set, measured topology) then M9 in `docs/plan.md` (five phases), and run:
+
+```
+sudo systemctl stop fw-helperd && sudo ./scratchpad/tune-levers-probe.sh 2>&1 | tee ~/tune-probe.log
+```
+
+**Must be on mains.** It answers four questions: do the `intel-rapl:0:0`/`:0:1` core and
+uncore rails bind (they are `enabled=0, limit=0` today); does `gt0/freq0/max_freq` cap the
+GPU; and **does starving the CPU give the GPU anything** — which also closes the standing
+binary-vs-graduated question below. If that last one comes back flat, the ~11 W core clamp
+is a fixed reservation and the GPU-bound profile is dead however well it is implemented.
+Core parking and `scaling_max_freq` proceed regardless.
+
+**Topology, measured 2026-09-22** (no SMT): P-cores **0-3** (4700/4800 MHz, `cpu_core`),
+E-cores **4-11** (3700), LP-E **12-15** (3300, `core_id` 32-35). **`cpu0` has no `online`
+file and can never be parked.** The GPU is **`card1`**, not card0, and runs `xe` - the
+i915-era `card0/gt_max_freq_mhz` path every forum script writes **does not exist here**,
+and those scripts guard it with `if [ -f ]`, so they silently do nothing.
+
+---
+
+Previous session ended 2026-09-21. **M0-M8 complete. Shipped 0.6.3 and 0.6.4.** The session
 was mostly a hardware investigation conducted in public on the Framework forum and
 Reddit, and it ended by **retiring a "finding" this file had recorded as fact**.
 

@@ -6,3 +6,6 @@ Cargo.lock
 
 # Built packages (scripts/build-deb.sh)
 *.deb
+
+# Scratch probes and one-off measurement scripts
+/scratchpad

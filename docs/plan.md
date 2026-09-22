@@ -719,7 +719,7 @@ Each capability probes **the whole path it promises**. `gpu usage available` was
 every startup for weeks while nothing was ever measured, because the probe stopped at
 "which driver is loaded".
 
-#### Phase 2 — the two profiles  ⬜
+#### Phase 2 — the two profiles  ✅ built; unbenchmarked
 
 An optional tune section on `Profile`, so the five built-ins and every existing
 `profiles.d/*.conf` parse unchanged. Keys: `park_cores`, `gpu_max_mhz`, `cpu_max_mhz`.
@@ -754,6 +754,21 @@ Expected: parity on fps, meaningfully quieter and cooler. Say that in the UI.
 **Counterexample to carry in the docs:** RPCS3 is heavily multithreaded for SPU emulation
 and would likely *lose* at `p-only`. That is precisely why this is three levels and a
 benchmark rather than one switch.
+
+Built 2026-09-22. Two design points worth keeping:
+
+- **`game` and `retro` are not rungs on the power ladder.** `Profile::ladder()` is now
+  separate from `Profile::workload_presets()` to keep that structural. The ladder's
+  invariant — strictly ascending watts, never quieter as it climbs — is real, and `game`
+  at 25 W beside `max` at 35 W would have broken it. They are not "more performance",
+  they are performance shaped differently.
+- **Neither sets `gpu_max_mhz`.** The key exists, parses, round-trips and is documented
+  in `example-profile.conf`, but a shipped default is the wrong place to find out
+  whether an unmeasured lever binds. Opt-in until Phase 0 question C answers.
+
+Applying a profile sets the tune levers **non-fatally**: a profile is a power budget and
+a fan curve first, and failing the whole apply because a machine has no parkable cores
+would break `quiet` on hardware that never had them.
 
 #### Phase 3 — daemon, and **ADR 0014**  ✅ verified on hardware
 

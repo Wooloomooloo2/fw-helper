@@ -12,6 +12,8 @@
 //! pl1_watts    = 12
 //! curve        = 55:0,65:40,75:70,85:110,95:255
 //! charge_limit = 80          # optional; omitted means "leave it alone"
+//! park_cores   = lpe         # optional; none | lpe | p-only
+//! gpu_max_mhz  = 1200        # optional; omitted means the full range
 //! ```
 //!
 //! **A file naming an existing profile replaces it.** That is how the shipped defaults
@@ -24,6 +26,7 @@
 //! One bad file does not sink the rest. Each is reported by name and skipped, because
 //! losing every profile over one typo is a worse failure than running without one.
 
+use fw_helper_core::tune::ParkLevel;
 use fw_helper_core::{Curve, Point, Ppd, Profile};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -153,6 +156,14 @@ pub fn render(profile: &Profile) -> String {
     out.push_str(&format!("ppd = {}\n", profile.ppd.as_str()));
     out.push_str(&format!("pl1_watts = {}\n", profile.pl1_watts));
     out.push_str(&format!("curve = {}\n", curve.join(", ")));
+    // Written only when set, so a round-trip through save/load does not turn "leave it
+    // alone" into an explicit default that then looks deliberate.
+    if profile.park_cores != ParkLevel::None {
+        out.push_str(&format!("park_cores = {}\n", profile.park_cores));
+    }
+    if let Some(mhz) = profile.gpu_max_mhz {
+        out.push_str(&format!("gpu_max_mhz = {mhz}\n"));
+    }
     if let Some(limit) = profile.charge_limit {
         out.push_str(&format!("charge_limit = {limit}\n"));
     }
@@ -162,6 +173,8 @@ pub fn render(profile: &Profile) -> String {
 /// Parse one profile file.
 pub fn parse(text: &str) -> Result<Profile, String> {
     let mut name = None;
+    let mut park = ParkLevel::None;
+    let mut gpu_max = None;
     let mut ppd = None;
     let mut watts = None;
     let mut curve = None;
@@ -194,6 +207,19 @@ pub fn parse(text: &str) -> Result<Profile, String> {
             "curve" => {
                 curve = Some(parse_curve(value).map_err(|e| format!("line {}: {e}", n + 1))?)
             }
+            "park_cores" => {
+                park = ParkLevel::parse(value).ok_or_else(|| {
+                    format!(
+                        "line {}: unknown park_cores {value:?}; expected none, lpe or p-only",
+                        n + 1
+                    )
+                })?
+            }
+            "gpu_max_mhz" => {
+                gpu_max = Some(value.parse::<u32>().map_err(|_| {
+                    format!("line {}: gpu_max_mhz {value:?} is not a number", n + 1)
+                })?)
+            }
             "charge_limit" => {
                 charge = Some(
                     value
@@ -210,6 +236,8 @@ pub fn parse(text: &str) -> Result<Profile, String> {
         ppd: ppd.ok_or("no ppd (power-saver, balanced or performance)")?,
         pl1_watts: watts.ok_or("no pl1_watts")?,
         curve: curve.ok_or("no curve")?,
+        park_cores: park,
+        gpu_max_mhz: gpu_max,
         charge_limit: charge,
     };
     profile.validate().map_err(|e| e.to_string())?;
@@ -402,5 +430,42 @@ charge_limit = 80   # trailing comment
         let d = tmpdir("ext");
         write(&d, "silent.conf.bak", GOOD);
         assert_eq!(load_from(&d).len(), Profile::built_ins().len());
+    }
+}
+
+#[cfg(test)]
+mod tune_round_trip_tests {
+    use super::*;
+
+    #[test]
+    fn park_and_gpu_keys_survive_a_round_trip() {
+        let mut p = Profile::retro();
+        p.gpu_max_mhz = Some(1200);
+        let text = render(&p);
+        assert!(text.contains("park_cores = lpe"), "{text}");
+        assert!(text.contains("gpu_max_mhz = 1200"), "{text}");
+
+        let back = parse(&text).expect("renders what it can read");
+        assert_eq!(back.park_cores, ParkLevel::Lpe);
+        assert_eq!(back.gpu_max_mhz, Some(1200));
+    }
+
+    #[test]
+    fn an_untuned_profile_writes_neither_key() {
+        // "Leave it alone" must not round-trip into an explicit default that then looks
+        // like somebody chose it.
+        let text = render(&Profile::quiet());
+        assert!(!text.contains("park_cores"), "{text}");
+        assert!(!text.contains("gpu_max_mhz"), "{text}");
+        let back = parse(&text).unwrap();
+        assert_eq!(back.park_cores, ParkLevel::None);
+        assert_eq!(back.gpu_max_mhz, None);
+    }
+
+    #[test]
+    fn a_bad_park_level_names_the_valid_ones() {
+        let text = format!("{}park_cores = sideways\n", render(&Profile::quiet()));
+        let err = parse(&text).unwrap_err();
+        assert!(err.contains("none, lpe or p-only"), "{err}");
     }
 }

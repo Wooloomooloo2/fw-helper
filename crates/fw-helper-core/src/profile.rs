@@ -16,6 +16,7 @@
 //! to 55 °C — at 15 W the machine sits around 62 °C under sustained load.
 
 use crate::curve::{Curve, Point};
+use crate::tune::ParkLevel;
 
 /// The PPD axis. These are PPD's own three profiles and the names it uses on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,7 @@ pub enum ProfileError {
     UnknownPpd(String),
     PowerOutOfRange(u32),
     ChargeOutOfRange(u8),
+    GpuFreqOutOfRange(u32),
 }
 
 impl std::fmt::Display for ProfileError {
@@ -75,6 +77,9 @@ impl std::fmt::Display for ProfileError {
                 crate::power::MAX_WATTS
             ),
             Self::ChargeOutOfRange(v) => write!(f, "{v}% is not a usable charge limit"),
+            Self::GpuFreqOutOfRange(v) => {
+                write!(f, "{v} MHz is not a plausible GPU clock")
+            }
         }
     }
 }
@@ -91,6 +96,20 @@ pub struct Profile {
     pub pl1_watts: u32,
     /// The fan curve this profile runs.
     pub curve: Curve,
+    /// How much of the CPU this profile wants running.
+    ///
+    /// **This is a placement lever, not a power one** — see [`crate::tune`]. Default
+    /// [`ParkLevel::None`] so every existing profile and config file means exactly what
+    /// it meant before this field existed.
+    pub park_cores: ParkLevel,
+    /// Cap the GPU's maximum clock, in MHz.
+    ///
+    /// `None` leaves the full range, which is what every shipped profile does. **The
+    /// cap is unproven on this hardware** — lowering `max_freq` is at least the right
+    /// direction, unlike the `min_freq` peg already known to be inert, but whether it
+    /// binds is M9 Phase 0 question C. Available to a user profile; not set by a
+    /// built-in until it is measured.
+    pub gpu_max_mhz: Option<u32>,
     /// Charge limit, if this profile should set one.
     ///
     /// **`None` in all three built-ins, deliberately.** ADR 0005's sketch included a
@@ -127,6 +146,8 @@ impl Profile {
                 (90.0, 130),
                 (100.0, 255),
             ]),
+            park_cores: ParkLevel::None,
+            gpu_max_mhz: None,
             charge_limit: None,
         }
     }
@@ -146,6 +167,8 @@ impl Profile {
                 (88.0, 145),
                 (100.0, 255),
             ]),
+            park_cores: ParkLevel::None,
+            gpu_max_mhz: None,
             charge_limit: None,
         }
     }
@@ -166,6 +189,8 @@ impl Profile {
                 (85.0, 170),
                 (95.0, 255),
             ]),
+            park_cores: ParkLevel::None,
+            gpu_max_mhz: None,
             charge_limit: None,
         }
     }
@@ -190,6 +215,8 @@ impl Profile {
                 (80.0, 190),
                 (90.0, 255),
             ]),
+            park_cores: ParkLevel::None,
+            gpu_max_mhz: None,
             charge_limit: None,
         }
     }
@@ -214,16 +241,88 @@ impl Profile {
                 (78.0, 210),
                 (88.0, 255),
             ]),
+            park_cores: ParkLevel::None,
+            gpu_max_mhz: None,
             charge_limit: None,
         }
     }
 
-    /// The shipped defaults, ordered by power budget.
+    /// For a GPU-bound title. **Not an unlock — a budget that stops being wasted.**
+    ///
+    /// There is very little withheld GPU performance on this machine, and saying so is
+    /// part of the design. Measured: Cyberpunk 2077 at PL1 **25 W scores 48.01 fps and
+    /// at 35 W scores 48.16**, with the GPU already at its clock ceiling and 96-97%
+    /// occupied. So this profile takes the 25 W — identical frames for 10 W less heat
+    /// and about 156 rpm less fan — and spends the difference on a curve that starts
+    /// early, where our curves are measured to beat firmware by 13-36 duty counts.
+    ///
+    /// Parks nothing: a title waiting on the GPU is not helped by having fewer cores.
+    pub fn game() -> Self {
+        Self {
+            name: "game".into(),
+            ppd: Ppd::Performance,
+            pl1_watts: 25,
+            curve: curve(&[
+                (45.0, 0),
+                (55.0, 75),
+                (65.0, 120),
+                (75.0, 165),
+                (85.0, 210),
+                (95.0, 255),
+            ]),
+            park_cores: ParkLevel::None,
+            gpu_max_mhz: None,
+            charge_limit: None,
+        }
+    }
+
+    /// For older titles and emulation — one hot thread that wants the fastest core.
+    ///
+    /// The measured case for this is a game reporting itself CPU-bound while nothing
+    /// looks busy: Horizon Zero Dawn gives **CPU FPS 34 against GPU FPS 45 while no
+    /// thread exceeds 50% and the busiest core sits at 47%**. That is a latency-bound
+    /// critical thread, and on a hybrid part the usual cause is the scheduler placing
+    /// it on an E core at 3.7 GHz or an LP-E core at 3.3 instead of a P core at 4.8.
+    ///
+    /// Defaults to [`ParkLevel::Lpe`], not `PCoresOnly`. Removing only the slowest
+    /// cluster is where the placement argument is strongest and the downside smallest —
+    /// 12 cores still remain. `p-only` is a real choice and is one command away, but it
+    /// is wrong for anything that threads well: RPCS3 emulates SPUs across many
+    /// threads and would likely lose. Which of the two wins is a question for a
+    /// benchmark, not for this file.
+    ///
+    /// Sets no GPU cap. Freeing package budget by throttling the GT is plausible and
+    /// unmeasured, and a shipped default is the wrong place to find out.
+    pub fn retro() -> Self {
+        Self {
+            name: "retro".into(),
+            ppd: Ppd::Performance,
+            pl1_watts: 35,
+            curve: curve(&[
+                (45.0, 0),
+                (55.0, 70),
+                (65.0, 115),
+                (75.0, 160),
+                (85.0, 205),
+                (95.0, 255),
+            ]),
+            park_cores: ParkLevel::Lpe,
+            gpu_max_mhz: None,
+            charge_limit: None,
+        }
+    }
+
+    /// The power ladder: strictly ascending in watts, and never quieter as it climbs.
+    ///
+    /// This is the axis the GNOME slider moves along, and the ordering is a real
+    /// invariant rather than a presentation choice — a "faster" profile that asked for
+    /// less air than the one below it would be a worse machine by every measure.
+    /// Enforced by a test over the whole list, so a new rung cannot quietly break it.
     ///
     /// `turbo` and `max` share the `performance` PPD position with `performance` itself.
     /// That is fine and is why [`Self::canonical_name_for`] exists: the GNOME slider
     /// still lands on `performance`, and the extra two are reached by name.
-    pub fn built_ins() -> Vec<Self> {
+    pub fn ladder() -> Vec<Self> {
         vec![
             Self::quiet(),
             Self::balanced(),
@@ -231,6 +330,23 @@ impl Profile {
             Self::turbo(),
             Self::max(),
         ]
+    }
+
+    /// Workload presets, which are **not** rungs on the ladder.
+    ///
+    /// `game` draws less than `max` and `retro` draws the same, so neither belongs in a
+    /// monotone ordering: they are not "more performance", they are performance shaped
+    /// differently. Kept separate so the ladder's invariant stays meaningful, and
+    /// listed after it, which is also the order a user reads them in.
+    pub fn workload_presets() -> Vec<Self> {
+        vec![Self::game(), Self::retro()]
+    }
+
+    /// Everything shipped: the ladder, then the workload presets.
+    pub fn built_ins() -> Vec<Self> {
+        let mut all = Self::ladder();
+        all.extend(Self::workload_presets());
+        all
     }
 
     /// Validate a profile assembled from somewhere less trustworthy than this file.
@@ -252,6 +368,14 @@ impl Profile {
         }
         if self.pl1_watts < crate::power::MIN_WATTS || self.pl1_watts > crate::power::MAX_WATTS {
             return Err(ProfileError::PowerOutOfRange(self.pl1_watts));
+        }
+        if let Some(mhz) = self.gpu_max_mhz {
+            // A real bound needs the hardware, which this function does not have. This
+            // only catches a value that cannot be a frequency at all; `GpuFreq::set_max`
+            // clamps against rpn_freq..rp0_freq at apply time and is the one that binds.
+            if !(100..=4000).contains(&mhz) {
+                return Err(ProfileError::GpuFreqOutOfRange(mhz));
+            }
         }
         if let Some(limit) = self.charge_limit {
             if !(crate::charge::MIN_LIMIT..=crate::charge::MAX_LIMIT).contains(&limit) {
@@ -338,7 +462,7 @@ mod tests {
         // built_ins() is declared in ascending power order, and each step up must ask
         // for at least as much air as the one below it at every temperature. Written
         // over the whole list so adding a profile cannot quietly break the ordering.
-        let all = Profile::built_ins();
+        let all = Profile::ladder();
         for pair in all.windows(2) {
             let (lo, hi) = (&pair[0], &pair[1]);
             assert!(
@@ -367,17 +491,67 @@ mod tests {
 
     #[test]
     fn sharing_a_ppd_position_does_not_disturb_the_slider() {
-        // turbo and max both claim `performance`. The GNOME slider must still land on
-        // the profile named `performance` — a coin toss between three is the ADR 0005
-        // failure in miniature.
-        let claimants: Vec<_> = Profile::built_ins()
-            .into_iter()
-            .filter(|p| p.ppd == Ppd::Performance)
-            .map(|p| p.name)
-            .collect();
-        assert_eq!(claimants.len(), 3, "expected performance, turbo and max");
-        assert_eq!(Profile::canonical_name_for(Ppd::Performance), "performance");
-        assert_eq!(Profile::for_ppd(Ppd::Performance).name, "performance");
+        // `performance`, `turbo`, `max`, `game` and `retro` all claim the same PPD
+        // position. However many there are, the slider must land somewhere predictable
+        // — a coin toss between them is the ADR 0005 failure in miniature. Asserted as
+        // a property rather than a count, so adding a profile cannot break it.
+        for ppd in [Ppd::PowerSaver, Ppd::Balanced, Ppd::Performance] {
+            let claimants: Vec<String> = Profile::built_ins()
+                .into_iter()
+                .filter(|p| p.ppd == ppd)
+                .map(|p| p.name)
+                .collect();
+            let canonical = Profile::canonical_name_for(ppd);
+            assert!(
+                claimants.iter().any(|n| n == canonical),
+                "{ppd:?} resolves to {canonical}, which is not among {claimants:?}"
+            );
+            assert_eq!(Profile::for_ppd(ppd).name, canonical);
+        }
+    }
+
+    #[test]
+    fn workload_presets_stay_off_the_ladder() {
+        // The whole reason they are a separate list. `game` draws 25 W where `max`
+        // draws 35, so folding them in would either break the ordering or require
+        // pretending `game` is a step down from `performance`, which it is not.
+        let ladder: Vec<String> = Profile::ladder().into_iter().map(|p| p.name).collect();
+        for preset in Profile::workload_presets() {
+            assert!(
+                !ladder.contains(&preset.name),
+                "{} must not be a rung on the ladder",
+                preset.name
+            );
+        }
+        assert_eq!(Profile::built_ins().len(), ladder.len() + 2);
+    }
+
+    #[test]
+    fn the_shipped_profiles_set_no_unproven_gpu_cap() {
+        // Lowering the GT ceiling is plausible and unmeasured on this board (M9 Phase 0
+        // question C). A shipped default is the wrong place to find out, so the control
+        // exists and nothing built-in uses it.
+        for p in Profile::built_ins() {
+            assert_eq!(p.gpu_max_mhz, None, "{} ships a GPU cap", p.name);
+        }
+    }
+
+    #[test]
+    fn retro_parks_the_slowest_cluster_and_no_more() {
+        // Not PCoresOnly: removing only the 3.3 GHz cluster is where the placement
+        // argument is strongest and the downside smallest, and 12 cores still remain.
+        // `p-only` is a real choice but wrong for anything that threads well.
+        assert_eq!(Profile::retro().park_cores, ParkLevel::Lpe);
+        assert_eq!(Profile::game().park_cores, ParkLevel::None);
+    }
+
+    #[test]
+    fn game_takes_the_measured_optimum_not_the_maximum() {
+        // CP2077: 25 W scores 48.01 fps, 35 W scores 48.16. The extra 10 W buys 0.3%,
+        // so `game` spends it on being cooler and quieter instead. If this ever changes
+        // to 35, something measured has to have changed first.
+        assert_eq!(Profile::game().pl1_watts, 25);
+        assert!(Profile::game().pl1_watts < Profile::max().pl1_watts);
     }
 
     #[test]

@@ -587,6 +587,27 @@ impl Daemon {
             .set_curve(profile.curve.clone(), self.thermal())
             .map_err(|e| zbus::fdo::Error::Failed(format!("fan curve: {e}")))?;
 
+        // The M9 levers, applied last and **non-fatally**. A profile is a power budget
+        // and a fan curve first; those two are what every existing profile means, and
+        // failing the whole apply because a machine has no parkable cores would break
+        // `quiet` on hardware that never had them. Reported, not raised.
+        if self.tuning.parking_supported() {
+            if let Err(e) = self.tuning.set_level(profile.park_cores) {
+                eprintln!("profile {}: could not park cores: {e}", profile.name);
+            }
+        } else if profile.park_cores != ParkLevel::None {
+            eprintln!(
+                "profile {}: asks to park {} but this machine has no hybrid topology",
+                profile.name, profile.park_cores
+            );
+        }
+        if let Err(e) = self.tuning.set_gpu_max(profile.gpu_max_mhz) {
+            eprintln!(
+                "profile {}: could not set the GPU ceiling: {e}",
+                profile.name
+            );
+        }
+
         if let Ok(mut state) = self.state.lock() {
             state.profile = Some(profile.name.to_string());
             state.power_limit = Some(profile.pl1_watts);
@@ -638,6 +659,10 @@ impl Daemon {
             ppd,
             pl1_watts: watts,
             curve,
+            // Captured from the machine, like the power limit and the curve: these are
+            // performance choices, which is exactly what a profile is for.
+            park_cores: self.tuning.observed_level().unwrap_or_default(),
+            gpu_max_mhz: self.tuning.gpu_cap(),
             // Deliberately not captured: a charge limit is a standing preference, and
             // folding whatever it happens to be into a performance profile would make
             // switching profiles change it later, which nobody asked for.

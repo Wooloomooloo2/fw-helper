@@ -25,7 +25,7 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M6 — GUI | **complete**: profile, save/delete, power limit, charge limit, fan release, auto-switching, and the fan curve editor in a two-column adaptive window |
 | M7 — packaging | **complete**: install, GNOME app-grid launch and `apt remove` (fan back to the EC, `pwm1_enable=2`) all verified on hardware |
 | M8 — recording & monitoring | **complete and verified on hardware** (2026-09-20): a session recorded against the packaged daemon, 48 rows with GPU load and attribution on every one. Two defects found doing it, both fixed — GPU load was **published by no packaged daemon** at all (uid 0 with an empty capability set cannot read another user's `fdinfo`; see traps), and `t_s` was truncated rather than rounded. The Monitor page now draws one card per measurement. Extended 2026-09-21 (0.6.3/0.6.4): CPU and GPU each report utilisation, power and **achieved** clock — per-rail watts from RAPL `core`/`uncore`, a busy-weighted CPU clock, and a `clock (achieved)` strip drawing the GPU's requested clock beside its real one. Only `gpu_watts` is confirmed on hardware so far |
-| M9 — two game profiles + benchmarking | **levers built and verified on hardware (2026-09-22); the profiles themselves are not.** Core parking (3 levels) and GPU frequency capping ship through CLI, D-Bus and GUI, with ADR 0014 restore-on-everything. Still to come: the `game`/`retro` profiles themselves, and Phase 0, which decides whether the GPU cap is worth keeping. The circulating blueprint for this laptop was checked path by path (2026-09-22): three of its four mechanisms do not exist here. See `docs/framework_gaming_profile.md` and M9 in `docs/plan.md` |
+| M9 — two game profiles + benchmarking | **levers built and verified on hardware (2026-09-22); the profiles themselves are not.** Core parking (3 levels) and GPU frequency capping ship through CLI, D-Bus and GUI, with ADR 0014 restore-on-everything. `game` (25 W, parks nothing) and `retro` (35 W, parks LP-E) ship as built-ins. Still to come: Phase 0, which decides whether the GPU cap is worth keeping, and Phase 5 — the first time anything measures whether parking actually helps. The circulating blueprint for this laptop was checked path by path (2026-09-22): three of its four mechanisms do not exist here. See `docs/framework_gaming_profile.md` and M9 in `docs/plan.md` |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
@@ -39,7 +39,14 @@ group in the GUI, with ADR 0014 restore-on-everything. **Verified on hardware th
 the packaged daemon**, including the one that matters: after `pkill -9` holding
 `p-only` and a 1200 MHz cap, `ExecStopPost` re-onlined 12 cores and lifted the cap in
 the **same second**. Two defects were found doing it and both are now traps below.
-The `game` and `retro` profiles themselves are **not** built. Read
+`game` and `retro` now ship as built-ins - `game` is PL1 **25 W** and parks nothing
+(the measured optimum: CP2077 scores 48.01 fps there against 48.16 at 35 W), `retro` is
+35 W and parks **LP-E only**. **Neither sets a GPU cap**, deliberately: the key exists
+and is documented, but shipping an unmeasured lever as a default is how you stop being
+able to tell whether it works. **Nothing has yet measured whether parking helps at all**
+- that is Phase 5, and Shadow of the Tomb Raider's split CPU/GPU frame rates are the
+instrument, because a parking win should move the CPU number and leave the GPU number
+alone. Read
 `docs/framework_gaming_profile.md` (corrected lever set, measured topology, the issue #263
 assessment) then M9 in `docs/plan.md`, and run:
 

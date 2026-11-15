@@ -96,7 +96,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: $ARCH
-Depends: ${DEPS}, dbus, systemd
+Depends: ${DEPS}, default-dbus-system-bus | dbus-system-bus, systemd
 Recommends: power-profiles-daemon
 Maintainer: Mark Hall <mark.a.hall@gmail.com>
 Homepage: https://github.com/Wooloomooloo2/fw-helper

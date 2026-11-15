@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.5 — 2026-11-15
+
+### Added
+
+- **A battery log, and `fw-helperctl battery` to read it.** The daemon now keeps
+  `/var/lib/fw-helper/battery/events.csv`: one line per 1 % step, plug or unplug,
+  screen on/off, charge-status change, suspend and resume, plus a heartbeat every
+  10 minutes on battery with the screen on. It rides the existing 1 Hz telemetry tick,
+  so it adds no wake-ups; the only new read is the panel's DRM `dpms` file.
+  `fw-helperctl battery` reads the file directly (no daemon needed) and shows the
+  current or last discharge split into **screen on / screen off / asleep**, each with
+  time, energy and average watts, an estimate of the time left, what the battery was last
+  charged to, and pack health and cycles. Asleep is *measured*: the suspend line is
+  written while logind's delay lock still holds the machine up, the resume line on the
+  first tick back. Ported from the Windows sibling's ADR 0018. Day/month/year history and
+  a GUI page come next; the log format is already what they will read.
+
+### Fixed
+
+- **The package installs on Ubuntu 26.10**, which replaced `dbus` with `dbus-broker`.
+  The hard dependency on `dbus` made the release upgrade remove and purge fw-helper -
+  daemon, saved charge limit and recorded sessions - and blocked reinstalling it. It now
+  depends on `default-dbus-system-bus | dbus-system-bus`.
+
 ## 0.6.4 — 2026-09-21
 
 ### Added

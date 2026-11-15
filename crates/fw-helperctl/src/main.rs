@@ -35,6 +35,7 @@ USAGE:
     fw-helperctl record stop       stop recording
     fw-helperctl record rm NAME    delete a recorded session
     fw-helperctl hud               one status line, for an in-game overlay
+    fw-helperctl battery           time on battery, where the charge went, last charge
     fw-helperctl tune              CPU clusters and GPU frequency, as discovered
     fw-helperctl tune park LEVEL   park cores: none | lpe | p-only
     fw-helperctl tune gpu MHZ      cap the GPU clock; 0 for the full range
@@ -64,6 +65,7 @@ fn main() {
             args.get(2).map(String::as_str),
         ),
         Some("hud") => hud(),
+        Some("battery") => battery(),
         Some("tune") => tune(
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
@@ -718,6 +720,168 @@ fn human_bytes(n: u64) -> String {
 /// wired into MangoHud's `exec=`, which runs inside the game's frame loop, and opening
 /// a bus connection per frame would be a frame-time bug. The D-Bus path is only the
 /// fallback for when the file is missing.
+/// `2 h 14 min`, `14 min`, `40 s`.
+fn span(secs: u64) -> String {
+    let (h, m) = (secs / 3600, secs % 3600 / 60);
+    match (h, m) {
+        (0, 0) => format!("{secs} s"),
+        (0, m) => format!("{m} min"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
+/// Read straight from the log file, so this works with no daemon running. Times are
+/// given as "ago" rather than clock times: core is std-only and std knows no time zone.
+fn battery() {
+    use fw_helper_core::battery_log::{
+        last_charged_to, last_discharge, log_path, parse, BatteryState, Entry, Event, Share,
+    };
+    let path = log_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "no battery log at {} ({e}).\n\
+                 fw-helperd writes it from 0.6.5 on; is the daemon installed and running?",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let entries = parse(&text);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // The live reading closes the last interval, so an ongoing discharge counts to now.
+    let fs = Sysfs::new("/");
+    let t = Monitor::new(fs.clone()).sample();
+    let live = Entry {
+        unix_time: now,
+        event: Event::Heartbeat,
+        state: BatteryState {
+            on_ac: t.on_ac,
+            // Someone is reading a terminal: the screen is on.
+            screen_on: Some(true),
+            status: t.battery_status.clone(),
+            percent: t.battery_percent,
+            wh: t.battery_wh,
+            wh_full: t.battery_wh_full,
+            cycles: None,
+        },
+    };
+
+    let row = |name: &str, s: &Share| {
+        if s.secs == 0 {
+            return;
+        }
+        let w = s
+            .watts()
+            .map(|w| format!("{w:5.1} W"))
+            .unwrap_or_else(|| "      -".into());
+        println!("  {name:<11} {:>12}  {:6.1} Wh  {w}", span(s.secs), s.wh);
+    };
+
+    match last_discharge(&entries, Some(&live)) {
+        None => println!("No time on battery logged yet."),
+        Some(d) => {
+            let pct = |p: Option<u64>| p.map(|p| format!("{p}%")).unwrap_or("?".into());
+            if d.ongoing {
+                println!(
+                    "On battery for {} ({} -> {})",
+                    span(d.to - d.from),
+                    pct(d.start_percent),
+                    pct(d.end_percent)
+                );
+            } else {
+                println!(
+                    "Last time on battery: {}, ended {} ago ({} -> {})",
+                    span(d.to - d.from),
+                    span(now.saturating_sub(d.to)),
+                    pct(d.start_percent),
+                    pct(d.end_percent)
+                );
+            }
+            row("screen on", &d.screen_on);
+            row("screen off", &d.screen_off);
+            row("asleep", &d.asleep);
+            let total = d.total();
+            let avg = total
+                .watts()
+                .map(|w| format!("{w:5.1} W"))
+                .unwrap_or_else(|| "      -".into());
+            println!(
+                "  {:<11} {:>12}  {:6.1} Wh  {avg}",
+                "total",
+                span(total.secs),
+                total.wh
+            );
+            if d.unknown_secs > 0 {
+                println!(
+                    "  ({} with no daemon running is left out)",
+                    span(d.unknown_secs)
+                );
+            }
+            if d.ongoing {
+                if let (Some(wh), Some(w)) = (t.battery_wh, d.screen_on.watts()) {
+                    if w > 0.5 {
+                        println!(
+                            "  about {} left at the screen-on average",
+                            span((wh / w * 3600.0) as u64)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((when, pct)) = last_charged_to(&entries) {
+        println!(
+            "Last charged to {pct}% (unplugged {} ago)",
+            span(now.saturating_sub(when))
+        );
+    }
+
+    // Health from the gauge's own figures. charge_* on this board, energy_* on others.
+    let bat = std::fs::read_dir("/sys/class/power_supply")
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| format!("sys/class/power_supply/{}", e.file_name().to_string_lossy()))
+        .find(|rel| fs.read_string(&format!("{rel}/type")).ok().as_deref() == Some("Battery"));
+    if let Some(rel) = bat {
+        let r = |f: &str| fs.read_u64(&format!("{rel}/{f}")).ok();
+        let (full, design) = match (r("charge_full"), r("charge_full_design")) {
+            (Some(f), Some(d)) => (Some(f), Some(d)),
+            _ => (r("energy_full"), r("energy_full_design")),
+        };
+        let mut parts = Vec::new();
+        if let (Some(f), Some(d)) = (full, design) {
+            if d > 0 {
+                parts.push(format!(
+                    "health {:.0}% of design",
+                    f as f64 * 100.0 / d as f64
+                ));
+            }
+        }
+        if let Some(c) = r("cycle_count") {
+            parts.push(format!("{c} cycles"));
+        }
+        if !parts.is_empty() {
+            println!("Battery: {}", parts.join(", "));
+        }
+    }
+    if let Some(first) = entries.first() {
+        println!(
+            "Logging for {} ({} lines, {})",
+            span(now.saturating_sub(first.unix_time)),
+            entries.len(),
+            path.display()
+        );
+    }
+}
+
 fn hud() {
     const HUD_FILE: &str = "/run/fw-helper/hud";
     if let Ok(line) = std::fs::read_to_string(HUD_FILE) {

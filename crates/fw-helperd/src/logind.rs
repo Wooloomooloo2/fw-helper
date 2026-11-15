@@ -74,7 +74,12 @@ async fn take_delay_lock(proxy: &Login1ManagerProxy<'static>) -> Option<zbus::zv
 /// Failure to reach logind is not fatal for the energy counter — the sampler's max-gap
 /// check already discards deltas spanning a long stall. It is more serious for the
 /// fan, so it is logged as such, and the startup reclaim remains the backstop.
-pub async fn watch_sleep(conn: &zbus::Connection, flag: Arc<AtomicBool>, lease: Arc<FanLease>) {
+pub async fn watch_sleep(
+    conn: &zbus::Connection,
+    flag: Arc<AtomicBool>,
+    lease: Arc<FanLease>,
+    battery_log: Arc<crate::battery_log::BatteryLog>,
+) {
     let proxy = match Login1ManagerProxy::new(conn).await {
         Ok(p) => p,
         Err(e) => {
@@ -110,6 +115,9 @@ pub async fn watch_sleep(conn: &zbus::Connection, flag: Arc<AtomicBool>, lease: 
                         lease.release_now();
                     }
                 }
+                // While the delay lock still holds suspend open, so the line lands
+                // before the freeze. After the fan, which is the part that matters.
+                battery_log.event_now(fw_helper_core::battery_log::Event::Suspend);
                 // Last, and deliberately so: this is what is holding suspend open.
                 drop(lock.take());
             } else {

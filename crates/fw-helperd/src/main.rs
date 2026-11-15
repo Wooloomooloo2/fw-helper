@@ -11,6 +11,7 @@
 //! the thing that proves this daemon is alive is the same thing that proves it is
 //! doing its job.
 
+mod battery_log;
 mod ec;
 mod fan;
 mod iface;
@@ -172,7 +173,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axis.watch_for_ppd().await;
 
     let resumed = Arc::new(AtomicBool::new(false));
-    logind::watch_sleep(&conn, Arc::clone(&resumed), Arc::clone(&lease)).await;
+    let battery_log = Arc::new(battery_log::BatteryLog::new(fs.clone()));
+    logind::watch_sleep(
+        &conn,
+        Arc::clone(&resumed),
+        Arc::clone(&lease),
+        Arc::clone(&battery_log),
+    )
+    .await;
 
     let poll = tokio::spawn(poll_loop(Poll {
         conn: conn.clone(),
@@ -191,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         usage: UsageSampler::new(fs.clone()),
         recording: Arc::clone(&recording),
         watchers: Arc::clone(&watchers),
+        battery_log: Arc::clone(&battery_log),
     }));
 
     // Shut down cleanly on either signal, and hand the fan back before doing anything
@@ -215,6 +224,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     shut_down_fan(&lease, &watchdog);
     shut_down_tuning(&tuning);
+    // After the fan, which matters more. Marks the end of this lifetime so the time
+    // until the next start reads as a gap rather than as whatever state came last.
+    battery_log.event_now(fw_helper_core::battery_log::Event::Stop);
     // Nothing should read numbers from a daemon that has stopped. systemd's
     // RuntimeDirectory= covers the packaged case; this covers a daemon run by hand.
     record::clear_hud();
@@ -785,6 +797,7 @@ struct Poll {
     usage: UsageSampler,
     recording: Arc<record::Recording>,
     watchers: Arc<record::Watchers>,
+    battery_log: Arc<battery_log::BatteryLog>,
 }
 
 async fn poll_loop(ctx: Poll) {
@@ -805,6 +818,7 @@ async fn poll_loop(ctx: Poll) {
         mut usage,
         recording,
         watchers,
+        battery_log,
     } = ctx;
     let iface_ref = match conn
         .object_server()
@@ -850,7 +864,8 @@ async fn poll_loop(ctx: Poll) {
         maybe_wedge(&started);
 
         // swap(false) so the resume is consumed exactly once.
-        if resumed.swap(false, Ordering::SeqCst) {
+        let just_resumed = resumed.swap(false, Ordering::SeqCst);
+        if just_resumed {
             mon.on_resume();
             // Same reasoning, different counters: /proc/stat keeps counting across
             // s2idle while the GPU's clock does not, so every rate spanning the sleep
@@ -876,6 +891,14 @@ async fn poll_loop(ctx: Poll) {
         }
 
         let sample = mon.sample();
+
+        // The resume line carries the first post-wake reading, so the energy the sleep
+        // cost is the drop between it and the suspend line.
+        if just_resumed {
+            battery_log.event_with(fw_helper_core::battery_log::Event::Resume, &sample);
+        } else {
+            battery_log.tick(&sample);
+        }
 
         // The GPU half of the load sample walks every file descriptor on the machine
         // to find DRM clients, so it runs only while someone would see the result:

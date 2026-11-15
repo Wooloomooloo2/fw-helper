@@ -457,6 +457,280 @@ pub fn last_charged_to(entries: &[Entry]) -> Option<(u64, u64)> {
     })
 }
 
+// ---- history: days, months, years -------------------------------------------------
+
+/// What a stretch of time counts as, for drawing. The analysis's own classification,
+/// published so a chart cannot shade a stretch differently from how it is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segment {
+    ScreenOn,
+    ScreenOff,
+    Asleep,
+    Ac,
+    Gap,
+}
+
+/// One interval of the log: `[from, to)` in one state, with the charge at each end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    pub from: u64,
+    pub to: u64,
+    pub segment: Segment,
+    pub percent_from: Option<u64>,
+    pub percent_to: Option<u64>,
+}
+
+/// Every interval in the log, for a chart. `now` closes the last one, as for
+/// [`last_discharge`].
+pub fn spans(entries: &[Entry], now: Option<&Entry>) -> Vec<Span> {
+    let all = with_now(entries, now);
+    intervals(&all)
+        .iter()
+        .zip(all.windows(2))
+        .map(|(iv, w)| Span {
+            from: iv.from,
+            to: iv.to,
+            segment: match iv.kind {
+                Kind::ScreenOn => Segment::ScreenOn,
+                Kind::ScreenOff => Segment::ScreenOff,
+                Kind::Asleep => Segment::Asleep,
+                Kind::Ac => Segment::Ac,
+                Kind::Gap => Segment::Gap,
+            },
+            percent_from: w[0].state.percent,
+            percent_to: w[1].state.percent,
+        })
+        .collect()
+}
+
+fn with_now(entries: &[Entry], now: Option<&Entry>) -> Vec<Entry> {
+    let mut all = entries.to_vec();
+    if let Some(n) = now {
+        if all.last().is_none_or(|l| n.unix_time >= l.unix_time) {
+            all.push(n.clone());
+        }
+    }
+    all
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tier {
+    Day,
+    Month,
+    Year,
+}
+
+/// A calendar period in local time. `month` and `day` are 0 where the tier does not
+/// use them, so keys sort chronologically within a tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PeriodKey {
+    pub year: i64,
+    pub month: u32,
+    pub day: u32,
+}
+
+impl PeriodKey {
+    /// `2026-11-15`, `2026-11`, `2026`.
+    pub fn label(&self) -> String {
+        match (self.month, self.day) {
+            (0, _) => format!("{}", self.year),
+            (m, 0) => format!("{}-{m:02}", self.year),
+            (m, d) => format!("{}-{m:02}-{d:02}", self.year),
+        }
+    }
+}
+
+/// Totals for one period.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Period {
+    pub key: PeriodKey,
+    pub screen_on: Share,
+    pub screen_off: Share,
+    pub asleep: Share,
+    pub ac_secs: u64,
+    pub unknown_secs: u64,
+    /// Times taken off the charger, bounces excluded.
+    pub unplugs: u32,
+    /// The charge at each of those unplugs.
+    pub charged_to: Vec<u64>,
+}
+
+impl Default for PeriodKey {
+    fn default() -> Self {
+        Self {
+            year: 1970,
+            month: 1,
+            day: 1,
+        }
+    }
+}
+
+impl Period {
+    pub fn on_battery(&self) -> Share {
+        Share {
+            secs: self.screen_on.secs + self.screen_off.secs + self.asleep.secs,
+            wh: self.screen_on.wh + self.screen_off.wh + self.asleep.wh,
+        }
+    }
+
+    pub fn average_charged_to(&self) -> Option<f64> {
+        (!self.charged_to.is_empty())
+            .then(|| self.charged_to.iter().sum::<u64>() as f64 / self.charged_to.len() as f64)
+    }
+}
+
+/// Days since 1970-01-01 to a civil date. Howard Hinnant's algorithm, valid far beyond
+/// any date a battery log will hold.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(m);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Calendar arithmetic in local time. The offset is supplied by the caller - core has
+/// no time zone database, while the GUI has GLib's and the CLI libc's - and is asked
+/// for at each instant, so a period spanning a DST change still splits at midnight.
+struct Calendar<'a> {
+    offset: &'a dyn Fn(u64) -> i64,
+}
+
+impl Calendar<'_> {
+    fn key(&self, t: u64, tier: Tier) -> PeriodKey {
+        let local = t as i64 + (self.offset)(t);
+        let (y, m, d) = civil_from_days(local.div_euclid(86_400));
+        match tier {
+            Tier::Day => PeriodKey {
+                year: y,
+                month: m,
+                day: d,
+            },
+            Tier::Month => PeriodKey {
+                year: y,
+                month: m,
+                day: 0,
+            },
+            Tier::Year => PeriodKey {
+                year: y,
+                month: 0,
+                day: 0,
+            },
+        }
+    }
+
+    /// UTC instant of local midnight on a civil date. The offset is looked up at the
+    /// naive instant and once more at the corrected one, which settles across a DST
+    /// change (midnight itself is never skipped in any zone that matters here).
+    fn midnight(&self, y: i64, m: u32, d: u32) -> u64 {
+        let naive = days_from_civil(y, m, d) * 86_400;
+        let first = naive - (self.offset)(naive.max(0) as u64);
+        (naive - (self.offset)(first.max(0) as u64)).max(0) as u64
+    }
+
+    /// Start of the period after the one holding `t`.
+    fn next_boundary(&self, t: u64, tier: Tier) -> u64 {
+        let k = self.key(t, Tier::Day);
+        let (y, m, d) = match tier {
+            Tier::Day => civil_from_days(days_from_civil(k.year, k.month, k.day) + 1),
+            Tier::Month if k.month == 12 => (k.year + 1, 1, 1),
+            Tier::Month => (k.year, k.month + 1, 1),
+            Tier::Year => (k.year + 1, 1, 1),
+        };
+        self.midnight(y, m, d).max(t + 1)
+    }
+}
+
+/// Unplugs, with charger bounce removed: an unplug followed by a plug-in within
+/// [`BOUNCE_SECS`] is contact noise, as is the plug-in that ends it.
+fn unplugs(entries: &[Entry]) -> Vec<(u64, Option<u64>)> {
+    let mut out = Vec::new();
+    for (i, w) in entries.windows(2).enumerate() {
+        if !(w[0].state.on_ac == Some(true) && w[1].state.on_ac == Some(false)) {
+            continue;
+        }
+        let at = w[1].unix_time;
+        let replugged = entries[i + 2..]
+            .iter()
+            .take_while(|e| e.unix_time < at + BOUNCE_SECS)
+            .any(|e| e.state.on_ac == Some(true));
+        if !replugged {
+            out.push((at, w[1].state.percent.or(w[0].state.percent)));
+        }
+    }
+    out
+}
+
+/// Totals per day, month or year, newest first.
+///
+/// Each interval is split proportionally at period boundaries, so a discharge across
+/// midnight puts its time and energy into both days in the right proportions.
+/// `utc_offset` gives the local offset from UTC, in seconds, at a Unix instant.
+pub fn history(
+    entries: &[Entry],
+    now: Option<&Entry>,
+    tier: Tier,
+    utc_offset: &dyn Fn(u64) -> i64,
+) -> Vec<Period> {
+    let cal = Calendar { offset: utc_offset };
+    let all = with_now(entries, now);
+    let mut periods: std::collections::BTreeMap<PeriodKey, Period> = Default::default();
+    fn slot(
+        periods: &mut std::collections::BTreeMap<PeriodKey, Period>,
+        key: PeriodKey,
+    ) -> &mut Period {
+        periods.entry(key).or_insert_with(|| Period {
+            key,
+            ..Default::default()
+        })
+    }
+
+    for iv in intervals(&all) {
+        let total = iv.secs();
+        let mut t = iv.from;
+        while t < iv.to {
+            let end = cal.next_boundary(t, tier).min(iv.to);
+            let part = Interval {
+                from: t,
+                to: end,
+                kind: iv.kind,
+                wh_drop: iv
+                    .wh_drop
+                    .map(|d| d * (end - t) as f64 / total.max(1) as f64),
+            };
+            let p = slot(&mut periods, cal.key(t, tier));
+            match part.kind {
+                Kind::ScreenOn => p.screen_on.add(&part),
+                Kind::ScreenOff => p.screen_off.add(&part),
+                Kind::Asleep => p.asleep.add(&part),
+                Kind::Ac => p.ac_secs += part.secs(),
+                Kind::Gap => p.unknown_secs += part.secs(),
+            }
+            t = end;
+        }
+    }
+    for (at, pct) in unplugs(&all) {
+        let p = slot(&mut periods, cal.key(at, tier));
+        p.unplugs += 1;
+        p.charged_to.extend(pct);
+    }
+    periods.into_values().rev().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +908,86 @@ mod tests {
         let d = last_discharge(&log, None).unwrap();
         assert_eq!(d.from, 9000);
         assert_eq!(d.start_percent, Some(80));
+    }
+
+    const UTC: &dyn Fn(u64) -> i64 = &|_| 0;
+
+    #[test]
+    fn the_calendar_round_trips() {
+        for &(y, m, d) in &[(1970, 1, 1), (2000, 2, 29), (2026, 11, 15), (2026, 12, 31)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
+        // 2026-11-15 00:00:00 UTC
+        assert_eq!(days_from_civil(2026, 11, 15) * 86_400, 1_794_700_800);
+    }
+
+    #[test]
+    fn a_discharge_across_midnight_is_split_between_the_days() {
+        let midnight = 1_794_700_800; // 2026-11-15 00:00 UTC
+        let log = vec![
+            e(midnight - 7200, Event::Start, st(true, true, 80, 56.0)),
+            e(midnight - 3600, Event::Ac, st(false, true, 80, 56.0)),
+            e(midnight + 3600, Event::Ac, st(true, true, 70, 49.0)),
+        ];
+        let days = history(&log, None, Tier::Day, UTC);
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[1].ac_secs, 3600);
+        assert_eq!(days[0].key.label(), "2026-11-15");
+        assert_eq!(days[1].key.label(), "2026-11-14");
+        for d in &days {
+            assert_eq!(d.screen_on.secs, 3600);
+            assert!((d.screen_on.wh - 3.5).abs() < 1e-9);
+        }
+        assert_eq!(days[1].unplugs, 1);
+        assert_eq!(days[1].charged_to, vec![80]);
+        let months = history(&log, None, Tier::Month, UTC);
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0].key.label(), "2026-11");
+        assert_eq!(months[0].on_battery().secs, 7200);
+    }
+
+    #[test]
+    fn local_midnight_follows_the_offset() {
+        // UTC+1: local midnight on the 15th is 23:00 UTC on the 14th.
+        let plus_one: &dyn Fn(u64) -> i64 = &|_| 3600;
+        let midnight_utc = 1_794_700_800;
+        let log = vec![
+            e(midnight_utc - 7200, Event::Ac, st(false, true, 80, 56.0)),
+            e(midnight_utc, Event::Ac, st(true, true, 78, 54.6)),
+        ];
+        let days = history(&log, None, Tier::Day, plus_one);
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0].key.label(), "2026-11-15");
+        assert_eq!(days[0].screen_on.secs, 3600);
+        assert_eq!(days[1].screen_on.secs, 3600);
+    }
+
+    #[test]
+    fn a_bounce_is_not_an_unplug() {
+        let log = vec![
+            e(0, Event::Start, st(true, true, 85, 60.0)),
+            e(100, Event::Ac, st(false, true, 85, 60.0)),
+            e(102, Event::Ac, st(true, true, 85, 60.0)),
+            e(5000, Event::Ac, st(false, true, 85, 60.0)),
+            e(9000, Event::Ac, st(true, true, 70, 49.0)),
+        ];
+        let p = &history(&log, None, Tier::Year, UTC)[0];
+        assert_eq!(p.unplugs, 1);
+        assert_eq!(p.average_charged_to(), Some(85.0));
+    }
+
+    #[test]
+    fn spans_cover_the_log_and_end_at_now() {
+        let log = vec![
+            e(0, Event::Start, st(true, true, 85, 60.0)),
+            e(100, Event::Ac, st(false, true, 85, 60.0)),
+        ];
+        let now = e(400, Event::Heartbeat, st(false, true, 84, 59.3));
+        let s = spans(&log, Some(&now));
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].segment, Segment::Ac);
+        assert_eq!((s[1].from, s[1].to), (100, 400));
+        assert_eq!(s[1].percent_to, Some(84));
     }
 
     #[test]

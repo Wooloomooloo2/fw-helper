@@ -349,6 +349,16 @@ pub fn build(app: &adw::Application) {
         "Monitor",
         "utilities-system-monitor-symbolic",
     );
+    // Reads the battery log from disk, so it needs neither the daemon connection nor
+    // the command channel - and keeps working with the daemon stopped.
+    // Kept alive by its own map handler; the refresh timer holds it only weakly.
+    let battery_page = crate::battery::BatteryPage::new();
+    stack.add_titled_with_icon(
+        &battery_page.widget,
+        Some("battery"),
+        "Battery",
+        "battery-symbolic",
+    );
 
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

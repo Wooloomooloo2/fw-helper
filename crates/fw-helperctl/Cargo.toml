@@ -10,3 +10,5 @@ rust-version.workspace = true
 [dependencies]
 fw-helper-client = { path = "../fw-helper-client" }
 fw-helper-core = { path = "../fw-helper-core" }
+# localtime_r, for splitting battery history at local midnight. Core has no time zones.
+libc = "0.2"

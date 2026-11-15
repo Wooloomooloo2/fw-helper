@@ -36,6 +36,7 @@ USAGE:
     fw-helperctl record rm NAME    delete a recorded session
     fw-helperctl hud               one status line, for an in-game overlay
     fw-helperctl battery           time on battery, where the charge went, last charge
+    fw-helperctl battery days|months|years   history: time, energy and draw on battery
     fw-helperctl tune              CPU clusters and GPU frequency, as discovered
     fw-helperctl tune park LEVEL   park cores: none | lpe | p-only
     fw-helperctl tune gpu MHZ      cap the GPU clock; 0 for the full range
@@ -65,7 +66,7 @@ fn main() {
             args.get(2).map(String::as_str),
         ),
         Some("hud") => hud(),
-        Some("battery") => battery(),
+        Some("battery") => battery(args.get(1).map(String::as_str)),
         Some("tune") => tune(
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
@@ -723,6 +724,9 @@ fn human_bytes(n: u64) -> String {
 /// `2 h 14 min`, `14 min`, `40 s`.
 fn span(secs: u64) -> String {
     let (h, m) = (secs / 3600, secs % 3600 / 60);
+    if h >= 48 {
+        return format!("{} d {} h", h / 24, h % 24);
+    }
     match (h, m) {
         (0, 0) => format!("{secs} s"),
         (0, m) => format!("{m} min"),
@@ -732,9 +736,90 @@ fn span(secs: u64) -> String {
 
 /// Read straight from the log file, so this works with no daemon running. Times are
 /// given as "ago" rather than clock times: core is std-only and std knows no time zone.
-fn battery() {
+/// Local offset from UTC at a Unix instant, from the system's time zone.
+fn utc_offset(t: u64) -> i64 {
+    let tt = t as libc::time_t;
+    // SAFETY: localtime_r writes only into the tm we own and pass; a zeroed tm is a
+    // valid initial value for a plain C struct of integers and one pointer.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&tt, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff
+        }
+    }
+}
+
+fn battery_history(
+    entries: &[fw_helper_core::battery_log::Entry],
+    live: &fw_helper_core::battery_log::Entry,
+    tier: fw_helper_core::battery_log::Tier,
+) {
+    use fw_helper_core::battery_log::history;
+    let hm = |s: u64| {
+        if s == 0 {
+            "-".to_string()
+        } else {
+            format!("{}:{:02}", s / 3600, s % 3600 / 60)
+        }
+    };
+    let w = |s: &fw_helper_core::battery_log::Share| {
+        s.watts().map(|w| format!("{w:.1}")).unwrap_or("-".into())
+    };
+    println!(
+        "{:<11} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>8}",
+        "",
+        "battery",
+        "scr on",
+        "scr off",
+        "asleep",
+        "used Wh",
+        "W on",
+        "W off",
+        "unplugs",
+        "charged"
+    );
+    let rows: Vec<_> = history(entries, Some(live), tier, &utc_offset)
+        .into_iter()
+        .filter(|p| p.on_battery().secs > 0 || p.unplugs > 0)
+        .collect();
+    if rows.is_empty() {
+        println!("(nothing on battery logged yet)");
+    }
+    for p in rows {
+        let b = p.on_battery();
+        println!(
+            "{:<11} {:>8} {:>8} {:>8} {:>8} {:>8.1} {:>7} {:>7} {:>7} {:>8}",
+            p.key.label(),
+            hm(b.secs),
+            hm(p.screen_on.secs),
+            hm(p.screen_off.secs),
+            hm(p.asleep.secs),
+            b.wh,
+            w(&p.screen_on),
+            w(&p.screen_off),
+            p.unplugs,
+            p.average_charged_to()
+                .map(|c| format!("{c:.0}%"))
+                .unwrap_or("-".into()),
+        );
+    }
+}
+
+fn battery(view: Option<&str>) {
     use fw_helper_core::battery_log::{
-        last_charged_to, last_discharge, log_path, parse, BatteryState, Entry, Event, Share,
+        last_charged_to, last_discharge, log_path, parse, BatteryState, Entry, Event, Share, Tier,
+    };
+    let tier = match view {
+        None => None,
+        Some("days" | "day") => Some(Tier::Day),
+        Some("months" | "month") => Some(Tier::Month),
+        Some("years" | "year") => Some(Tier::Year),
+        Some(other) => {
+            eprintln!("unknown battery view {other:?}: use days, months or years");
+            std::process::exit(2);
+        }
     };
     let path = log_path();
     let text = match std::fs::read_to_string(&path) {
@@ -771,6 +856,11 @@ fn battery() {
             cycles: None,
         },
     };
+
+    if let Some(tier) = tier {
+        battery_history(&entries, &live, tier);
+        return;
+    }
 
     let row = |name: &str, s: &Share| {
         if s.secs == 0 {

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.6 — 2026-11-15
+
+### Added
+
+- **A Battery page in the window, and battery history.** Beside Control and Monitor:
+  - **Now** - charge and power source (with "settling down to the charge limit" /
+    "the charge limit is holding" explained on mains), time left at this discharge's
+    screen-on average, what it was last charged to and when, and health, cycles and
+    full capacity.
+  - **This / last discharge** - time, energy and average watts for screen on, screen
+    off and asleep, plus the total.
+  - **Charge** - the last 24 hours or 7 days, the line shaded for mains, screen off and
+    asleep, and broken where the daemon was not running.
+  - **History** - days (last 31), months or years: time on battery split three ways,
+    energy used, average draw with the screen on and off, unplugs, and the average
+    charge at unplug. Days spent entirely on mains are left out.
+
+  It reads the log from disk, so it works with the daemon stopped, and refreshes every
+  5 s only while it is on screen. `fw-helperctl battery days|months|years` prints the
+  same history. Periods split at **local** midnight, with each interval divided
+  proportionally between the days it spans; the offset comes from GLib in the window
+  and libc in the CLI, since core has no time-zone database.
+
 ## 0.6.5 — 2026-11-15
 
 ### Added

@@ -145,16 +145,16 @@ impl Sample {
 /// Colours, chosen per theme rather than derived by flipping one set.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
-    ink: (f64, f64, f64),
+    pub(crate) ink: (f64, f64, f64),
     cpu: (f64, f64, f64),
     gpu: (f64, f64, f64),
-    power: (f64, f64, f64),
-    battery: (f64, f64, f64),
+    pub(crate) power: (f64, f64, f64),
+    pub(crate) battery: (f64, f64, f64),
     board: (f64, f64, f64),
     fan: (f64, f64, f64),
     memory: (f64, f64, f64),
     /// Reserved for throttling, which is a state and not an identity.
-    alert: (f64, f64, f64),
+    pub(crate) alert: (f64, f64, f64),
     /// The background this is drawn on. Only used to punch a hole behind a threshold
     /// label so it stays readable where it crosses a series.
     ///

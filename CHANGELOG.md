@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.7 — 2026-11-15
+
+### Fixed
+
+- **A sleep that changes power source is no longer counted as asleep on battery.** The
+  first real evening's log suspended on mains at 19:00 and woke unplugged at 21:42; all
+  2 h 42 min was credited to "asleep on battery", making it most of the discharge and
+  inflating the asleep draw with drain that happened on mains (the charge limit runs the
+  pack down even when plugged in). A sleep now counts as asleep only if it began and
+  ended on battery; begun on mains it counts as mains, and ended on mains as unknown.
+
 ## 0.6.6 — 2026-11-15
 
 ### Added

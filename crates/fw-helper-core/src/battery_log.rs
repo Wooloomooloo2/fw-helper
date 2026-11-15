@@ -300,7 +300,19 @@ fn intervals(entries: &[Entry]) -> Vec<Interval> {
         let kind = if a.event == Event::Stop || crashed {
             Kind::Gap
         } else if a.event == Event::Suspend {
-            Kind::Asleep
+            // The supply can change while asleep, and the log cannot say when. Seen on
+            // the first real evening (2026-11-15): suspended on mains at 19:00, unplugged
+            // in the bag, woke on battery at 21:42. Crediting all 2 h 42 min to "asleep
+            // on battery" made it most of the discharge and inflated the asleep draw
+            // with drain that happened on mains (the charge limit runs the pack down
+            // even when plugged in). So a sleep counts as asleep only if it began and
+            // ended on battery; begun on mains it is mains, and ended on mains it is
+            // unknown.
+            match (a.state.on_ac, b.state.on_ac) {
+                (Some(true), _) => Kind::Ac,
+                (_, Some(true)) => Kind::Gap,
+                _ => Kind::Asleep,
+            }
         } else if a.state.on_ac == Some(true) {
             Kind::Ac
         } else if a.state.screen_on == Some(false) {
@@ -988,6 +1000,42 @@ mod tests {
         assert_eq!(s[0].segment, Segment::Ac);
         assert_eq!((s[1].from, s[1].to), (100, 400));
         assert_eq!(s[1].percent_to, Some(84));
+    }
+
+    #[test]
+    fn unplugged_while_asleep_starts_the_discharge_at_the_wake() {
+        // The real sequence from 2026-11-15, times shortened.
+        let mut asleep = st(true, true, 92, 68.11);
+        asleep.status = Some("Discharging".into());
+        let log = vec![
+            e(0, Event::Start, st(true, true, 99, 73.63)),
+            e(2400, Event::Suspend, asleep),
+            e(12126, Event::Ac, st(false, false, 90, 67.03)),
+            e(12127, Event::Resume, st(false, true, 90, 67.03)),
+            e(12340, Event::Suspend, st(false, true, 90, 66.70)),
+            e(12500, Event::Resume, st(false, true, 90, 66.66)),
+            e(12700, Event::Percent, st(false, true, 89, 66.56)),
+        ];
+        let d = last_discharge(&log, None).unwrap();
+        assert_eq!(d.from, 12126);
+        assert_eq!(d.start_percent, Some(90));
+        assert_eq!(d.asleep.secs, 160);
+        let p = &history(&log, None, Tier::Year, UTC)[0];
+        assert_eq!(p.ac_secs, 12126);
+        assert_eq!(p.unplugs, 1);
+        assert_eq!(p.charged_to, vec![90]);
+    }
+
+    #[test]
+    fn plugged_in_while_asleep_is_unknown_not_asleep() {
+        let log = vec![
+            e(0, Event::Ac, st(false, true, 60, 42.0)),
+            e(600, Event::Suspend, st(false, true, 59, 41.3)),
+            e(9000, Event::Resume, st(true, true, 85, 60.0)),
+        ];
+        let p = &history(&log, None, Tier::Year, UTC)[0];
+        assert_eq!(p.asleep.secs, 0);
+        assert_eq!(p.unknown_secs, 8400);
     }
 
     #[test]

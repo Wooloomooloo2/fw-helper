@@ -6,57 +6,18 @@
   <vendor>fw-helper</vendor>
   <vendor_url>https://github.com/Wooloomooloo2/fw-helper</vendor_url>
 
-  <action id="org.fwhelper.set-charge-limit">
-    <description>Set the battery charge limit</description>
-    <message>Authentication is required to change the battery charge limit</message>
+  <action id="org.fwhelper.configure">
+    <description>Change fan, power, charge-limit and CPU/GPU tuning settings</description>
+    <message>Authentication is required to change Framework laptop hardware settings</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
       <!--
-        auth_admin_keep: authenticate once, then the session may adjust freely.
-        Prompting on every slider movement would train users to click through.
-      -->
-      <allow_active>auth_admin_keep</allow_active>
-    </defaults>
-  </action>
-  <action id="org.fwhelper.set-fan">
-    <description>Control the fan</description>
-    <message>Authentication is required to take manual control of the fan</message>
-    <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <!--
-        Same auth_admin_keep reasoning as the charge limit: a fan control that
-        prompts on every adjustment trains people to click through prompts.
-        Note this action also governs handing the fan back to the EC. That is the
-        safe direction, but it is still someone else's setting being changed.
-      -->
-      <allow_active>auth_admin_keep</allow_active>
-    </defaults>
-  </action>
-  <action id="org.fwhelper.set-power-limit">
-    <description>Set the sustained CPU power limit</description>
-    <message>Authentication is required to change the CPU power limit</message>
-    <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <!--
-        Same auth_admin_keep reasoning as the other knobs: a control that prompts on
-        every adjustment trains people to click through prompts.
-      -->
-      <allow_active>auth_admin_keep</allow_active>
-    </defaults>
-  </action>
-  <action id="org.fwhelper.set-tuning">
-    <description>Park CPU cores or cap the GPU frequency</description>
-    <message>Authentication is required to change CPU and GPU tuning</message>
-    <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <!--
-        auth_admin_keep, like the other hardware knobs. Note this one is reversible
-        by anything that restarts the daemon, because ADR 0014 restores on every exit
-        path; that is a reason to keep the prompt infrequent, not to drop it.
+        One action for every hardware setting (ADR 0015), auth_admin_keep: one password
+        unlocks the whole window for polkit's retention period. This used to be four
+        actions, each retained separately, so a profile switch (power limit and fan)
+        raised two dialogs back to back and moving between groups asked again - the
+        prompt-fatigue failure auth_admin_keep was chosen to avoid.
       -->
       <allow_active>auth_admin_keep</allow_active>
     </defaults>

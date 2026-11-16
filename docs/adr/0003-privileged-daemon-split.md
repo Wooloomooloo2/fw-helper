@@ -1,6 +1,6 @@
 # 0003 — Privileged daemon + unprivileged GUI over D-Bus
 
-- **Status:** Accepted
+- **Status:** Accepted; the per-action polkit split is superseded by [0015](0015-one-polkit-action-for-hardware.md)
 - **Date:** 2026-08-18
 
 ## Context
@@ -51,7 +51,7 @@ org.fwhelper.Daemon1                      (system bus, /org/fwhelper/Daemon1)
   Methods
     SetProfile(s name)                     -> polkit: org.fwhelper.set-profile     (auth_admin_keep)
     SetFanCurve(s profile, a(uu) points)   -> polkit: org.fwhelper.manage-fan      (auth_admin_keep)
-    SetChargeLimit(y percent)              -> polkit: org.fwhelper.set-charge-limit(auth_admin_keep)
+    SetChargeLimit(y percent)              -> polkit: org.fwhelper.set-charge-limit(auth_admin_keep)  [now org.fwhelper.configure, ADR 0015]
     SetPowerLimits(u pl1_uw, u pl2_uw)     -> polkit: org.fwhelper.set-power       (auth_admin_keep)
     ResetToFirmwareDefaults()              -> polkit: org.fwhelper.reset           (yes)
 ```

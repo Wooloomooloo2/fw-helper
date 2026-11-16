@@ -8,7 +8,7 @@ and setting the old one's status to `Superseded by NNNN`.
 |---|---|---|
 | [0001](0001-separate-repository.md) | Separate repository, not a fork of G-Helper | Accepted |
 | [0002](0002-rust-and-gtk4.md) | Rust for the daemon, GTK4/libadwaita for the GUI | Accepted |
-| [0003](0003-privileged-daemon-split.md) | Privileged daemon + unprivileged GUI over D-Bus | Accepted |
+| [0003](0003-privileged-daemon-split.md) | Privileged daemon + unprivileged GUI over D-Bus | Accepted (polkit split superseded by 0015) |
 | [0004](0004-sysfs-first-hardware-access.md) | Kernel sysfs first, raw EC commands only as fallback | Accepted |
 | [0005](0005-delegate-to-power-profiles-daemon.md) | Delegate profile switching to power-profiles-daemon | Accepted |
 | [0006](0006-fail-safe-fan-control.md) | Fan control must fail safe, never fail silent | Accepted (point 4 amended by 0011) |
@@ -20,3 +20,4 @@ and setting the old one's status to `Superseded by NNNN`.
 | [0012](0012-charge-limit-via-custom-ec-command.md) | Charge limit via Framework's custom EC command | Accepted |
 | [0013](0013-cap-sys-ptrace-for-gpu-load.md) | The daemon holds `CAP_SYS_PTRACE`, and nothing else | Accepted |
 | [0014](0014-parked-cores-are-fail-safe-state.md) | Parked cores and GPU frequency caps are fail-safe state | Accepted |
+| [0015](0015-one-polkit-action-for-hardware.md) | One polkit action for every hardware setting | Accepted |

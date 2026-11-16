@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.8 — 2026-11-16
+
+### Changed
+
+- **One password for every setting.** The charge limit, fan, power limit and tuning
+  were four separate polkit actions, and polkit remembers a password per action - so
+  each group asked again the first time it was touched, and switching profile raised
+  two password dialogs back to back. They are now one action, `org.fwhelper.configure`,
+  so one password covers the whole window for polkit's retention period (ADR 0015).
+  Any local polkit rule naming the old action ids stops matching and falls back to
+  asking.
+
 ## 0.6.7 — 2026-11-15
 
 ### Fixed

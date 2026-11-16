@@ -565,9 +565,8 @@ impl Daemon {
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
         let profile = self.by_name(name)?;
-        // A profile sets a power limit and takes the fan, so it needs both rights.
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
-        Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+        // A profile sets a power limit and takes the fan; one action covers both (ADR 0015).
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
 
         // Mark before asking, so the change signal cannot arrive before the flag.
         self.applied_ppd.store(
@@ -672,7 +671,7 @@ impl Daemon {
             .validate()
             .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
 
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
         let path = crate::profiles::save(&profile).map_err(zbus::fdo::Error::Failed)?;
 
         // Take effect now rather than at the next restart.
@@ -699,7 +698,7 @@ impl Daemon {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
         crate::profiles::delete(name).map_err(zbus::fdo::Error::Failed)?;
 
         if let Ok(mut known) = self.profiles.lock() {
@@ -746,7 +745,7 @@ impl Daemon {
                 self.by_name(name)?;
             }
         }
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
         if let Ok(mut state) = self.state.lock() {
             state.profile_on_ac = Some(on_ac.to_string()).filter(|v| !v.is_empty());
             state.profile_on_battery = Some(on_battery.to_string()).filter(|v| !v.is_empty());
@@ -820,7 +819,7 @@ impl Daemon {
                 "no hybrid CPU topology found, so there is nothing useful to park".into(),
             ));
         }
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_TUNING).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
 
         self.tuning
             .set_level(parsed)
@@ -874,7 +873,7 @@ impl Daemon {
                 "no xe GT frequency controls found under /sys/class/drm".into(),
             ));
         }
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_TUNING).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
 
         self.tuning
             .set_gpu_max((mhz != 0).then_some(mhz))
@@ -915,7 +914,7 @@ impl Daemon {
         if let fw_helper_core::Cap::No(reason) = &self.caps.power_limit {
             return Err(zbus::fdo::Error::NotSupported(reason.clone()));
         }
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
 
         PowerLimit::new(&self.fs)
             .set(watts)
@@ -955,7 +954,7 @@ impl Daemon {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_CHARGE_LIMIT).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
 
         crate::ec::set_charge_limit(&self.fs, &*self.ec, percent)
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -1047,7 +1046,7 @@ impl Daemon {
             )));
         }
 
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
 
         // The temperature the floor is computed against comes from the same telemetry
         // the daemon publishes, and the staleness check above is what makes it
@@ -1134,7 +1133,7 @@ impl Daemon {
         )
         .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
 
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
         let applied = self
             .fan
             .set_curve(curve, self.thermal())
@@ -1161,7 +1160,7 @@ impl Daemon {
         if let fw_helper_core::Cap::No(reason) = &self.caps.fan_control {
             return Err(zbus::fdo::Error::NotSupported(reason.clone()));
         }
-        let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+        let sender = Self::authorize(&header, conn, polkit::actions::CONFIGURE).await?;
 
         self.fan
             .release()

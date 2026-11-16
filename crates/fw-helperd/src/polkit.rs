@@ -138,10 +138,13 @@ pub async fn check(conn: &zbus::Connection, sender: &str, action: &str) -> Resul
 }
 
 pub mod actions {
-    pub const SET_CHARGE_LIMIT: &str = "org.fwhelper.set-charge-limit";
-    pub const SET_FAN: &str = "org.fwhelper.set-fan";
-    pub const SET_POWER_LIMIT: &str = "org.fwhelper.set-power-limit";
-    pub const SET_TUNING: &str = "org.fwhelper.set-tuning";
+    /// Every hardware write: charge limit, fan, power limit, profiles, tuning.
+    ///
+    /// One action rather than one per knob (ADR 0015, superseding that part of ADR
+    /// 0003). polkit retains `auth_admin_keep` per action, so four actions meant four
+    /// separate passwords and two dialogs back to back for a profile switch. Splitting
+    /// them bought a policy distinction nobody on a single-user laptop configures.
+    pub const CONFIGURE: &str = "org.fwhelper.configure";
     /// Start, stop and delete monitoring sessions.
     ///
     /// Still an action rather than an unchecked method, because it makes the daemon

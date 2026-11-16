@@ -46,7 +46,7 @@ const FLUSH_EVERY: u32 = 10;
 pub const HEADER: &str = "t_s,unix_time,cpu_pct,cpu_mhz,gpu_pct,gpu_mhz,gpu_top,\
 mem_used_mb,mem_total_mb,package_w,system_w,pl1_w,peci_c,coretemp_c,battery_c,board_c,\
 fan_rpm,fan_duty,fan_mode,throttle_events,throttle_ms,gpu_throttle,profile,on_ac,\
-battery_pct,cpu_w,gpu_w,cpu_mhz_busy,gpu_mhz_req";
+battery_pct,cpu_w,gpu_w,cpu_mhz_busy,gpu_mhz_req,ddr_c,battery_min,fps,fps_app";
 
 /// One sample. Every field is optional because every source can be absent — a machine
 /// with no battery, a GPU we cannot read, a power figure discarded as untrustworthy.
@@ -102,6 +102,19 @@ pub struct Row {
     /// `cpu_w + gpu_w` is less than it — the package also carries fabric and the
     /// memory controller, which neither rail covers.
     pub gpu_w: Option<f64>,
+    /// The DDR sensor (`ddr_*`), which the board-temperature column folds into a
+    /// maximum. Recorded on its own because memory is the one board part a game loads.
+    pub ddr_c: Option<f64>,
+    /// Minutes of battery left at this second's draw, as the kernel estimates it.
+    /// Absent on mains.
+    pub battery_min: Option<u64>,
+    /// Frames per second, from MangoHud's frame log. **Never written by the daemon**:
+    /// the frames come from a file in the user's home, so the client that exports a
+    /// session joins them in afterwards (`fw_helper_core::frames`). Empty means no game
+    /// was presenting frames, or the recording was never exported.
+    pub fps: Option<f64>,
+    /// Which program those frames came from - MangoHud's name for it.
+    pub fps_app: Option<String>,
 }
 
 /// Render a value, or an empty cell when it is not known.
@@ -128,7 +141,7 @@ impl Row {
     pub fn to_csv(&self) -> String {
         format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
-             {},{},{},{}",
+             {},{},{},{},{},{},{},{}",
             self.t_s,
             self.unix_time,
             num(&self.cpu_pct, 1),
@@ -161,6 +174,10 @@ impl Row {
             num(&self.gpu_w, 2),
             cell(&self.cpu_mhz_busy),
             cell(&self.gpu_mhz_req),
+            num(&self.ddr_c, 1),
+            cell(&self.battery_min),
+            num(&self.fps, 1),
+            self.fps_app.as_deref().map(safe).unwrap_or_default(),
         )
     }
 
@@ -207,6 +224,10 @@ impl Row {
             gpu_w: f("gpu_w"),
             cpu_mhz_busy: u("cpu_mhz_busy"),
             gpu_mhz_req: u("gpu_mhz_req"),
+            ddr_c: f("ddr_c"),
+            battery_min: u("battery_min"),
+            fps: f("fps"),
+            fps_app: s("fps_app"),
         })
     }
 }
@@ -597,6 +618,10 @@ mod tests {
             // point of carrying both is that the request and the result differ.
             cpu_mhz_busy: Some(4100),
             gpu_mhz_req: Some(2500),
+            ddr_c: Some(55.9),
+            battery_min: Some(187),
+            fps: Some(47.5),
+            fps_app: Some("Cyberpunk2077.exe".into()),
         }
     }
 

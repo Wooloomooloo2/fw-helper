@@ -264,6 +264,20 @@ pub fn row(elapsed_secs: u64, t: &Telemetry, u: &Usage, ctx: &Context) -> Row {
         profile: ctx.profile.clone(),
         on_ac: t.on_ac,
         battery_pct: t.battery_percent,
+        ddr_c: t
+            .temps
+            .iter()
+            .find(|r| r.label.starts_with("ddr"))
+            .map(|r| r.celsius),
+        // The kernel's estimate is only meaningful while discharging.
+        battery_min: if t.on_ac == Some(true) {
+            None
+        } else {
+            t.battery_minutes
+        },
+        // Filled in by the client that exports the session; see `Row::fps`.
+        fps: None,
+        fps_app: None,
     }
 }
 

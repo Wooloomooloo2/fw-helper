@@ -6,6 +6,10 @@
 //! This crate exists so the proxy is defined once. It sits outside `fw-helper-core`,
 //! which stays dependency-free (ADR 0010).
 
+pub mod bench;
+pub mod compare;
+pub mod report;
+
 use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 

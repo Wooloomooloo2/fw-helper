@@ -61,6 +61,12 @@ fn session() -> Vec<chart::Sample> {
                 fan_rpm: Some(if t < 60.0 { 0.0 } else { 900.0 + heat * 4300.0 }),
                 // Only at the top of the ramp, and only sometimes.
                 throttled: cpu_c > 88.0 && (i % 37 == 0),
+                ddr_c: Some(41.0 + heat * 14.0),
+                fps: (t >= 60.0).then(|| 48.0 + 4.0 * (t / 13.0).sin()),
+                fps_app: (t >= 60.0).then(|| "Cyberpunk2077".to_string()),
+                battery_pct: Some(85.0),
+                on_ac: Some(true),
+                ..Default::default()
             }
         })
         .collect()

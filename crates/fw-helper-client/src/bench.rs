@@ -361,6 +361,39 @@ pub fn load_frames(csv: &Path) -> Vec<Frame> {
         .unwrap_or_default()
 }
 
+/// Load a saved recording with its frames and notes, and summarise it.
+pub fn summarise(
+    csv: &Path,
+) -> std::io::Result<(
+    Session,
+    fw_helper_core::summary::RunSummary,
+    Option<RunNotes>,
+)> {
+    let session = Session::read(csv)?;
+    let frames = load_frames(csv);
+    let summary = fw_helper_core::summary::RunSummary::from_rows(
+        &session.rows,
+        (!frames.is_empty()).then_some(frames.as_slice()),
+    );
+    Ok((session, summary, load_notes(csv)))
+}
+
+/// Write a saved recording's summary page beside it, and return its path.
+pub fn write_summary(csv: &Path, utc_offset: &dyn Fn(u64) -> i64) -> std::io::Result<PathBuf> {
+    let (session, summary, notes) = summarise(csv)?;
+    let html = crate::report::summary_html(
+        &session.rows,
+        &summary,
+        notes.as_ref(),
+        &session.meta.label,
+        csv.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        utc_offset,
+    );
+    let out = report_path(csv);
+    write_atomic(&out, &html)?;
+    Ok(out)
+}
+
 /// Recordings in the benchmark folder, newest first.
 pub fn saved_sessions() -> Vec<SessionMeta> {
     session::list(&bench_dir())

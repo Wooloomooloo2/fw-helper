@@ -8,9 +8,11 @@
 
 mod battery;
 mod chart;
+mod compare;
 mod curve;
 mod monitor;
 mod overlay;
+mod shortcut;
 mod ui;
 mod units;
 mod worker;

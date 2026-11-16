@@ -60,6 +60,20 @@ pub struct Sample {
     pub battery_c: Option<f64>,
     pub board_c: Option<f64>,
     pub fan_rpm: Option<f64>,
+    pub ddr_c: Option<f64>,
+    /// Whole-machine draw, from the battery; only measurable when discharging.
+    pub system_w: Option<f64>,
+    pub battery_pct: Option<f64>,
+    pub battery_min: Option<u64>,
+    pub on_ac: Option<bool>,
+    /// From MangoHud's frame log - live, or joined into a saved recording.
+    pub fps: Option<f64>,
+    pub fps_app: Option<String>,
+    /// `auto` or `manual`, and the duty: what the fan card says under its title.
+    pub fan_mode: Option<String>,
+    pub fan_duty: Option<u8>,
+    /// The GPU's limit reasons this second, for the GPU clock card's note.
+    pub gpu_throttle: Option<String>,
     /// Anything was being held back this second: CPU thermal events, or a GPU throttle
     /// reason. Drawn as a mark rather than a series, because it is an event.
     pub throttled: bool,
@@ -111,6 +125,25 @@ impl Sample {
                 .map(|r| r.celsius),
             board_c: board,
             fan_rpm: s.fan_rpm.map(|v| v as f64),
+            ddr_c: s
+                .temps
+                .iter()
+                .find(|r| r.label.starts_with("ddr"))
+                .map(|r| r.celsius),
+            system_w: s.system_watts,
+            battery_pct: s.battery_percent.map(|v| v as f64),
+            battery_min: if s.on_ac == Some(true) {
+                None
+            } else {
+                s.battery_minutes
+            },
+            on_ac: s.on_ac,
+            // Filled in by the monitor page, which reads MangoHud's log.
+            fps: None,
+            fps_app: None,
+            fan_mode: s.fan_mode.clone(),
+            fan_duty: s.fan_duty,
+            gpu_throttle: s.load.gpu_throttle.clone(),
             throttled: s.load.throttled(),
         }
     }
@@ -137,6 +170,16 @@ impl Sample {
             battery_c: r.battery_c,
             board_c: r.board_c,
             fan_rpm: r.fan_rpm.map(|v| v as f64),
+            ddr_c: r.ddr_c,
+            system_w: r.system_w,
+            battery_pct: r.battery_pct.map(|v| v as f64),
+            battery_min: r.battery_min,
+            on_ac: r.on_ac,
+            fps: r.fps,
+            fps_app: r.fps_app.clone(),
+            fan_mode: r.fan_mode.clone(),
+            fan_duty: r.fan_duty,
+            gpu_throttle: r.gpu_throttle.clone(),
             throttled: r.throttle_events > 0 || r.gpu_throttle.is_some(),
         }
     }
@@ -213,8 +256,9 @@ const TJMAX_C: f64 = 100.0;
 /// The battery's critical temperature. Unlike the CPU it has no protection of its own.
 const BATTERY_CRIT_C: f64 = 49.9;
 
-const HEADER_H: f64 = 15.0;
-const PLOT_H: f64 = 64.0;
+/// Two lines: the title (and a note), then the series and their latest values.
+const HEADER_H: f64 = 30.0;
+const PLOT_H: f64 = 84.0;
 /// Space between cards when the whole column is drawn onto one surface. The live
 /// widget gets this from the box's spacing plus the cards' own padding instead.
 #[allow(dead_code)]
@@ -225,34 +269,42 @@ const PAD_R: f64 = 10.0;
 
 /// One measured quantity, which is one card.
 ///
-/// Ordered as the eye should read them: what was asked of the machine, what that cost
-/// in watts, what it did to temperatures, what the fan did about it. Memory last — it
-/// is the one figure here that no thermal or power decision depends on.
+/// Ordered as the eye should read them, in pairs across the two columns: what was asked
+/// of the machine and how fast it ran, the GPU's clock against its power, what that did
+/// to temperatures and what the fan did about it, then memory and frame rate, and the
+/// battery last - it spans both columns when it is alone on its row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     Load,
-    Clock,
+    CpuClock,
+    GpuClock,
     Power,
     Temperature,
     Fan,
     Memory,
+    Fps,
+    Battery,
 }
 
-pub const METRICS: [Metric; 6] = [
+pub const METRICS: [Metric; 9] = [
     Metric::Load,
-    Metric::Clock,
+    Metric::CpuClock,
+    Metric::GpuClock,
     Metric::Power,
     Metric::Temperature,
     Metric::Fan,
     Metric::Memory,
+    Metric::Fps,
+    Metric::Battery,
 ];
 
-/// Height of one card's drawing area: its header, and its plot.
+/// Height of one card's drawing area: its header, its plot and its own time axis.
 pub fn card_height() -> i32 {
-    (HEADER_H + PLOT_H) as i32
+    (HEADER_H + PLOT_H + AXIS_H) as i32
 }
 
-/// Height of the shared time axis under the column.
+/// Height of a card's time axis.
+#[allow(dead_code)]
 pub fn axis_height() -> i32 {
     AXIS_H as i32
 }
@@ -260,7 +312,7 @@ pub fn axis_height() -> i32 {
 /// Total height the whole column needs when drawn onto a single surface.
 #[allow(dead_code)]
 pub fn natural_height() -> i32 {
-    ((HEADER_H + PLOT_H + STRIP_GAP) * METRICS.len() as f64 + AXIS_H) as i32
+    ((HEADER_H + PLOT_H + AXIS_H + STRIP_GAP) * METRICS.len() as f64) as i32
 }
 
 /// How one series is read out of a sample.
@@ -284,56 +336,61 @@ struct Strip {
     thresholds: Vec<(f64, String)>,
     /// Draw the "something was throttled" marks along this strip's baseline.
     mark_throttle: bool,
+    /// A few words after the title about the newest sample: which program the frame
+    /// rate is from, how long the battery has left, who owns the fan.
+    note: Option<String>,
 }
 
 /// What one card plots, and what it is read against.
 fn strip(metric: Metric, p: &Palette, samples: &[Sample]) -> Strip {
+    let last = samples.last();
+    let base = |title, series, y_min, y_floor_max, unit| Strip {
+        title,
+        series,
+        y_min,
+        y_floor_max,
+        unit,
+        thresholds: Vec::new(),
+        mark_throttle: false,
+        note: None,
+    };
     match metric {
-        Metric::Load => Strip {
-            title: "load",
-            series: vec![("cpu", p.cpu, |s| s.cpu_pct), ("gpu", p.gpu, |s| s.gpu_pct)],
-            y_min: 0.0,
-            y_floor_max: 100.0,
-            unit: "%",
-            thresholds: Vec::new(),
-            mark_throttle: false,
-        },
-        // Achieved clocks, with the GPU's requested one drawn beside them.
-        //
-        // The request is on the strip deliberately. Every other tool on this machine
-        // reports it *as* the clock — Mission Center, nvtop and turbostat's GFXMHz all
-        // show a flat 2500 while the GPU runs at 1950 — so drawing the two together is
-        // what makes the distinction visible instead of merely claimed. The gap between
-        // the lines is the thing worth seeing.
-        //
-        // CPU and GPU share an axis here, unlike the rest of this module's small
-        // multiples, because for once the quantities really are the same: both are MHz.
-        Metric::Clock => Strip {
-            title: "clock (achieved)",
-            series: vec![
-                ("cpu busy", p.cpu, |s| s.cpu_mhz),
-                ("gpu", p.gpu, |s| s.gpu_mhz),
-                ("gpu requested", p.board, |s| s.gpu_mhz_req),
-            ],
-            y_min: 0.0,
-            y_floor_max: 2600.0,
-            unit: "MHz",
-            thresholds: Vec::new(),
-            mark_throttle: false,
+        Metric::Load => base(
+            "load",
+            vec![("cpu", p.cpu, |s| s.cpu_pct), ("gpu", p.gpu, |s| s.gpu_pct)],
+            0.0,
+            100.0,
+            "%",
+        ),
+        // The clock the busy cores actually ran at (turbostat's Bzy_MHz), not the flat
+        // mean over sixteen cores, which reads ~1500 MHz with one core pegged at 4300.
+        Metric::CpuClock => base(
+            "cpu clock (busy cores)",
+            vec![("cpu", p.cpu, |s| s.cpu_mhz)],
+            0.0,
+            4800.0,
+            "MHz",
+        ),
+        // Achieved against requested. Every other tool on this machine reports the
+        // request *as* the clock - Mission Center, nvtop and turbostat's GFXMHz all show
+        // a flat 2500 while the GPU runs at 1950 - so drawing the two together is what
+        // makes the distinction visible instead of merely claimed.
+        Metric::GpuClock => Strip {
+            note: last
+                .and_then(|s| s.gpu_throttle.clone())
+                .map(|t| format!("limit: {t}")),
+            ..base(
+                "gpu clock",
+                vec![
+                    ("asked", p.board, |s| s.gpu_mhz_req),
+                    ("actual", p.gpu, |s| s.gpu_mhz),
+                ],
+                0.0,
+                2600.0,
+                "MHz",
+            )
         },
         Metric::Power => Strip {
-            title: "package power",
-            // Package first so it reads as the total, with the two rails beneath it.
-            // Deliberately not stacked: cores + iGPU is less than the package, and a
-            // stacked area would assert an equality that does not hold.
-            series: vec![
-                ("package", p.power, |s| s.package_w),
-                ("cpu", p.cpu, |s| s.cpu_w),
-                ("gpu", p.gpu, |s| s.gpu_w),
-            ],
-            y_min: 0.0,
-            y_floor_max: 40.0,
-            unit: "W",
             // The setpoint in force at the end of the window: what the trace should be
             // read against right now.
             thresholds: samples
@@ -345,40 +402,92 @@ fn strip(metric: Metric, p: &Palette, samples: &[Sample]) -> Strip {
             // Throttle events belong here: this is the strip where being held back is
             // the thing under discussion.
             mark_throttle: true,
+            // Package first so it reads as the total, with the rails beneath it.
+            // Deliberately not stacked: cores + iGPU is less than the package, and a
+            // stacked area would assert an equality that does not hold. System is the
+            // whole machine from the battery, so it only exists when discharging.
+            ..base(
+                "power",
+                vec![
+                    ("package", p.power, |s| s.package_w),
+                    ("cpu", p.cpu, |s| s.cpu_w),
+                    ("gpu", p.gpu, |s| s.gpu_w),
+                    ("system", p.battery, |s| s.system_w),
+                ],
+                0.0,
+                40.0,
+                "W",
+            )
         },
         Metric::Temperature => Strip {
-            title: "temperature",
-            series: vec![
-                ("cpu", p.cpu, |s| s.cpu_c),
-                ("battery", p.battery, |s| s.battery_c),
-                ("board", p.board, |s| s.board_c),
-            ],
-            y_min: 20.0,
-            y_floor_max: TJMAX_C,
-            unit: "\u{b0}C",
             thresholds: vec![
                 (TJMAX_C, "Tjmax 100\u{b0}".to_string()),
                 (BATTERY_CRIT_C, "battery crit 50\u{b0}".to_string()),
             ],
-            mark_throttle: false,
+            ..base(
+                "temperature",
+                vec![
+                    ("cpu", p.cpu, |s| s.cpu_c),
+                    ("ddr", p.memory, |s| s.ddr_c),
+                    ("battery", p.battery, |s| s.battery_c),
+                    ("board", p.board, |s| s.board_c),
+                ],
+                20.0,
+                TJMAX_C,
+                "\u{b0}C",
+            )
         },
         Metric::Fan => Strip {
-            title: "fan",
-            series: vec![("speed", p.fan, |s| s.fan_rpm)],
-            y_min: 0.0,
-            y_floor_max: 5200.0,
-            unit: "rpm",
-            thresholds: Vec::new(),
-            mark_throttle: false,
+            note: last.and_then(|s| match (s.fan_mode.as_deref(), s.fan_duty) {
+                (Some("manual"), Some(d)) => Some(format!("fw-helper, duty {d}/255")),
+                (Some("manual"), None) => Some("fw-helper".into()),
+                (Some(_), _) => Some("EC auto".into()),
+                _ => None,
+            }),
+            ..base(
+                "fan",
+                vec![("speed", p.fan, |s| s.fan_rpm)],
+                0.0,
+                5200.0,
+                "rpm",
+            )
         },
-        Metric::Memory => Strip {
-            title: "memory",
-            series: vec![("used", p.memory, |s| s.mem_pct)],
-            y_min: 0.0,
-            y_floor_max: 100.0,
-            unit: "%",
-            thresholds: Vec::new(),
-            mark_throttle: false,
+        Metric::Memory => base(
+            "memory",
+            vec![("used", p.memory, |s| s.mem_pct)],
+            0.0,
+            100.0,
+            "%",
+        ),
+        // Frame rate has no natural ceiling: start the axis at 60 so a 30 fps game
+        // does not fill the card, and let a faster one raise it.
+        Metric::Fps => Strip {
+            note: samples
+                .iter()
+                .rev()
+                .find_map(|s| s.fps_app.clone())
+                .or_else(|| {
+                    (!samples.iter().any(|s| s.fps.is_some()))
+                        .then(|| "no game logging frames - see MangoHud in the README".into())
+                }),
+            ..base("frame rate", vec![("fps", p.fan, |s| s.fps)], 0.0, 60.0, "")
+        },
+        Metric::Battery => Strip {
+            note: last.and_then(|s| match (s.on_ac, s.battery_min) {
+                (Some(true), _) => Some("on mains".into()),
+                (_, Some(m)) => Some(match s.system_w {
+                    Some(w) => format!("{}h{:02} left at {w:.1} W", m / 60, m % 60),
+                    None => format!("{}h{:02} left", m / 60, m % 60),
+                }),
+                _ => None,
+            }),
+            ..base(
+                "battery",
+                vec![("charge", p.battery, |s| s.battery_pct)],
+                0.0,
+                100.0,
+                "%",
+            )
         },
     }
 }
@@ -448,20 +557,22 @@ pub struct ChartData {
     pub placeholder: String,
 }
 
-/// One card per measurement, sharing one set of samples and one time axis.
+/// One card per measurement, sharing one set of samples.
 ///
 /// The samples live in a single [`ChartData`] that every card borrows, rather than a
-/// copy each: a loaded session is tens of thousands of rows, and five clones of it per
-/// view would be megabytes moved every time the source row changes.
+/// copy each: a loaded session is tens of thousands of rows, and nine clones of it per
+/// view would be megabytes moved every time the source changes.
+///
+/// The cards flow two to a row, like the Windows build's grid, and fall back to one
+/// column when the window is narrow. Each carries its own time axis, since in a grid
+/// there is no single column foot to share one at.
 pub struct ChartStack {
     pub widget: gtk::Box,
     data: Rc<RefCell<ChartData>>,
-    /// The cards themselves, hidden wholesale when there is nothing to plot — five
-    /// empty boxes each saying "no data" is worse than one sentence saying why.
-    cards: Vec<gtk::Widget>,
+    /// Hidden wholesale when there is nothing to plot - nine empty boxes each saying
+    /// "no data" is worse than one sentence saying why.
+    grid: gtk::FlowBox,
     areas: Vec<gtk::DrawingArea>,
-    axis: gtk::DrawingArea,
-    axis_holder: gtk::Widget,
     empty: gtk::Label,
 }
 
@@ -485,11 +596,22 @@ impl ChartStack {
             .build();
         widget.append(&empty);
 
-        let mut cards = Vec::new();
+        let grid = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .homogeneous(true)
+            .min_children_per_line(1)
+            .max_children_per_line(2)
+            .column_spacing(10)
+            .row_spacing(10)
+            .build();
+
         let mut areas = Vec::new();
         for metric in METRICS {
             let area = gtk::DrawingArea::builder()
                 .content_height(card_height())
+                // Below this the two-line header no longer fits, so the box drops to
+                // one column instead of squeezing.
+                .width_request(330)
                 .hexpand(true)
                 .build();
             let for_draw = Rc::clone(&data);
@@ -506,36 +628,20 @@ impl ChartStack {
                 .css_classes(["card", "chart-card"])
                 .build();
             card.append(&area);
-            widget.append(&card);
-            cards.push(card.upcast::<gtk::Widget>());
+            let child = gtk::FlowBoxChild::builder()
+                .child(&card)
+                .focusable(false)
+                .build();
+            grid.append(&child);
             areas.push(area);
         }
-
-        // The axis sits outside the cards but inside the same horizontal padding, so
-        // its ticks line up with the plots above rather than with the window.
-        let axis = gtk::DrawingArea::builder()
-            .content_height(axis_height())
-            .hexpand(true)
-            .build();
-        let for_axis = Rc::clone(&data);
-        axis.set_draw_func(move |_area, cr, w, h| {
-            let palette = Palette::for_theme(adw::StyleManager::default().is_dark());
-            draw_axis(cr, w, h, &for_axis.borrow(), palette);
-        });
-        let axis_holder = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .css_classes(["chart-axis"])
-            .build();
-        axis_holder.append(&axis);
-        widget.append(&axis_holder);
+        widget.append(&grid);
 
         let stack = Rc::new(Self {
             widget,
             data,
-            cards,
+            grid,
             areas,
-            axis,
-            axis_holder: axis_holder.upcast(),
             empty,
         });
         stack.show_cards(false);
@@ -549,7 +655,6 @@ impl ChartStack {
         for area in &self.areas {
             area.queue_draw();
         }
-        self.axis.queue_draw();
     }
 
     pub fn set_placeholder(&self, text: &str) {
@@ -558,10 +663,7 @@ impl ChartStack {
     }
 
     fn show_cards(&self, any: bool) {
-        for card in &self.cards {
-            card.set_visible(any);
-        }
-        self.axis_holder.set_visible(any);
+        self.grid.set_visible(any);
         self.empty.set_visible(!any);
         if !any {
             self.empty.set_label(&self.data.borrow().placeholder);
@@ -592,9 +694,19 @@ pub fn draw_metric(
     let x_of = x_mapper(w, d);
     let strip = strip(metric, &p, &d.samples);
     draw_strip(cr, &p, &strip, d, 0.0, w, &x_of, t_min, t_span, plot_w);
+    draw_time_axis(
+        cr,
+        &p,
+        HEADER_H + PLOT_H + 4.0,
+        w,
+        t_min,
+        t_min + t_span,
+        &x_of,
+    );
 }
 
-/// Draw the time axis the cards share.
+/// Draw a time axis on its own.
+#[allow(dead_code)]
 pub fn draw_axis(cr: &gtk::cairo::Context, w: i32, _h: i32, d: &ChartData, p: Palette) {
     let w = f64::from(w);
     if d.samples.is_empty() {
@@ -637,7 +749,14 @@ pub fn draw(cr: &gtk::cairo::Context, w: i32, h: i32, d: &ChartData, p: Palette)
         // The card behind the strip, so the rendered image matches the window rather
         // than a continuous surface the window has not drawn since the strips became
         // cards.
-        rounded_rect(cr, 0.0, top - 6.0, w, HEADER_H + PLOT_H + 12.0, 10.0);
+        rounded_rect(
+            cr,
+            0.0,
+            top - 6.0,
+            w,
+            HEADER_H + PLOT_H + AXIS_H + 12.0,
+            10.0,
+        );
         cr.set_source_rgb(p.surface.0, p.surface.1, p.surface.2);
         let _ = cr.fill();
 
@@ -645,9 +764,17 @@ pub fn draw(cr: &gtk::cairo::Context, w: i32, h: i32, d: &ChartData, p: Palette)
         draw_strip(
             cr, &p, &strip, d, top, w, &x_of, geo.t_min, geo.t_span, geo.plot_w,
         );
-        top += HEADER_H + PLOT_H + STRIP_GAP;
+        draw_time_axis(
+            cr,
+            &p,
+            top + HEADER_H + PLOT_H + 4.0,
+            w,
+            geo.t_min,
+            geo.t_max,
+            &x_of,
+        );
+        top += HEADER_H + PLOT_H + AXIS_H + STRIP_GAP;
     }
-    draw_time_axis(cr, &p, top, w, geo.t_min, geo.t_max, &x_of);
 }
 
 /// Font and line width, identical for every entry point.
@@ -728,7 +855,7 @@ fn draw_strip(
         }
     }
     if data_max > y_max {
-        y_max = data_max * 1.05;
+        y_max = nice_ceiling(data_max * 1.05);
     }
     // A threshold must never be drawn off the top of its own strip.
     for (value, _) in &strip.thresholds {
@@ -737,32 +864,52 @@ fn draw_strip(
     let y_span = (y_max - strip.y_min).max(1.0);
     let y_of = |v: f64| plot_bottom - ((v - strip.y_min) / y_span).clamp(0.0, 1.0) * PLOT_H;
 
-    // --- header: the title, then a swatch, name and current value per series.
-    cr.set_source_rgba(r, g, b, 0.55);
-    cr.move_to(PAD_L, top + 10.0);
+    // --- header, line one: the title, and a note about the newest sample.
+    cr.set_source_rgba(r, g, b, 0.80);
+    cr.select_font_face(
+        "sans-serif",
+        gtk::cairo::FontSlant::Normal,
+        gtk::cairo::FontWeight::Bold,
+    );
+    cr.set_font_size(11.0);
+    cr.move_to(PAD_L, top + 11.0);
     let _ = cr.show_text(strip.title);
+    let title_w = cr
+        .text_extents(strip.title)
+        .map(|e| e.x_advance())
+        .unwrap_or(60.0);
+    prepare(cr);
+    if let Some(note) = &strip.note {
+        cr.set_source_rgba(r, g, b, 0.50);
+        cr.move_to(PAD_L + title_w + 10.0, top + 11.0);
+        let _ = cr.show_text(note);
+    }
 
-    // Laid out right to left so the values line up with the plot's right edge, which is
-    // where the most recent sample is.
-    let mut cursor = w - PAD_R;
-    for &(name, colour, accessor) in strip.series.iter().rev() {
+    // --- line two: a swatch, name and latest value per series, left to right. Its own
+    // line rather than beside the title, because the cards are half the window wide and
+    // four series beside a title do not fit.
+    let mut cursor = PAD_L;
+    for &(name, colour, accessor) in &strip.series {
         let latest = d.samples.iter().rev().find_map(accessor);
         let text = match latest {
             Some(v) if strip.unit == "rpm" => format!("{name} {v:.0} {}", strip.unit),
+            Some(v) if strip.unit == "W" => format!("{name} {v:.1} {}", strip.unit),
             Some(v) => format!("{name} {v:.0}{}", strip.unit),
             None => format!("{name} \u{2013}"),
         };
-        let width = cr.text_extents(&text).map(|e| e.width()).unwrap_or(60.0);
-        cursor -= width;
+        cr.set_source_rgb(colour.0, colour.1, colour.2);
+        cr.rectangle(cursor, top + 18.5, 7.0, 7.0);
+        let _ = cr.fill();
+        cursor += 11.0;
         // Text in ink, never in the series colour: the swatch beside it carries identity.
         cr.set_source_rgba(r, g, b, 0.75);
-        cr.move_to(cursor, top + 10.0);
+        cr.move_to(cursor, top + 25.0);
         let _ = cr.show_text(&text);
-        cursor -= 6.0;
-        cr.set_source_rgb(colour.0, colour.1, colour.2);
-        cr.rectangle(cursor - 6.0, top + 3.5, 6.0, 6.0);
-        let _ = cr.fill();
-        cursor -= 14.0;
+        cursor += cr
+            .text_extents(&text)
+            .map(|e| e.x_advance())
+            .unwrap_or(60.0)
+            + 14.0;
     }
 
     // --- grid: solid hairlines, one shade off the surface. Never dashed, so that
@@ -879,6 +1026,16 @@ fn draw_strip(
         }
         let _ = cr.stroke();
     }
+}
+
+/// Round an axis maximum up to a multiple of 2 x 10^k, so the half-way gridline lands
+/// on a round number too: 44 -> 60, 68 -> 80, 4400 -> 6000.
+fn nice_ceiling(v: f64) -> f64 {
+    if v <= 0.0 || !v.is_finite() {
+        return 1.0;
+    }
+    let unit = 2.0 * 10f64.powf(v.log10().floor());
+    (v / unit).ceil() * unit
 }
 
 fn format_tick(v: f64) -> String {
@@ -1005,6 +1162,15 @@ mod tests {
         assert!((cols[0].x - 10.0).abs() < 0.1, "x was {}", cols[0].x);
         assert_eq!(cols[1].mean, 60.0);
         assert!((cols[1].x - 20.0).abs() < 0.1, "x was {}", cols[1].x);
+    }
+
+    #[test]
+    fn axis_maxima_round_up_to_round_numbers() {
+        assert_eq!(nice_ceiling(44.1), 60.0);
+        assert_eq!(nice_ceiling(67.8), 80.0);
+        assert_eq!(nice_ceiling(4400.0), 6000.0);
+        assert_eq!(nice_ceiling(105.0), 200.0);
+        assert_eq!(nice_ceiling(0.0), 1.0);
     }
 
     #[test]

@@ -17,7 +17,10 @@ fn export_joins_frames_keeps_notes_and_is_repeatable() {
     std::env::set_var("FW_HELPER_MANGOHUD_DIR", &mango);
 
     // A ten-second recording, as the daemon writes it: no fps.
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let start = now - 20;
     let mut rec = Recorder::start(&daemon, "cp2077 test").unwrap();
     for i in 0..10 {
@@ -70,9 +73,17 @@ fn export_joins_frames_keeps_notes_and_is_repeatable() {
     let first_frame = end as f64 - last_ns as f64 / 1e9;
     for r in &s.rows {
         let covered = (r.unix_time as f64) > first_frame && r.unix_time <= end;
-        assert_eq!(r.fps.is_some(), covered, "row at {} (frames {first_frame}..{end})", r.unix_time);
+        assert_eq!(
+            r.fps.is_some(),
+            covered,
+            "row at {} (frames {first_frame}..{end})",
+            r.unix_time
+        );
         if let Some(f) = r.fps {
-            assert!((f - 62.5).abs() < 0.01, "16 ms frames are 62.5 fps, got {f}");
+            assert!(
+                (f - 62.5).abs() < 0.01,
+                "16 ms frames are 62.5 fps, got {f}"
+            );
             assert_eq!(r.fps_app.as_deref(), Some("Cyberpunk2077"));
         }
     }
@@ -86,7 +97,10 @@ fn export_joins_frames_keeps_notes_and_is_repeatable() {
     bench::save_notes(&out.csv, &n).unwrap();
     bench::export(&session_path).unwrap();
     assert_eq!(
-        bench::load_notes(&out.csv).unwrap().game_settings.as_deref(),
+        bench::load_notes(&out.csv)
+            .unwrap()
+            .game_settings
+            .as_deref(),
         Some("1080p Medium")
     );
 

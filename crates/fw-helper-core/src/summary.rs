@@ -182,7 +182,9 @@ pub const COLUMNS: &[Column] = &[
         key: "gpu_mhz",
         label: "GPU clock",
         unit: "MHz",
-        get: |r| r.gpu_mhz.map(|v| v as f64),
+        // 0 is the GT asleep in RC6 at the instant of the read, not a clock: averaging
+        // it in would report an idle-ish GPU as running at a fraction of its speed.
+        get: |r| r.gpu_mhz.filter(|&v| v > 0).map(|v| v as f64),
     },
     Column {
         key: "gpu_req_mhz",
@@ -342,7 +344,7 @@ impl RunSummary {
         let with_gpu: Vec<&Row> = kept
             .iter()
             .copied()
-            .filter(|r| r.gpu_mhz.is_some())
+            .filter(|r| r.gpu_mhz.is_some_and(|v| v > 0))
             .collect();
         let gpu_throttle = shares(&with_gpu, |r| {
             Some(r.gpu_throttle.clone().unwrap_or_else(|| "none".into()))

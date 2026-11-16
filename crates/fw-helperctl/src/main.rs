@@ -32,9 +32,15 @@ USAGE:
     fw-helperctl auto-profile off      stop switching automatically
     fw-helperctl record            what is being recorded, and what has been
     fw-helperctl record start [NAME]  start recording a session
-    fw-helperctl record stop       stop recording
+    fw-helperctl record stop       stop recording, and save it to FW Benchmark
+    fw-helperctl record toggle [NAME] start or stop - bind this to a keyboard shortcut
     fw-helperctl record rm NAME    delete a recorded session
     fw-helperctl hud               one status line, for an in-game overlay
+    fw-helperctl bench             recordings saved in ~/Documents/FW Benchmark
+    fw-helperctl bench save NAME   save (export) a daemon recording there, with its FPS
+    fw-helperctl bench report NAME make its HTML summary and print the path
+    fw-helperctl bench compare PROJECT   make a compare project's HTML report
+    fw-helperctl fps               the frame rate now, from MangoHud's log
     fw-helperctl battery           time on battery, where the charge went, last charge
     fw-helperctl battery days|months|years   history: time, energy and draw on battery
     fw-helperctl tune              CPU clusters and GPU frequency, as discovered
@@ -66,6 +72,11 @@ fn main() {
             args.get(2).map(String::as_str),
         ),
         Some("hud") => hud(),
+        Some("bench") => bench_cmd(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        Some("fps") => fps(),
         Some("battery") => battery(args.get(1).map(String::as_str)),
         Some("tune") => tune(
             args.get(1).map(String::as_str),
@@ -658,13 +669,32 @@ fn record(action: Option<&str>, name: Option<&str>) {
                 }
             }
         }
-        Some("stop") => match d.stop_recording() {
-            Ok(path) => println!("recorded {path}"),
-            Err(e) => {
-                eprintln!("could not stop recording: {}", describe(e));
-                std::process::exit(1);
+        Some("stop") => stop_and_save(&d),
+        Some("toggle") => {
+            let recording = matches!(d.recording_session(), Ok((label, ..)) if !label.is_empty());
+            if recording {
+                stop_and_save(&d);
+            } else {
+                // Named after the game if one is running, as the window does.
+                let label = name
+                    .map(str::to_string)
+                    .or_else(|| fw_helper_client::bench::live_fps().map(|(_, app)| app))
+                    .unwrap_or_else(|| "session".into());
+                match d.start_recording(&label) {
+                    Ok(path) => {
+                        println!("recording to {path}");
+                        notify(
+                            "Recording",
+                            &format!("{label} - press the shortcut again to stop"),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("could not start recording: {}", describe(e));
+                        std::process::exit(1);
+                    }
+                }
             }
-        },
+        }
         Some("rm") | Some("delete") => {
             let Some(name) = name else {
                 eprintln!("which session? `fw-helperctl record` lists them");
@@ -684,6 +714,226 @@ fn record(action: Option<&str>, name: Option<&str>) {
             std::process::exit(2);
         }
     }
+}
+
+/// Stop, then export into the benchmark folder - the step that joins in the frame rate,
+/// which the daemon cannot see.
+fn stop_and_save(d: &DaemonProxyBlocking<'_>) {
+    let path = match d.stop_recording() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("could not stop recording: {}", describe(e));
+            std::process::exit(1);
+        }
+    };
+    println!("recorded {path}");
+    match fw_helper_client::bench::export(std::path::Path::new(&path)) {
+        Ok(out) => {
+            println!("saved {}", out.csv.display());
+            match &out.game {
+                Some(g) => println!("  with frame times from {g}"),
+                None => println!("  no MangoHud frames in that window, so no FPS"),
+            }
+            notify(
+                "Recording saved",
+                &format!(
+                    "{}{}",
+                    out.csv
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default(),
+                    out.game.map(|g| format!(" - {g}")).unwrap_or_default()
+                ),
+            );
+        }
+        Err(e) => eprintln!(
+            "could not save it to {}: {e}",
+            fw_helper_client::bench::bench_dir().display()
+        ),
+    }
+}
+
+/// A desktop notification, for the keyboard-shortcut path where no terminal is
+/// watching. Best effort: no notify-send, no notification.
+fn notify(title: &str, body: &str) {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        return;
+    }
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=fw-helper", "--icon=media-record", title, body])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn fps() {
+    fw_helper_client::bench::ensure_mangohud_dir();
+    match fw_helper_client::bench::live_fps() {
+        Some((fps, app)) => println!("{fps:.0} fps  {app}"),
+        None => {
+            println!("no game is logging frames");
+            println!(
+                "  MangoHud logs to {} when launched with fw-helper's config:",
+                fw_helper_client::bench::mangohud_dir().display()
+            );
+            println!("  MANGOHUD=1 MANGOHUD_CONFIGFILE=/usr/share/fw-helper/mangohud/fw-helper.conf %command%");
+        }
+    }
+}
+
+/// A saved recording by name: the file stem, with or without `.csv`.
+fn saved_csv(name: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(name);
+    if p.is_absolute() || p.exists() {
+        return p.to_path_buf();
+    }
+    let stem = name.strip_suffix(".csv").unwrap_or(name);
+    fw_helper_client::bench::bench_dir().join(format!("{stem}.csv"))
+}
+
+fn open_in_browser(path: &std::path::Path) {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+fn bench_cmd(action: Option<&str>, name: Option<&str>) {
+    use fw_helper_client::{bench, compare};
+    let need = |what: &str| -> &str {
+        name.unwrap_or_else(|| {
+            eprintln!("which {what}? `fw-helperctl bench` lists them");
+            std::process::exit(2);
+        })
+    };
+    match action {
+        None | Some("list") => {
+            let dir = bench::bench_dir();
+            let saved = bench::saved_sessions();
+            println!("{}", dir.display());
+            if saved.is_empty() {
+                println!("  nothing saved yet - `fw-helperctl record stop` saves here");
+            }
+            for s in &saved {
+                let csv = &s.path;
+                let notes = bench::load_notes(csv);
+                let frames = bench::frames_path(csv).exists();
+                println!(
+                    "  {:<40} {:>8}{}{}",
+                    s.name,
+                    human_bytes(s.bytes),
+                    if frames { "  frames" } else { "" },
+                    notes
+                        .and_then(|n| n.game_settings)
+                        .map(|g| format!("  {g}"))
+                        .unwrap_or_default()
+                );
+            }
+            if let Ok(entries) = std::fs::read_dir(bench::projects_dir()) {
+                let mut projects: Vec<String> = entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter_map(|n| n.strip_suffix(bench::PROJECT_SUFFIX).map(str::to_string))
+                    .collect();
+                projects.sort();
+                if !projects.is_empty() {
+                    println!("\ncompare projects:");
+                    for p in projects {
+                        println!("  {p}");
+                    }
+                }
+            }
+        }
+        Some("save") | Some("export") => {
+            let name = need("recording");
+            let (d, _) = match connect() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("fw-helperd unavailable ({e}); it lists the recordings to save");
+                    std::process::exit(1);
+                }
+            };
+            let Some(s) = SessionInfo::fetch(&d).into_iter().find(|s| s.name == name) else {
+                eprintln!("no recording called {name}; `fw-helperctl record` lists them");
+                std::process::exit(1);
+            };
+            match bench::export(std::path::Path::new(&s.path)) {
+                Ok(out) => println!(
+                    "saved {}{}",
+                    out.csv.display(),
+                    out.game
+                        .map(|g| format!(" with frames from {g}"))
+                        .unwrap_or_default()
+                ),
+                Err(e) => {
+                    eprintln!("could not save {name}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("report") | Some("summary") => {
+            let csv = saved_csv(need("recording"));
+            match fw_helper_client::bench::write_summary(&csv, &utc_offset_i) {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    open_in_browser(&path);
+                }
+                Err(e) => {
+                    eprintln!("could not summarise {}: {e}", csv.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("compare") => {
+            let name = need("project");
+            let path = if std::path::Path::new(name).exists() {
+                std::path::PathBuf::from(name)
+            } else {
+                compare::project_path(&bench::projects_dir(), name)
+            };
+            let project = match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| compare::CompareProject::from_json(&t))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("could not read {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            };
+            let entries = compare::entries(&project);
+            let html = compare::html(
+                &project.name,
+                &entries,
+                project.baseline_index(),
+                &path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                &utc_offset_i,
+            );
+            let out = path.with_extension("html");
+            if let Err(e) = std::fs::write(&out, html) {
+                eprintln!("could not write {}: {e}", out.display());
+                std::process::exit(1);
+            }
+            println!("{}", out.display());
+            open_in_browser(&out);
+        }
+        Some(other) => {
+            eprintln!("unknown bench action: {other}\n");
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn utc_offset_i(t: u64) -> i64 {
+    utc_offset(t)
 }
 
 fn record_list(d: &DaemonProxyBlocking<'_>) {
@@ -715,12 +965,6 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-/// The one-line status an in-game overlay shows.
-///
-/// Reads the file the daemon writes rather than asking over D-Bus: this is meant to be
-/// wired into MangoHud's `exec=`, which runs inside the game's frame loop, and opening
-/// a bus connection per frame would be a frame-time bug. The D-Bus path is only the
-/// fallback for when the file is missing.
 /// `2 h 14 min`, `14 min`, `40 s`.
 fn span(secs: u64) -> String {
     let (h, m) = (secs / 3600, secs % 3600 / 60);
@@ -734,8 +978,6 @@ fn span(secs: u64) -> String {
     }
 }
 
-/// Read straight from the log file, so this works with no daemon running. Times are
-/// given as "ago" rather than clock times: core is std-only and std knows no time zone.
 /// Local offset from UTC at a Unix instant, from the system's time zone.
 fn utc_offset(t: u64) -> i64 {
     let tt = t as libc::time_t;
@@ -807,6 +1049,7 @@ fn battery_history(
     }
 }
 
+/// Read straight from the log file, so this works with no daemon running.
 fn battery(view: Option<&str>) {
     use fw_helper_core::battery_log::{
         last_charged_to, last_discharge, log_path, parse, BatteryState, Entry, Event, Share, Tier,
@@ -972,6 +1215,12 @@ fn battery(view: Option<&str>) {
     }
 }
 
+/// The one-line status an in-game overlay shows.
+///
+/// Reads the file the daemon writes rather than asking over D-Bus: this is meant to be
+/// wired into MangoHud's `exec=`, which runs inside the game's frame loop, and opening
+/// a bus connection per frame would be a frame-time bug. The D-Bus path is only the
+/// fallback for when the file is missing.
 fn hud() {
     const HUD_FILE: &str = "/run/fw-helper/hud";
     if let Ok(line) = std::fs::read_to_string(HUD_FILE) {

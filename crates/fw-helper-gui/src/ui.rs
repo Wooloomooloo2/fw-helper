@@ -359,6 +359,13 @@ pub fn build(app: &adw::Application) {
         "Battery",
         "battery-symbolic",
     );
+    // The Monitor page's Battery button, as the Windows monitor window has.
+    let to_battery = stack.downgrade();
+    monitor.set_show_battery(move || {
+        if let Some(stack) = to_battery.upgrade() {
+            stack.set_visible_child_name("battery");
+        }
+    });
 
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

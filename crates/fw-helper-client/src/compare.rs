@@ -137,6 +137,78 @@ pub struct Entry {
     pub notes: Option<RunNotes>,
 }
 
+/// Load every run of a project that can still be read. A run whose file has gone is
+/// left out with a message on stderr rather than failing the whole comparison.
+pub fn entries(p: &CompareProject) -> Vec<Entry> {
+    let dir = crate::bench::bench_dir();
+    p.runs
+        .iter()
+        .filter_map(|r| {
+            let csv = CompareProject::resolve(&dir, &r.file);
+            match crate::bench::summarise(&csv) {
+                Ok((session, summary, notes)) => Some(Entry {
+                    name: if r.name.trim().is_empty() {
+                        session.meta.label.clone()
+                    } else {
+                        r.name.clone()
+                    },
+                    file: r.file.clone(),
+                    summary,
+                    notes,
+                }),
+                Err(e) => {
+                    eprintln!("compare: skipping {}: {e}", csv.display());
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Save a project and write its report beside it; returns the report's path.
+pub fn save_and_report(
+    p: &CompareProject,
+    utc_offset: &dyn Fn(u64) -> i64,
+) -> std::io::Result<PathBuf> {
+    let dir = crate::bench::projects_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = project_path(&dir, &p.name);
+    std::fs::write(&path, p.to_json())?;
+    let runs = entries(p);
+    let file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let html = html(&p.name, &runs, p.baseline_index(), &file, utc_offset);
+    let out = path.with_extension("html");
+    std::fs::write(&out, html)?;
+    Ok(out)
+}
+
+/// Saved projects, by name.
+pub fn list_projects() -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(crate::bench::projects_dir()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| {
+            let proj = CompareProject::from_json(&std::fs::read_to_string(&p).ok()?).ok()?;
+            let name = if proj.name.is_empty() {
+                p.file_stem()?.to_str()?.to_string()
+            } else {
+                proj.name
+            };
+            Some((name, p))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 pub const SETTING_NAMES: [&str; 9] = [
     "Game",
     "Game settings",

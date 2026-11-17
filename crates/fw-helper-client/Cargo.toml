@@ -10,4 +10,4 @@ rust-version.workspace = true
 # zbus lives here, not in fw-helper-core (ADR 0010).
 [dependencies]
 fw-helper-core = { path = "../fw-helper-core" }
-zbus = "5"
+zbus = "6.3.0"

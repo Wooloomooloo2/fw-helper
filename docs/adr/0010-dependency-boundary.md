@@ -71,6 +71,9 @@ selected **zbus 3.15.2** while 5.19.0 was available — a three-year-old API we 
 to migrate off later, chosen for us without comment. MSRV was raised to **1.85** to get the
 current release.
 
+Raised again to **1.89** in 0.7.2 for zbus 6, which RustSec's advisories against the
+crates zbus 5 was built from (RUSTSEC-2026-0370..0372) made necessary.
+
 The lesson generalises: **check what the resolver actually picked, not just that it
 resolved.** A build that succeeds against stale dependencies looks identical to one against
 current ones.

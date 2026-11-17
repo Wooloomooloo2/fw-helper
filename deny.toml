@@ -3,17 +3,6 @@
 [advisories]
 version = 2
 yanked = "deny"
-# zbus 6 merged zvariant, zbus_names and zvariant_derive into itself, and RustSec then
-# marked the standalone crates unmaintained (2026-11). They are what zbus 5 is built
-# from, so the only fix is the zbus 6 migration - a breaking change to the daemon's and
-# the client's D-Bus code, to be done as its own piece of work. Ignored with the user's
-# agreement, 2026-11-17. These are "unmaintained" notices, not vulnerabilities; a
-# security advisory against any of these crates still fails the check.
-ignore = [
-    { id = "RUSTSEC-2026-0370", reason = "zvariant: merged into zbus 6; migration pending" },
-    { id = "RUSTSEC-2026-0371", reason = "zbus_names: merged into zbus 6; migration pending" },
-    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: merged into zbus 6; migration pending" },
-]
 
 [licenses]
 version = 2

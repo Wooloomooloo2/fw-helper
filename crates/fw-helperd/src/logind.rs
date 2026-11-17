@@ -34,13 +34,7 @@ pub trait Login1Manager {
     /// Take an inhibitor lock. The returned descriptor *is* the lock; dropping it
     /// releases. `mode` is `delay` (hold suspend open briefly) or `block` (refuse it
     /// outright, which would be a wildly disproportionate thing for a fan daemon to do).
-    fn inhibit(
-        &self,
-        what: &str,
-        who: &str,
-        why: &str,
-        mode: &str,
-    ) -> zbus::Result<zbus::zvariant::OwnedFd>;
+    fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<zbus::OwnedFd>;
 }
 
 /// Take the delay lock that keeps suspend open long enough to release the fan.
@@ -48,7 +42,7 @@ pub trait Login1Manager {
 /// Failure is not fatal. Without the lock the release still runs, it simply races the
 /// suspend instead of being guaranteed to precede it — and the startup reclaim catches
 /// a fan left manual across a sleep. Log it and carry on rather than refusing to run.
-async fn take_delay_lock(proxy: &Login1ManagerProxy<'static>) -> Option<zbus::zvariant::OwnedFd> {
+async fn take_delay_lock(proxy: &Login1ManagerProxy<'static>) -> Option<zbus::OwnedFd> {
     match proxy
         .inhibit(
             "sleep",

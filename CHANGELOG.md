@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.2 — 2026-11-17
+
+### Changed
+
+- **zbus 6.3** (from 5.19). zbus 6 absorbed `zvariant`, `zbus_names` and
+  `zvariant_derive`, which RustSec then marked unmaintained; they are no longer in the
+  dependency tree, and `deny.toml` no longer ignores their advisories. zbus 6 has no
+  blocking API, so the CLI and GUI call through a wrapper running each call in
+  `zbus::block_on`. The daemon's D-Bus connection still runs on its own zbus thread,
+  separate from tokio, as before. Minimum Rust is now 1.89.
+
 ## 0.7.1 — 2026-11-17
 
 ### Added

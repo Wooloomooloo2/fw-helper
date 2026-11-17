@@ -5,7 +5,7 @@
 //! (ADR 0003). Every method that changes hardware must go through [`check`].
 
 use std::collections::HashMap;
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ trait Authority {
     #[allow(clippy::too_many_arguments)]
     fn check_authorization(
         &self,
-        subject: &(&str, HashMap<&str, OwnedValue>),
+        subject: &(&str, HashMap<&str, OwnedVariant>),
         action_id: &str,
         details: HashMap<&str, &str>,
         flags: u32,
@@ -68,7 +68,7 @@ pub async fn check(conn: &zbus::Connection, sender: &str, action: &str) -> Resul
         .map_err(|e| format!("cannot reach polkit: {e}"))?;
 
     let mut details = HashMap::new();
-    let name = OwnedValue::try_from(zbus::zvariant::Value::from(sender))
+    let name = OwnedVariant::try_from(zbus::Variant::from(sender))
         .map_err(|e| format!("cannot encode caller name: {e}"))?;
     details.insert("name", name);
     let subject = (SUBJECT_KIND, details);
@@ -104,7 +104,7 @@ pub async fn check(conn: &zbus::Connection, sender: &str, action: &str) -> Resul
             .await
             .map_err(|e| format!("cannot reach polkit: {e}"))?;
         let mut details = HashMap::new();
-        let name = OwnedValue::try_from(zbus::zvariant::Value::from(sender.as_str()))
+        let name = OwnedVariant::try_from(zbus::Variant::from(sender.as_str()))
             .map_err(|e| format!("cannot encode caller name: {e}"))?;
         details.insert("name", name);
         let subject = (SUBJECT_KIND, details);

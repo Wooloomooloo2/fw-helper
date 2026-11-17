@@ -112,7 +112,7 @@ with no network, and there is no dependency-resolution risk to debug alongside l
 
 #### M1b — daemon and D-Bus  ✅ complete
 
-- [x] `fw-helperd` on the system bus as `org.fwhelper.Daemon1` (zbus 5.19)
+- [x] `fw-helperd` on the system bus as `org.fwhelper.Daemon1` (zbus 5.19; zbus 6.3 since 0.7.2)
 - [x] `Capabilities`, `Telemetry`, `CriticalTemperatures`, `Version` properties, with
       PropertiesChanged emitted only when the published view actually changes
 - [x] 1 Hz poll cap and 0.1 W quantization enforced; no on-demand sampling method

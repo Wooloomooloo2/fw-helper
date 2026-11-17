@@ -150,12 +150,13 @@ impl ProfileAxis {
     async fn probe(&self) -> Option<&'static str> {
         let conn = self.conn.as_ref()?;
         for dest in [PREFERRED, LEGACY] {
+            // zbus 6 defers a bad destination or path to build().
             let built = PowerProfilesProxy::builder(conn)
                 .destination(dest)
-                .and_then(|b| b.path(PATH))
-                .map(|b| b.build());
-            let Ok(fut) = built else { continue };
-            let Ok(proxy) = fut.await else { continue };
+                .path(PATH)
+                .build()
+                .await;
+            let Ok(proxy) = built else { continue };
             // Constructing a proxy contacts nothing, so force a round trip: without it
             // an absent PPD looks identical to a present one until the first real call
             // fails. Bounded, because that round trip is what used to block startup.

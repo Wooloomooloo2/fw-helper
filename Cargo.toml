@@ -13,8 +13,8 @@ members = [
 # Not published to crates.io: these are the pieces of one application, and
 # `allow-wildcard-paths` in deny.toml depends on them being private.
 publish = false
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/Wooloomooloo2/fw-helper"
-rust-version = "1.85"
+rust-version = "1.89"

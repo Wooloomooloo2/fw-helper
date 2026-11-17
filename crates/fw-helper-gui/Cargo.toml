@@ -18,7 +18,7 @@ path = "src/main.rs"
 fw-helper-core = { path = "../fw-helper-core" }
 fw-helper-client = { path = "../fw-helper-client" }
 async-channel = "2"
-zbus = { version = "5.13.2", default-features = false }
+zbus = { version = "6.3.0", default-features = false }
 gtk = { version = "0.10.3", package = "gtk4", features = ["v4_14"] }
 adw = { version = "0.8", package = "libadwaita", features = ["v1_5"] }
 

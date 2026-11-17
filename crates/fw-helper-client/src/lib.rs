@@ -1,6 +1,7 @@
 //! Client side of `org.fwhelper.Daemon1`, shared by the CLI and the GUI.
 //!
-//! Uses zbus's blocking API deliberately: neither consumer wants an async runtime.
+//! Blocking calls deliberately: neither consumer wants an async runtime. zbus 6 has no
+//! blocking API, so [`DaemonProxyBlocking`] wraps the async proxy in `zbus::block_on`.
 //! The GUI drives this from a worker thread so its main loop never blocks on IPC.
 //!
 //! This crate exists so the proxy is defined once. It sits outside `fw-helper-core`,
@@ -11,7 +12,7 @@ pub mod compare;
 pub mod report;
 
 use std::collections::HashMap;
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 /// A recorded session on the wire: `(name, label, path, started_unix, bytes)`.
 /// Decoded into [`SessionInfo`] the moment it arrives.
@@ -27,11 +28,44 @@ pub type SessionTuple = (String, String, String, u64, u64);
 /// An empty label means nothing is being recorded.
 pub type RecordingTuple = (String, String, String, u64, u64);
 
-#[zbus::proxy(
-    interface = "org.fwhelper.Daemon1",
-    default_service = "org.fwhelper.Daemon1",
-    default_path = "/org/fwhelper/Daemon1"
-)]
+/// Both halves of the proxy from one list of methods, so they cannot drift: zbus's
+/// async `DaemonProxy`, and `DaemonProxyBlocking`, which runs each call to completion
+/// on the calling thread with [`zbus::block_on`].
+///
+/// zbus 6 removed its blocking API. `block_on` is its replacement for programs with no
+/// runtime of their own - the CLI, and the GUI's worker thread - and between calls a
+/// zbus helper thread keeps the connection serviced (cached properties, the bus's
+/// own messages), which is what the blocking connection's executor thread used to do.
+macro_rules! daemon_proxy {
+    ($( $(#[$meta:meta])* fn $name:ident(&self $(, $arg:ident: $ty:ty)*) -> $ret:ty; )*) => {
+        #[zbus::proxy(
+            interface = "org.fwhelper.Daemon1",
+            default_service = "org.fwhelper.Daemon1",
+            default_path = "/org/fwhelper/Daemon1"
+        )]
+        pub trait Daemon {
+            $( $(#[$meta])* fn $name(&self $(, $arg: $ty)*) -> $ret; )*
+        }
+
+        /// [`DaemonProxy`] for callers with no async runtime; see [`connect`].
+        #[derive(Clone)]
+        pub struct DaemonProxyBlocking<'a>(DaemonProxy<'a>);
+
+        impl<'a> DaemonProxyBlocking<'a> {
+            /// The async proxy underneath.
+            pub fn inner(&self) -> &DaemonProxy<'a> {
+                &self.0
+            }
+
+            $(
+                pub fn $name(&self $(, $arg: $ty)*) -> $ret {
+                    zbus::block_on(self.0.$name($($arg),*))
+                }
+            )*
+        }
+    };
+}
+
 // Every property here except `telemetry` and `critical_temperatures` is marked as not
 // emitting a change signal, which makes zbus fetch it each time instead of caching it.
 //
@@ -42,11 +76,13 @@ pub type RecordingTuple = (String, String, String, u64, u64);
 //
 // Refetching costs a round trip per property per second on a local bus, against
 // silently stale readings. The daemon already caps its own publication rate (ADR 0009).
-pub trait Daemon {
+// Kept indented as a trait body; rustfmt would flush it to column 0.
+#[rustfmt::skip]
+daemon_proxy! {
     #[zbus(property(emits_changed_signal = "false"))]
     fn capabilities(&self) -> zbus::Result<HashMap<String, (bool, String)>>;
     #[zbus(property)]
-    fn telemetry(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+    fn telemetry(&self) -> zbus::Result<HashMap<String, OwnedVariant>>;
 
     /// Machine load: CPU, memory and GPU.
     ///
@@ -55,7 +91,7 @@ pub trait Daemon {
     /// a client is asking for it, so a cached proxy would switch the scan off and then
     /// wonder why the numbers never arrive.
     #[zbus(property(emits_changed_signal = "false"))]
-    fn usage(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+    fn usage(&self) -> zbus::Result<HashMap<String, OwnedVariant>>;
 
     /// The recording in progress as `(label, name, path, started_unix, samples)`.
     /// An empty label means nothing is being recorded.
@@ -205,14 +241,16 @@ pub const SUPPORTED_VERSION: u32 = 1;
 /// "daemon absent" from "daemon present", and every later property read fails
 /// separately instead of falling back cleanly.
 pub fn connect() -> zbus::Result<(DaemonProxyBlocking<'static>, u32)> {
-    let conn = if std::env::var_os("FW_HELPERD_SESSION_BUS").is_some() {
-        zbus::blocking::Connection::session()?
-    } else {
-        zbus::blocking::Connection::system()?
-    };
-    let proxy = DaemonProxyBlocking::new(&conn)?;
-    let version = proxy.version()?;
-    Ok((proxy, version))
+    zbus::block_on(async {
+        let conn = if std::env::var_os("FW_HELPERD_SESSION_BUS").is_some() {
+            zbus::Connection::session().await?
+        } else {
+            zbus::Connection::system().await?
+        };
+        let proxy = DaemonProxy::new(&conn).await?;
+        let version = proxy.version().await?;
+        Ok((DaemonProxyBlocking(proxy), version))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -224,7 +262,7 @@ pub struct Sensor {
 
 /// One decoded reading of everything the daemon publishes.
 ///
-/// Decoding happens here so consumers never touch `zvariant` types directly, and so
+/// Decoding happens here so consumers never touch zbus wire types directly, and so
 /// an interface change lands in one place.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
@@ -463,7 +501,7 @@ impl Snapshot {
     }
 }
 
-fn decode_load(u: &HashMap<String, OwnedValue>) -> Load {
+fn decode_load(u: &HashMap<String, OwnedVariant>) -> Load {
     let mut engines: Vec<(String, f64)> = u
         .get("gpu_engines")
         .and_then(|v| v.try_clone().ok())
@@ -503,25 +541,25 @@ fn decode_load(u: &HashMap<String, OwnedValue>) -> Load {
     }
 }
 
-fn as_bool(v: &OwnedValue) -> Option<bool> {
+fn as_bool(v: &OwnedVariant) -> Option<bool> {
     bool::try_from(v).ok()
 }
 
-fn as_f64(v: &OwnedValue) -> Option<f64> {
+fn as_f64(v: &OwnedVariant) -> Option<f64> {
     f64::try_from(v)
         .ok()
         .or_else(|| u64::try_from(v).ok().map(|n| n as f64))
 }
 
-fn as_u64(v: &OwnedValue) -> Option<u64> {
+fn as_u64(v: &OwnedVariant) -> Option<u64> {
     u64::try_from(v).ok()
 }
 
-fn as_string(v: &OwnedValue) -> Option<String> {
+fn as_string(v: &OwnedVariant) -> Option<String> {
     String::try_from(v.try_clone().ok()?).ok()
 }
 
-fn as_temp_map(v: Option<&OwnedValue>) -> HashMap<String, f64> {
+fn as_temp_map(v: Option<&OwnedVariant>) -> HashMap<String, f64> {
     v.and_then(|v| v.try_clone().ok())
         .and_then(|v| HashMap::<String, f64>::try_from(v).ok())
         .unwrap_or_default()

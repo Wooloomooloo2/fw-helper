@@ -12,7 +12,7 @@ use fw_helper_core::tune::ParkLevel;
 use fw_helper_core::{Capabilities, PowerLimit, Sysfs, Telemetry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 /// Outcome of [`Daemon::reapply_charge_limit`].
 ///
@@ -381,7 +381,7 @@ impl Daemon {
     /// see ADR 0009. There is deliberately no on-demand sampling method: a client
     /// must not be able to drive sampling cadence.
     #[zbus(property)]
-    async fn telemetry(&self) -> HashMap<String, OwnedValue> {
+    async fn telemetry(&self) -> HashMap<String, OwnedVariant> {
         // Somebody is looking. The poll loop reads this to decide whether the GPU
         // client scan earns its cost this tick.
         self.watchers.touch();
@@ -399,7 +399,7 @@ impl Daemon {
     /// somebody starts watching and disappear again afterwards, which is a property of
     /// the sampler rather than of the hardware.
     #[zbus(property)]
-    async fn usage(&self) -> HashMap<String, OwnedValue> {
+    async fn usage(&self) -> HashMap<String, OwnedVariant> {
         self.watchers.touch();
         match self.usage.lock() {
             Ok(u) => wire::usage_dict(&u),

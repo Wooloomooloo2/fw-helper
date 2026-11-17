@@ -12,4 +12,4 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 libc = "0.2"
 fw-helper-core = { path = "../fw-helper-core" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
-zbus = "5.13.2"
+zbus = "6.3.0"

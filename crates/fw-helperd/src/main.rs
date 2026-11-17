@@ -144,14 +144,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = std::env::var_os("FW_HELPERD_SESSION_BUS").is_some();
     let builder = if session {
         eprintln!("FW_HELPERD_SESSION_BUS set -- using session bus (development only)");
-        zbus::connection::Builder::session()?
+        zbus::connection::Builder::session()
     } else {
-        zbus::connection::Builder::system()?
+        zbus::connection::Builder::system()
     };
 
+    // zbus 6 defers every builder error to build(), so a bad name or path fails here.
     let conn = builder
-        .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, daemon)?
+        .name(BUS_NAME)
+        .serve_at(OBJECT_PATH, daemon)
         .build()
         .await?;
     eprintln!("listening on {BUS_NAME} at {OBJECT_PATH}");

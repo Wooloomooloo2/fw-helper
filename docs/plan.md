@@ -852,6 +852,27 @@ fixed and both now regression-tested: see ADR 0014's "What this cost to learn".
 
 ---
 
+### M10 — Parity with the Windows build  🟡 benchmarking done; the rest outstanding
+
+Started 2026-11-15 after the Windows sibling (`../fw-helper-windows`) grew past this
+project. Order follows usefulness, not the Windows changelog.
+
+- [x] **Battery log and Battery page** (0.6.5-0.6.7): event-driven log in the daemon,
+  time on battery, where the charge went, history by day/month/year. Verified on
+  hardware, including a sleep that changed power source.
+- [x] **One polkit action for hardware settings** (0.6.8, ADR 0015).
+- [x] **Benchmarking** (0.7.0, ADR 0016): MangoHud frame log -> live FPS and per-second
+  FPS in saved runs, frame-time lows, run notes, HTML run summary, compare projects,
+  the FW Benchmark folder, record toggle on Ctrl+Shift+F5, Monitor page in the Windows
+  layout. Verified with vkcube through the installed daemon; **not yet with a real game**.
+- [ ] **Step 0: re-baseline on BIOS 03.04** - `scripts/rebaseline.sh`, never yet run.
+- [ ] PPD mismatch display (Windows shows when the OS power mode disagrees).
+- [ ] Keyboard backlight and power LED.
+- [ ] Refresh-rate switching (60 / max / auto).
+- [ ] Firmware snapshot script.
+- [ ] Game auto-profiles.
+- [ ] Limiter analysis in the summary (Windows: "A diagnosis ... comes in a later version").
+
 ## Risks
 
 | Risk | Impact | Mitigation |

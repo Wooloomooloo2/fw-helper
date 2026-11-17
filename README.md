@@ -61,7 +61,8 @@ full load. See [ADR 0007](docs/adr/0007-no-undervolting.md).
 ## Recording a session
 
 The question this started from was *"is 35 W actually the ceiling on this laptop?"*, and
-answering it once took a bespoke script and four manual runs. Now:
+answering it once took a bespoke script and four manual runs. Now, on the **Monitor**
+page: **Record**, play, **Stop**. Or from a terminal:
 
 ```bash
 fw-helperctl record start "cyberpunk at 35W"
@@ -69,23 +70,43 @@ fw-helperctl record start "cyberpunk at 35W"
 fw-helperctl record stop
 ```
 
+Or press **Ctrl+Shift+F5** in the game, once the Monitor page's *Add Ctrl+Shift+F5
+Shortcut* button has set it up. Wayland gives an application no global hotkey, so this
+is a GNOME custom shortcut running `fw-helperctl record toggle`; on another desktop, bind
+that command yourself.
+
 Recording happens in the **daemon**, not the app, for two reasons. `energy_uj` is
 root-only (the PLATYPUS mitigation), so an unprivileged recorder cannot read package
-power at all; and a recording has to survive the window being closed, which is the whole
-point of coming back to look at it later.
+power at all; and a recording has to survive the window being closed.
 
-Open the **Monitor** tab in the app to read one back: five plots on a shared time axis —
-load, power, temperature, fan, memory. Sessions are plain CSV under
-`/var/lib/fw-helper/sessions/`, world-readable, with columns matching
-`scripts/sustained-perf-test.sh`, so a recorded game session and a benchmark run drop
-into the same spreadsheet.
+**When a recording stops it is saved to `~/Documents/FW Benchmark`** - the folder the
+Windows build uses too - with three things the daemon cannot add itself:
+
+- **the frame rate**, second by second, from MangoHud's frame log (below), and a
+  `.frames.csv` of every frame time, which is what the 1 % and 0.1 % lows come from;
+- **run notes** (`.notes.json`): BIOS, EC, kernel and fan filled in automatically, the
+  game settings and anything else typed when the window asks;
+- on request, a **summary** (`.html`): one self-contained page with tiles, every reading
+  second by second, where the watts went, what held the GPU clock, and the figures over
+  the *steady* seconds only - loading, the first 10 s and uncapped menus left out.
+
+**Compare** puts several saved runs against a baseline - "25 W against 35 W", "quiet fan
+against the EC" - and writes a report of what changed: FPS, 1 % lows, package watts,
+FPS per watt, and which recorded settings differ. Project files use the Windows build's
+format. From a terminal: `fw-helperctl bench` lists what is saved, `bench report NAME`
+and `bench compare PROJECT` make the pages.
+
+The Monitor page itself shows nine cards - load, CPU clock, GPU clock (asked against
+actual), power, temperature, fan, memory, frame rate and battery - live over the last
+five minutes, or for any saved run or unsaved recording.
 
 **How to tell whether the power limit was the thing holding you back.** The package
 publishes no "I am power limited" flag — unlike the GPU, which publishes real throttle
 reasons. So the PL1 setpoint is drawn as a dashed line over the power trace: draw sitting
 on the line *is* PL1 binding. That inference is how the 35 W ceiling was found.
 
-The last 20 sessions are kept, and a single recording stops itself after 12 hours.
+The daemon keeps its last 20 recordings in `/var/lib/fw-helper/sessions/`, and a single
+recording stops itself after 12 hours. What is saved to FW Benchmark is never pruned.
 
 ## In-game numbers, and why fw-helper does not draw them
 
@@ -105,6 +126,14 @@ MANGOHUD=1 MANGOHUD_CONFIGFILE=/usr/share/fw-helper/mangohud/fw-helper.conf %com
 
 as Steam launch options. That adds the power limit being enforced, who owns the fan, the
 active profile, the battery pack temperature, and whether a recording is running.
+
+**It is also where fw-helper's frame rate comes from.** The same config has MangoHud log
+every frame to `~/.local/share/fw-helper/mangohud/`, which fw-helper reads: live on the
+Monitor page, and joined into a recording when it is saved. Nothing outside the game's
+process can see its frames on Linux, and MangoHud already runs there. Logs older than 14
+days are deleted; at 60 fps a log grows by roughly 20 MB an hour of play. To use your own
+MangoHud config instead, add its four logging lines (`output_folder`, `autostart_log`,
+`log_interval`, `log_duration`) from `/usr/share/fw-helper/mangohud/fw-helper.conf`.
 
 **It also adds GPU load, which MangoHud cannot show on this laptop.** Measured with
 MangoHud 0.6.9.1: its Intel support is i915-only, and this board runs `xe`, so it

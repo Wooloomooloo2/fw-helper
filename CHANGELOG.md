@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.0 — 2026-11-17
+
+The Windows build's benchmarking workflow, on Linux (ADR 0016).
+
+### Added
+
+- **Frame rate**, from MangoHud. The shipped MangoHud config now logs every frame to
+  `~/.local/share/fw-helper/mangohud`; the Monitor page reads the live frame rate from
+  it, and a saved recording carries FPS for every second and a `.frames.csv` of every
+  frame time. `fw-helperctl fps` prints the rate now.
+- **FW Benchmark folder** (`~/Documents/FW Benchmark`). A recording is saved there when
+  it stops - from the window, `fw-helperctl record stop`, or the new
+  `fw-helperctl record toggle` - with its frame rate joined in, and run notes with the
+  BIOS, EC, kernel, fw-helper version and fan filled in automatically.
+- **Run notes**: stopping a recording in the window asks for the game settings and notes.
+- **Run summary**: a self-contained HTML page per run - tiles (median FPS with 1 % and
+  0.1 % lows, package power split, FPS per watt, what held the GPU clock, GPU clock,
+  CPU temperature), hoverable second-by-second charts, the power split against PL1, the
+  limits table, and every reading over the steady seconds only (the first 10 s of play,
+  loading and uncapped menus left out). `fw-helperctl bench report NAME`.
+- **Compare**: projects of saved runs against a baseline, with a report of what changed,
+  the fastest and most efficient run, and which recorded settings differ. Same project
+  format as the Windows build. `fw-helperctl bench compare PROJECT`.
+- **Ctrl+Shift+F5**: the Monitor page can install a GNOME custom shortcut that starts and
+  stops a recording from inside a game, and saves it when it stops.
+- Recordings gain `ddr_c`, `battery_min`, `fps` and `fps_app` columns. Old recordings
+  still open; columns are read by name.
+
+### Changed
+
+- **The Monitor page is laid out like the Windows monitor**: a button row (Record, Open,
+  Live, Save, Notes, Summary, Compare, Battery, Delete) and nine cards two to a row -
+  load, CPU clock, GPU clock asked against actual, power with whole-system watts on
+  battery, temperature with DDR, fan with who owns it, memory, frame rate with the game's
+  name, and battery with time left. Each card has its own time axis; a narrow window gets
+  one column.
+
 ## 0.6.8 — 2026-11-16
 
 ### Changed

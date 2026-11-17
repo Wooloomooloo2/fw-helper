@@ -362,7 +362,7 @@ impl RunSummary {
         let fan = shares(&kept, |r| {
             r.fan_mode.as_deref().map(|m| {
                 match m {
-                    "auto" => "EC auto",
+                    "auto" | "automatic" | "EC automatic" => "EC auto",
                     "manual" => "fw-helper curve",
                     other => other,
                 }

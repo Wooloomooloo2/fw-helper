@@ -97,7 +97,7 @@ Section: utils
 Priority: optional
 Architecture: $ARCH
 Depends: ${DEPS}, default-dbus-system-bus | dbus-system-bus, systemd
-Recommends: power-profiles-daemon
+Recommends: power-profiles-daemon, mangohud, libnotify-bin
 Maintainer: Mark Hall <mark.a.hall@gmail.com>
 Homepage: https://github.com/Wooloomooloo2/fw-helper
 Description: Firmware control for Framework laptops

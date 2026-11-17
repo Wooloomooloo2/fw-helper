@@ -21,3 +21,4 @@ and setting the old one's status to `Superseded by NNNN`.
 | [0013](0013-cap-sys-ptrace-for-gpu-load.md) | The daemon holds `CAP_SYS_PTRACE`, and nothing else | Accepted |
 | [0014](0014-parked-cores-are-fail-safe-state.md) | Parked cores and GPU frequency caps are fail-safe state | Accepted |
 | [0015](0015-one-polkit-action-for-hardware.md) | One polkit action for every hardware setting | Accepted |
+| [0016](0016-benchmark-folder-and-mangohud-frames.md) | Benchmark runs live in the user's home, and frames come from MangoHud | Accepted |

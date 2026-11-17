@@ -813,7 +813,14 @@ impl MonitorPage {
             .extra_child(&body)
             .build();
         if offer_summary {
-            dialog.add_responses(&[("skip", "Summary Only"), ("save", "Save and Open Summary")]);
+            // A run that went wrong - wrong settings, a crash, an alt-tab - is best thrown
+            // away here, before it is something to remember to delete.
+            dialog.add_responses(&[
+                ("discard", "Discard Run"),
+                ("skip", "Summary Only"),
+                ("save", "Save and Open Summary"),
+            ]);
+            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
         } else {
             dialog.add_responses(&[("skip", "Cancel"), ("save", "Save")]);
         }
@@ -822,7 +829,12 @@ impl MonitorPage {
         dialog.set_close_response("skip");
         let this = Rc::clone(self);
         dialog.connect_response(None, move |_, response| {
-            if response == "save" {
+            if std::env::var_os("FW_HELPER_DEBUG_WIDGETS").is_some() {
+                eprintln!("monitor: run notes answered {response:?}");
+            }
+            // Discard keeps what was typed too: "Keep It" reopens this dialog from disk,
+            // and a discarded run deletes the notes with it.
+            if response == "save" || response == "discard" {
                 let buffer = text.buffer();
                 let typed = buffer
                     .text(&buffer.start_iter(), &buffer.end_iter(), false)
@@ -836,9 +848,48 @@ impl MonitorPage {
                     return;
                 }
             }
+            if response == "discard" {
+                this.confirm_discard(csv.clone(), name.clone());
+                return;
+            }
             if offer_summary {
                 this.open_summary(&csv);
             }
+        });
+        dialog.present(Some(&self.widget));
+    }
+
+    /// Discarding deletes both copies and cannot be undone, and it sits one button away
+    /// from Save, so it asks once more. A stray click in testing threw away a whole run.
+    fn confirm_discard(self: &Rc<Self>, csv: PathBuf, name: String) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Discard this run?")
+            .body(
+                "The recording, its frame times and notes are deleted, including the \
+                 daemon's copy. This cannot be undone.",
+            )
+            .build();
+        dialog.add_responses(&[("keep", "Keep It"), ("discard", "Discard")]);
+        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("keep"));
+        dialog.set_close_response("keep");
+        let this = Rc::clone(self);
+        dialog.connect_response(None, move |_, response| {
+            if response != "discard" {
+                // Back to the notes, so keeping it still lets them be written.
+                this.ask_for_notes(csv.clone(), true);
+                return;
+            }
+            // Both copies: the saved run, and the daemon's recording it came from, so it
+            // does not reappear under Open as unsaved.
+            if let Err(e) = bench::delete_saved(&csv) {
+                this.summary
+                    .set_label(&format!("Could not discard the run: {e}"));
+                return;
+            }
+            let _ = this.commands.send(Command::DeleteSession(name.clone()));
+            *this.saved.borrow_mut() = bench::saved_sessions();
+            this.view(Viewing::Live);
         });
         dialog.present(Some(&self.widget));
     }
@@ -898,6 +949,12 @@ impl MonitorPage {
 
 /// Open a file in its default application - for a report, the browser.
 pub fn open_file(path: &Path, parent: Option<&gtk::Window>) {
+    // For the render example, which drives dialogs that would otherwise open the
+    // browser on whoever's desktop it runs on.
+    if std::env::var_os("FW_HELPER_NO_OPEN").is_some() {
+        eprintln!("would open {}", path.display());
+        return;
+    }
     let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
     launcher.launch(parent, gio::Cancellable::NONE, |_| {});
 }

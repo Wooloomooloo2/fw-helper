@@ -26,6 +26,8 @@ mod shortcut;
 mod worker;
 
 fn main() {
+    // Never launch a browser from a test render.
+    std::env::set_var("FW_HELPER_NO_OPEN", "1");
     let args: Vec<String> = std::env::args().collect();
     let csv = std::path::PathBuf::from(args.get(1).expect("a saved run's CSV"));
     let out = args.get(2).cloned().unwrap_or_else(|| "monitor.png".into());
@@ -77,6 +79,61 @@ fn main() {
             gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
                 match dialog.as_deref() {
                     Some("notes") => page.ask_for_notes(csv, true),
+                    // Answers the notes dialog and then its confirmation, as a person
+                    // pressing Discard Run then Discard would.
+                    Some(answer @ ("discard" | "keep")) => {
+                        page.ask_for_notes(csv.clone(), true);
+                        let (page, answer) = (page.clone(), answer.to_string());
+                        // Click the dialog's own button, so it closes exactly as it
+                        // would for a person; emitting the signal, or closing the
+                        // dialog, also fires its close response.
+                        fn find(w: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+                            if let Some(b) = w.downcast_ref::<gtk::Button>() {
+                                if b.label().as_deref() == Some(label) {
+                                    return Some(b.clone());
+                                }
+                            }
+                            let mut c = w.first_child();
+                            while let Some(ch) = c {
+                                if let Some(b) = find(&ch, label) {
+                                    return Some(b);
+                                }
+                                c = ch.next_sibling();
+                            }
+                            None
+                        }
+                        let press = |page: &monitor::MonitorPage, label: &str| {
+                            let root = page.widget.root().and_downcast::<adw::ApplicationWindow>();
+                            match root
+                                .and_then(|w| w.visible_dialog())
+                                .and_then(|d| find(d.upcast_ref(), label))
+                            {
+                                Some(b) => b.emit_clicked(),
+                                None => eprintln!("no button labelled {label:?}"),
+                            }
+                        };
+                        gtk::glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(500),
+                            move || {
+                                press(&page, "Discard Run");
+                                let page = page.clone();
+                                gtk::glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(500),
+                                    move || {
+                                        press(
+                                            &page,
+                                            if answer == "keep" {
+                                                "Keep It"
+                                            } else {
+                                                "Discard"
+                                            },
+                                        );
+                                        eprintln!("csv exists after {answer}: {}", csv.exists());
+                                    },
+                                );
+                            },
+                        );
+                    }
                     Some("compare") => compare::present(&page.widget, Some(csv)),
                     _ => {}
                 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1 — 2026-11-17
+
+### Added
+
+- **Discard Run** in the notes dialog that follows a stopped recording. It asks once
+  more, then deletes the saved run and the daemon's copy and returns to Live. "Keep It"
+  goes back to the notes with whatever was typed.
+
 ## 0.7.0 — 2026-11-17
 
 The Windows build's benchmarking workflow, on Linux (ADR 0016).

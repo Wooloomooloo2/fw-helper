@@ -50,8 +50,15 @@ the Vulkan loader, and only a layer loaded into that process sees it. `perf` is 
   The FPS card says so. A user's own MangoHud config can opt in with four lines.
 - MangoHud does not create `output_folder`, and logs nothing without it ("Failed to
   write log file" on the game's stderr). Every fw-helper client creates it.
-- Logging every frame costs disk: ~20 MB an hour at 60 fps. Logs older than 14 days are
-  deleted by the GUI.
+- Logging every frame costs disk: ~20 MB an hour at 60 fps, for every game run with the
+  config, recorded or not. So a raw log is deleted as soon as nothing needs it: once its
+  game has stopped writing it for ten minutes, unless a daemon recording not yet saved
+  overlaps it; 14 days is the hard limit. A saved run holds its own `.frames.csv`, and
+  re-saving it after its raw log has gone keeps the frame rate it already had. Every
+  frame, not one row a second, because the 1 % and 0.1 % lows are computed from frame
+  times - and stutter that a one-second average hides is what separated settings in
+  this project's own game runs (CP2077 47 -> 49 fps average at a CPU cap, with visibly
+  worse pacing). The Windows build records every frame too, through PresentMon.
 - An unsaved recording still opens in the Monitor page from the daemon's directory, but
   has no frame rate until saved.
 - The mtime anchor is wrong if a log is touched after MangoHud finished with it (copied

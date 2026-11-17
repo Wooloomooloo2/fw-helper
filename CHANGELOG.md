@@ -9,7 +9,9 @@ The Windows build's benchmarking workflow, on Linux (ADR 0016).
 - **Frame rate**, from MangoHud. The shipped MangoHud config now logs every frame to
   `~/.local/share/fw-helper/mangohud`; the Monitor page reads the live frame rate from
   it, and a saved recording carries FPS for every second and a `.frames.csv` of every
-  frame time. `fw-helperctl fps` prints the rate now.
+  frame time. `fw-helperctl fps` prints the rate now. MangoHud's raw logs (~20 MB an
+  hour) are deleted ten minutes after the game stops writing them, unless a recording
+  not yet saved needs them.
 - **FW Benchmark folder** (`~/Documents/FW Benchmark`). A recording is saved there when
   it stops - from the window, `fw-helperctl record stop`, or the new
   `fw-helperctl record toggle` - with its frame rate joined in, and run notes with the

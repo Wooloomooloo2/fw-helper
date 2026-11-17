@@ -130,8 +130,10 @@ active profile, the battery pack temperature, and whether a recording is running
 **It is also where fw-helper's frame rate comes from.** The same config has MangoHud log
 every frame to `~/.local/share/fw-helper/mangohud/`, which fw-helper reads: live on the
 Monitor page, and joined into a recording when it is saved. Nothing outside the game's
-process can see its frames on Linux, and MangoHud already runs there. Logs older than 14
-days are deleted; at 60 fps a log grows by roughly 20 MB an hour of play. To use your own
+process can see its frames on Linux, and MangoHud already runs there. A log grows by roughly
+20 MB an hour of play at 60 fps, so fw-helper deletes each one once nothing needs it: ten
+minutes after the game stops writing it, unless a recording that has not been saved yet
+overlaps it (and after 14 days regardless). A saved run keeps its own copy of the frames. To use your own
 MangoHud config instead, add its four logging lines (`output_folder`, `autostart_log`,
 `log_interval`, `log_duration`) from `/usr/share/fw-helper/mangohud/fw-helper.conf`.
 

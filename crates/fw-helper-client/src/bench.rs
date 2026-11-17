@@ -25,9 +25,14 @@ pub const FRAMES_SUFFIX: &str = ".frames.csv";
 pub const REPORT_SUFFIX: &str = ".html";
 pub const PROJECT_SUFFIX: &str = ".json";
 
-/// MangoHud logs older than this are deleted. Logging every frame of every game runs
-/// to ~20 MB an hour at 60 fps; a recording that wanted them has exported them by now.
+/// MangoHud logs older than this are deleted whatever else is true.
 pub const MANGOHUD_KEEP_DAYS: u64 = 14;
+
+/// A raw log is left alone until its game has stopped writing it for this long. MangoHud
+/// keeps writing to a file deleted under it, so deleting the log of a game that is
+/// still running (paused, alt-tabbed) would lose every later frame to a recording
+/// started afterwards.
+pub const MANGOHUD_IDLE_SECS: f64 = 600.0;
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -135,12 +140,61 @@ pub fn mangohud_logs() -> Vec<MangoLog> {
     logs
 }
 
-/// Delete MangoHud logs older than [`MANGOHUD_KEEP_DAYS`]. Returns how many went.
+/// Where the daemon records. `FW_HELPER_SESSION_DIR` overrides it, for tests.
+pub fn sessions_dir() -> PathBuf {
+    std::env::var_os("FW_HELPER_SESSION_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/fw-helper/sessions"))
+}
+
+/// Daemon recordings not yet in the benchmark folder, as `(start, end)` unix spans.
+/// Each could still be saved, and saving one needs the frames inside its span. The end
+/// is the file's mtime, i.e. its newest row; a recording in progress ends "now".
+fn unsaved_spans() -> Vec<(f64, f64)> {
+    let saved: Vec<String> = saved_sessions().into_iter().map(|m| m.name).collect();
+    session::list(&sessions_dir())
+        .into_iter()
+        .filter(|m| !saved.contains(&m.name))
+        .map(|m| {
+            (
+                m.started_unix as f64,
+                mtime(&m.path).unwrap_or(f64::INFINITY),
+            )
+        })
+        .collect()
+}
+
+/// Whether a raw log spanning `start..=end` can go. Logging every frame of every game
+/// runs to ~20 MB an hour, and a log is only worth keeping while a recording that has
+/// not been saved yet overlaps it: once saved, the run has its own copy of the frames.
+pub fn log_disposable(start: f64, end: f64, now: f64, unsaved: &[(f64, f64)]) -> bool {
+    if end < now - (MANGOHUD_KEEP_DAYS * 86_400) as f64 {
+        return true;
+    }
+    if now - end < MANGOHUD_IDLE_SECS {
+        return false;
+    }
+    // A second's slack: a recording's first row counts frames from the second before.
+    !unsaved.iter().any(|&(s, e)| start <= e && end >= s - 1.0)
+}
+
+/// Delete the MangoHud logs no unsaved recording needs - see [`log_disposable`].
+/// Returns how many went.
 pub fn prune_mangohud() -> usize {
-    let cutoff = unix_now() - (MANGOHUD_KEEP_DAYS * 86_400) as f64;
+    let now = unix_now();
+    let unsaved = unsaved_spans();
     mangohud_logs()
         .into_iter()
-        .filter(|l| l.modified < cutoff)
+        .filter(|l| {
+            // Creation time where the filesystem has one; otherwise assume the log
+            // began at the epoch, which only ever keeps it.
+            let start = fs::metadata(&l.path)
+                .and_then(|m| m.created())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0.0, |d| d.as_secs_f64());
+            log_disposable(start, l.modified, now, &unsaved)
+        })
         .filter(|l| fs::remove_file(&l.path).is_ok())
         .count()
 }
@@ -229,6 +283,7 @@ pub fn export(session_path: &Path) -> std::io::Result<Exported> {
     fs::create_dir_all(&dir)?;
     let name = session.meta.name.clone();
     let mut rows = session.rows;
+    let csv = dir.join(format!("{name}.csv"));
 
     let mut game = None;
     let mut frames_path = None;
@@ -255,10 +310,22 @@ pub fn export(session_path: &Path) -> std::io::Result<Exported> {
             let p = dir.join(format!("{name}{FRAMES_SUFFIX}"));
             write_atomic(&p, &frames::to_sidecar(f))?;
             frames_path = Some(p);
+        } else if let Ok(earlier) = Session::read(&csv) {
+            // Saved before, and the raw log has since been pruned: keep the frame rate
+            // the first save joined in rather than overwriting it with nothing.
+            for row in rows.iter_mut() {
+                if let Some(e) = earlier.rows.iter().find(|e| e.unix_time == row.unix_time) {
+                    row.fps = e.fps;
+                    row.fps_app = e.fps_app.clone();
+                }
+            }
+            let p = sibling(&csv, FRAMES_SUFFIX);
+            if p.exists() {
+                game = earlier.rows.iter().find_map(|r| r.fps_app.clone());
+                frames_path = Some(p);
+            }
         }
     }
-
-    let csv = dir.join(format!("{name}.csv"));
     let mut text = String::with_capacity(rows.len() * 180 + HEADER.len());
     text.push_str(HEADER);
     text.push('\n');
@@ -278,6 +345,9 @@ pub fn export(session_path: &Path) -> std::io::Result<Exported> {
     n.app = n.app.or(auto.app);
     n.fan_curve = n.fan_curve.or(auto.fan_curve);
     write_atomic(&notes_path, &n.to_json())?;
+
+    // This run has its frames now, so the raw logs it was protecting may be free.
+    prune_mangohud();
 
     Ok(Exported {
         csv,
@@ -414,6 +484,30 @@ pub fn delete_saved(csv: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_raw_log_goes_once_no_unsaved_recording_needs_it() {
+        let now = 1_000_000.0;
+        let day = 86_400.0;
+        // Still being written (or the game is paused): kept, recording or not.
+        assert!(!log_disposable(now - 3600.0, now - 60.0, now, &[]));
+        // Game closed, nothing recorded: goes.
+        assert!(log_disposable(now - 3600.0, now - 900.0, now, &[]));
+        // Game closed during a recording nobody has saved yet: kept.
+        let unsaved = [(now - 1800.0, now - 1000.0)];
+        assert!(!log_disposable(now - 3600.0, now - 900.0, now, &unsaved));
+        // A recording that began after the log's last frame needs nothing from it.
+        let later = [(now - 800.0, now - 700.0)];
+        assert!(log_disposable(now - 3600.0, now - 900.0, now, &later));
+        // Past the hard limit even an unsaved recording does not keep it.
+        let old = [(now - 20.0 * day, now - 19.0 * day)];
+        assert!(log_disposable(
+            now - 20.0 * day,
+            now - 19.0 * day,
+            now,
+            &old
+        ));
+    }
 
     #[test]
     fn siblings_share_the_stem() {

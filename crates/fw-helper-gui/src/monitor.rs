@@ -108,8 +108,13 @@ fn button(label: &str, tip: &str) -> gtk::Button {
 impl MonitorPage {
     pub fn new(commands: std::sync::mpsc::Sender<Command>) -> Rc<Self> {
         bench::ensure_mangohud_dir();
-        // Old frame logs are only worth keeping until a recording has used them.
+        // Raw frame logs are only worth keeping until a recording has used them; the
+        // window may stay open for days, so check again every half hour.
         std::thread::spawn(bench::prune_mangohud);
+        glib::timeout_add_seconds_local(1800, || {
+            std::thread::spawn(bench::prune_mangohud);
+            glib::ControlFlow::Continue
+        });
 
         let chart = ChartStack::new();
 

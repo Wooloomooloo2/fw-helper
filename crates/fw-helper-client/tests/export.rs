@@ -15,6 +15,7 @@ fn export_joins_frames_keeps_notes_and_is_repeatable() {
     fs::create_dir_all(&mango).unwrap();
     std::env::set_var("FW_HELPER_BENCH_DIR", &saved);
     std::env::set_var("FW_HELPER_MANGOHUD_DIR", &mango);
+    std::env::set_var("FW_HELPER_SESSION_DIR", &daemon);
 
     // A ten-second recording, as the daemon writes it: no fps.
     let now = SystemTime::now()
@@ -103,6 +104,23 @@ fn export_joins_frames_keeps_notes_and_is_repeatable() {
             .as_deref(),
         Some("1080p Medium")
     );
+
+    // The export pruned the old log, which no recording covers. The game's log is
+    // still kept: its last frame is under ten minutes old.
+    assert!(
+        !old.exists(),
+        "a log no recording needs survived the export"
+    );
+    assert!(log_path.exists());
+
+    // Once the raw log is gone, saving the run again keeps the frame rate it had.
+    fs::remove_file(&log_path).unwrap();
+    let again = bench::export(&session_path).unwrap();
+    assert_eq!(again.game.as_deref(), Some("Cyberpunk2077"));
+    assert!(again.frames.is_some());
+    let s = Session::read(&out.csv).unwrap();
+    assert!(s.rows.iter().filter(|r| r.fps.is_some()).count() >= 6);
+    assert_eq!(bench::load_frames(&out.csv).len(), frames);
 
     // The folder lists the recording once - not its frames file as a second session.
     let listed = bench::saved_sessions();

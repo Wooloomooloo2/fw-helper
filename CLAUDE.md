@@ -356,6 +356,9 @@ FW_HELPER_DEBUG_WIDGETS=1         # GUI: traces control signals and command resu
 - Floor observations only ever **rise** within a bucket and now persist, so a one-off
   anomaly is sticky. Errs loud, costing quiet rather than safety.
 - The **battery guard has never fired** and is sized so it should not (ADR 0011).
+- **zbus 6 migration.** RustSec marked `zvariant`, `zbus_names` and `zvariant_derive`
+  unmaintained (RUSTSEC-2026-0370..0372) after zbus 6 absorbed them; `deny.toml` ignores
+  those three IDs until the daemon and client move to zbus 6, a breaking upgrade.
 - **PL2 is untouched**; its `max_power_uw` reads 0.
 - The curve's **sensor is not configurable** — `control_temp()` picks `peci-temp`.
 - `/etc/sudoers.d/fw-helper-dev` grants passwordless `install-dev.sh`. It is scoped to a

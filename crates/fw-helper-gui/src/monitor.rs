@@ -97,6 +97,56 @@ fn local_label(unix: u64) -> String {
         .unwrap_or_default()
 }
 
+/// How to get a game's frame rate in: MangoHud's launch option, at either rate. The
+/// choice lives in each game's launch options, not here, so it can differ per game.
+fn frame_logging_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Frame Rate")
+        .description(
+            "Frame rates come from MangoHud, which runs inside the game. Paste one of these \
+             into a game's Steam launch options. Raw logs are deleted once a saved run has \
+             its copy.",
+        )
+        .build();
+    for (title, subtitle, option) in [
+        (
+            "Every frame",
+            "FPS plus 1 % and 0.1 % lows, which show stutter an average hides. \
+             About 20 MB an hour while playing.",
+            bench::LAUNCH_EVERY_FRAME,
+        ),
+        (
+            "Once a second",
+            "Average FPS only, no lows. About half a megabyte an hour.",
+            bench::LAUNCH_PER_SECOND,
+        ),
+    ] {
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .build();
+        let copy = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text(option)
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        copy.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Copy the {} launch option",
+            title.to_lowercase()
+        ))]);
+        copy.connect_clicked(move |b| {
+            b.clipboard().set_text(option);
+            b.set_icon_name("object-select-symbolic");
+            let b = b.clone();
+            glib::timeout_add_seconds_local_once(2, move || b.set_icon_name("edit-copy-symbolic"));
+        });
+        row.add_suffix(&copy);
+        group.add(&row);
+    }
+    group
+}
+
 fn button(label: &str, tip: &str) -> gtk::Button {
     gtk::Button::builder()
         .label(label)
@@ -220,12 +270,11 @@ impl MonitorPage {
             .wrap(true)
             .css_classes(["stat-label"])
             .label(
-                "A recording keeps running after this window is closed. The frame rate comes \
-                 from MangoHud: launch a game with MANGOHUD=1 MANGOHUD_CONFIGFILE=/usr/share/\
-                 fw-helper/mangohud/fw-helper.conf %command% and it logs every frame for fw-helper \
-                 to read. Saved runs, notes and reports are in ~/Documents/FW Benchmark.",
+                "A recording keeps running after this window is closed. Saved runs, notes \
+                 and reports are in ~/Documents/FW Benchmark.",
             )
             .build();
+        let frame_logging = frame_logging_group();
         let shortcut_row = crate::shortcut::row();
 
         let column = gtk::Box::builder()
@@ -240,6 +289,7 @@ impl MonitorPage {
         column.append(&summary);
         column.append(&chart.widget);
         column.append(&hint);
+        column.append(&frame_logging);
         column.append(&shortcut_row);
 
         let scroll = gtk::ScrolledWindow::builder()

@@ -39,6 +39,19 @@ install -m 644 data/example-profile.conf      "$STAGE/usr/share/fw-helper/"
 # Wayland, so this hands MangoHud - which is loaded into the game itself - the state
 # only fw-helper knows.
 install -m 644 data/mangohud/fw-helper.conf   "$STAGE/usr/share/fw-helper/mangohud/"
+# The same config logging once a second instead of every frame: average FPS only, no
+# 1 % lows, and a log a few hundred times smaller. Generated, so the two cannot drift;
+# chosen per game by which file the launch option names.
+PER_SECOND="$STAGE/usr/share/fw-helper/mangohud/fw-helper-per-second.conf"
+{
+    echo "### fw-helper + MangoHud, logging ONCE A SECOND: average FPS for each second, but"
+    echo "### no frame times, so saved runs have no 1 % or 0.1 % lows. For every frame, use"
+    echo "### fw-helper.conf beside this file. Generated from it by build-deb.sh."
+    echo "###"
+    sed 's/^log_interval=0$/log_interval=1000/' data/mangohud/fw-helper.conf
+} > "$PER_SECOND"
+grep -qx 'log_interval=1000' "$PER_SECOND" || { echo "per-second MangoHud config: log_interval not replaced" >&2; exit 1; }
+chmod 644 "$PER_SECOND"
 install -m 644 README.md LICENSE CHANGELOG.md "$STAGE/usr/share/doc/fw-helper/"
 
 # Debian expects a machine-readable copyright file; shipping LICENSE alone is not it.

@@ -34,6 +34,12 @@ pub const MANGOHUD_KEEP_DAYS: u64 = 14;
 /// started afterwards.
 pub const MANGOHUD_IDLE_SECS: f64 = 600.0;
 
+/// Steam launch option logging every frame: FPS and the 1 % / 0.1 % lows.
+pub const LAUNCH_EVERY_FRAME: &str =
+    "MANGOHUD=1 MANGOHUD_CONFIGFILE=/usr/share/fw-helper/mangohud/fw-helper.conf %command%";
+/// Steam launch option logging once a second: average FPS only, a far smaller log.
+pub const LAUNCH_PER_SECOND: &str = "MANGOHUD=1 MANGOHUD_CONFIGFILE=/usr/share/fw-helper/mangohud/fw-helper-per-second.conf %command%";
+
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -308,8 +314,14 @@ pub fn export(session_path: &Path) -> std::io::Result<Exported> {
         if let Some((app, f)) = all.first() {
             game = Some(app.clone());
             let p = dir.join(format!("{name}{FRAMES_SUFFIX}"));
-            write_atomic(&p, &frames::to_sidecar(f))?;
-            frames_path = Some(p);
+            // A once-a-second log has averages, not frame times: the rows above have
+            // their FPS, but there is nothing to take lows from.
+            if frames::per_frame(f) {
+                write_atomic(&p, &frames::to_sidecar(f))?;
+                frames_path = Some(p);
+            } else {
+                let _ = fs::remove_file(&p);
+            }
         } else if let Ok(earlier) = Session::read(&csv) {
             // Saved before, and the raw log has since been pruned: keep the frame rate
             // the first save joined in rather than overwriting it with nothing.
@@ -319,9 +331,9 @@ pub fn export(session_path: &Path) -> std::io::Result<Exported> {
                     row.fps_app = e.fps_app.clone();
                 }
             }
+            game = earlier.rows.iter().find_map(|r| r.fps_app.clone());
             let p = sibling(&csv, FRAMES_SUFFIX);
             if p.exists() {
-                game = earlier.rows.iter().find_map(|r| r.fps_app.clone());
                 frames_path = Some(p);
             }
         }

@@ -139,6 +139,29 @@ pub fn per_second(frames: &[Frame], times: &[u64]) -> Vec<Option<f64>> {
 }
 
 /// fw-helper's frames file: the frame times of one recording, for its 1% lows.
+/// Whether these rows are individual frames, or one averaged row per interval.
+///
+/// MangoHud with `log_interval=0` writes a row per frame, each `elapsed` one frame
+/// time after the last. With `log_interval=1000` (fw-helper's once-a-second config) it
+/// writes one row a second whose `frametime` is that second's **average** - measured
+/// 2026-11-17, 0.8.4: rows 1000 ms apart, `frametime` 8.33 at `fps` 120.1. Averages
+/// still give the right frame rate per second, but percentiles of them are not frame
+/// times, so such a log yields no 1 % lows. Told apart by the spacing: a per-frame
+/// log's rows are about one frame time apart, an interval log's many.
+pub fn per_frame(frames: &[Frame]) -> bool {
+    if frames.len() < 3 {
+        return true;
+    }
+    let mut gaps: Vec<f64> = frames
+        .windows(2)
+        .map(|w| (w[1].unix - w[0].unix) * 1000.0)
+        .collect();
+    let mut ms: Vec<f64> = frames.iter().map(|f| f.ms).collect();
+    gaps.sort_by(f64::total_cmp);
+    ms.sort_by(f64::total_cmp);
+    gaps[gaps.len() / 2] <= 3.0 * ms[ms.len() / 2]
+}
+
 pub fn to_sidecar(frames: &[Frame]) -> String {
     let mut out = String::with_capacity(frames.len() * 24 + 20);
     out.push_str(SIDECAR_HEADER);
@@ -169,6 +192,24 @@ pub fn from_sidecar(text: &str) -> Vec<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_once_a_second_log_is_told_from_a_per_frame_one() {
+        // As MangoHud wrote it with log_interval=1000, 2026-11-17.
+        let interval = "fps,frametime,elapsed
+120.098,8.32655,1000658915
+117.761,8.4918,2000946783
+119.204,8.38898,3001097007
+120.352,8.30897,4001269139
+";
+        let f = parse_mangohud(interval, 1000.0);
+        assert_eq!(f.len(), 4);
+        assert!(!per_frame(&f));
+        // Its per-second rate is still right: one averaged row a second.
+        let fps = per_second(&f, &[1000]);
+        assert!((fps[0].unwrap() - 120.35).abs() < 0.1, "{fps:?}");
+        assert!(per_frame(&parse_mangohud(LOG, 1000.0)));
+    }
 
     /// Shaped exactly like the log MangoHud 0.8.4 wrote on this machine, 2026-11-16.
     const LOG: &str = "os,cpu,gpu,ram,kernel,driver,cpuscheduler

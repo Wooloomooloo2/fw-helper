@@ -59,6 +59,15 @@ the Vulkan loader, and only a layer loaded into that process sees it. `perf` is 
   times - and stutter that a one-second average hides is what separated settings in
   this project's own game runs (CP2077 47 -> 49 fps average at a CPU cap, with visibly
   worse pacing). The Windows build records every frame too, through PresentMon.
+- For anyone who wants only average FPS, `fw-helper-per-second.conf` is shipped beside
+  it, generated at package build from the same file with `log_interval=1000`. The choice
+  lives in each game's launch option, so it is per game, and the GUI only shows the two
+  options; no preference is stored. MangoHud's once-a-second rows carry that second's
+  **average** `frametime` (measured 2026-11-17, 0.8.4: rows 1000 ms apart, 8.33 ms at
+  120.1 fps), so the per-second rate is computed by the same code, but they are not
+  frame times. `frames::per_frame` tells the two apart by row spacing, and a saved run
+  from an interval log gets no `.frames.csv`; its report falls back to the 5th-percentile
+  second, as for a run with no frames at all.
 - An unsaved recording still opens in the Monitor page from the daemon's directory, but
   has no frame rate until saved.
 - The mtime anchor is wrong if a log is touched after MangoHud finished with it (copied

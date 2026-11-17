@@ -731,7 +731,10 @@ fn stop_and_save(d: &DaemonProxyBlocking<'_>) {
         Ok(out) => {
             println!("saved {}", out.csv.display());
             match &out.game {
-                Some(g) => println!("  with frame times from {g}"),
+                Some(g) if out.frames.is_some() => println!("  with frame times from {g}"),
+                Some(g) => println!(
+                    "  with FPS from {g}, logged once a second: no frame times, so no 1 % lows"
+                ),
                 None => println!("  no MangoHud frames in that window, so no FPS"),
             }
             notify(
@@ -776,7 +779,10 @@ fn fps() {
                 "  MangoHud logs to {} when launched with fw-helper's config:",
                 fw_helper_client::bench::mangohud_dir().display()
             );
-            println!("  MANGOHUD=1 MANGOHUD_CONFIGFILE=/usr/share/fw-helper/mangohud/fw-helper.conf %command%");
+            println!("  every frame (FPS and 1 % lows):");
+            println!("    {}", fw_helper_client::bench::LAUNCH_EVERY_FRAME);
+            println!("  once a second (average FPS only, a far smaller log):");
+            println!("    {}", fw_helper_client::bench::LAUNCH_PER_SECOND);
         }
     }
 }
@@ -864,9 +870,11 @@ fn bench_cmd(action: Option<&str>, name: Option<&str>) {
                 Ok(out) => println!(
                     "saved {}{}",
                     out.csv.display(),
-                    out.game
-                        .map(|g| format!(" with frames from {g}"))
-                        .unwrap_or_default()
+                    match (&out.game, &out.frames) {
+                        (Some(g), Some(_)) => format!(" with frames from {g}"),
+                        (Some(g), None) => format!(" with once-a-second FPS from {g} (no lows)"),
+                        (None, _) => String::new(),
+                    }
                 ),
                 Err(e) => {
                     eprintln!("could not save {name}: {e}");

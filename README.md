@@ -133,7 +133,12 @@ Monitor page, and joined into a recording when it is saved. Nothing outside the 
 process can see its frames on Linux, and MangoHud already runs there. A log grows by roughly
 20 MB an hour of play at 60 fps, so fw-helper deletes each one once nothing needs it: ten
 minutes after the game stops writing it, unless a recording that has not been saved yet
-overlaps it (and after 14 days regardless). A saved run keeps its own copy of the frames. To use your own
+overlaps it (and after 14 days regardless). A saved run keeps its own copy of the frames.
+
+If you don't need the 1 % and 0.1 % lows, use `fw-helper-per-second.conf` in that launch
+option instead: the same config logging once a second, about half a megabyte an hour.
+Saved runs then have the average FPS for every second but no frame times. The choice is
+per game, and the Monitor page has both launch options with copy buttons. To use your own
 MangoHud config instead, add its four logging lines (`output_folder`, `autostart_log`,
 `log_interval`, `log_duration`) from `/usr/share/fw-helper/mangohud/fw-helper.conf`.
 

@@ -301,11 +301,8 @@ impl RunSummary {
 
         let (mut first, mut last) = (0, rows.len() - 1);
         if game.is_some() {
-            first = rows.iter().position(|r| playing(r)).unwrap_or(0);
-            last = rows
-                .iter()
-                .rposition(|r| playing(r))
-                .unwrap_or(rows.len() - 1);
+            first = rows.iter().position(&playing).unwrap_or(0);
+            last = rows.iter().rposition(&playing).unwrap_or(rows.len() - 1);
         }
 
         // Trim the start, as long as at least 20 s are left.
@@ -481,7 +478,7 @@ fn shares(rows: &[&Row], get: impl Fn(&Row) -> Option<String>) -> Vec<Share> {
             None => counts.push((v, 1)),
         }
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
     counts
         .into_iter()
         .map(|(value, n)| Share {

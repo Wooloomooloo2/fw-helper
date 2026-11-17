@@ -917,11 +917,9 @@ fn bench_cmd(action: Option<&str>, name: Option<&str>) {
                 &project.name,
                 &entries,
                 project.baseline_index(),
-                &path
-                    .file_name()
+                path.file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                    .unwrap_or_default(),
                 &utc_offset_i,
             );
             let out = path.with_extension("html");

@@ -498,10 +498,10 @@ pub fn summary_html(
             )
         })
         .unwrap_or_default();
-    let _ = write!(
+    let _ = writeln!(
         o,
         "<footer class=\"note\">{firmware}Made by fw-helper {} from <span class=\"mono\">{}</span>, in the FW Benchmark folder. \
-         Open it from fw-helper's Monitor page to see it in the live charts, or to make this report again.</footer>\n",
+         Open it from fw-helper's Monitor page to see it in the live charts, or to make this report again.</footer>",
         e(env!("CARGO_PKG_VERSION")),
         e(csv_name)
     );

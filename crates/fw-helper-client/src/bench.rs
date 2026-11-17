@@ -232,7 +232,7 @@ pub fn frames_between(from_unix: f64, to_unix: f64) -> Vec<(String, Vec<Frame>)>
         f.sort_by(|a, b| a.unix.total_cmp(&b.unix));
     }
     // Most frames first: that is the game, anything else is a launcher or a tool.
-    out.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    out.sort_by_key(|(_, f)| std::cmp::Reverse(f.len()));
     out
 }
 
